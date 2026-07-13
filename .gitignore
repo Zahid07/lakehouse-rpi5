@@ -1,0 +1,41 @@
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Local runtime locks
+*.lock
+.realtime_worker.lock
+
+# Generated data and local storage artifacts
+accel_data/
+ducklake_data/
+metadata.ducklake
+metadata.ducklake.files/
+*.duckdb
+*.db
+
+# Keep env templates/versioned config if needed
+# (ignore local overrides only)
+config/*.local.env
