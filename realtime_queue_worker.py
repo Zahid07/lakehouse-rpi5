@@ -16,7 +16,7 @@ def ensure_realtime_queue_table(con, config: dict):
     con.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {queue_table} (
-            file_path VARCHAR PRIMARY KEY,
+            file_path VARCHAR,
             folder_path VARCHAR,
             file_size_bytes BIGINT,
             file_mtime_ns BIGINT,

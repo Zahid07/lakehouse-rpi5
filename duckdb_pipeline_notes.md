@@ -198,3 +198,20 @@ Optional custom lock file:
 ~~~bash
 python realtime_queue_worker.py dev --lock-file /tmp/realtime_worker.lock
 ~~~
+
+
+<!-- add in the readme and in the dubdbnotes that we installed MQTT, and we used
+sudo apt update
+sudo apt install -y mosquitto mosquitto-clients
+sudo systemctl enable mosquitto
+sudo systemctl start mosquitto -->
+
+Now what I've done further is that I have implemented a solution where 
+Data is dumped every 30 secs, and every 40secs a cronjob runs that takes these new files and processes this.
+This is implementing microbatching.
+
+I have used a thread, that is called when we have to implement dumping of data, 
+because we dont need to block our data fetch process.
+
+Here we have a buffer of 10s, so in these 10s we need our processing to be done, and that is doable.
+Next I am going to do benchmarking on this
