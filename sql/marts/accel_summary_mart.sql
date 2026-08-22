@@ -1,5 +1,15 @@
 -- accel_summary_mart.sql
 -- Hourly aggregated summary mart (MERGE - upsert by hour_ts + location_key)
+--
+-- Scope is the [window_lo, window_hi) range the runner derives from the hours
+-- this batch actually touched, so untouched history is never read. Every hour in
+-- range is recomputed in full rather than folded into the stored average.
+-- Incrementally merging an average cannot be done correctly without carrying the
+-- running sums, and with 30s dumps an hour is touched ~120 times, so recomputing
+-- keeps this mart exact and idempotent under retries.
+--
+-- These are streaming aggregates (one small accumulator per group), so memory is
+-- driven by group count, not row count. The runner does not chunk this step.
 
 CREATE TABLE IF NOT EXISTS :marts_schema.accel_hourly_summary (
     hour_ts          TIMESTAMP,
@@ -29,34 +39,40 @@ USING (
         l.city,
         l.country,
         COUNT(*)                          AS sample_count,
-        ROUND(AVG(f.x), 4)               AS avg_x,
-        ROUND(AVG(f.y), 4)               AS avg_y,
-        ROUND(AVG(f.z), 4)               AS avg_z,
-        ROUND(AVG(f.magnitude), 4)       AS avg_magnitude,
-        ROUND(MAX(f.magnitude), 4)       AS max_magnitude,
-        ROUND(MIN(f.magnitude), 4)       AS min_magnitude,
-        ROUND(STDDEV(f.magnitude), 4)    AS stddev_magnitude,
-        current_timestamp                AS ins_tmstmp,
-        current_timestamp                AS upd_tmstmp,
-        ':batch_id'                      AS batch_id
+        ROUND(AVG(f.x), 4)                AS avg_x,
+        ROUND(AVG(f.y), 4)                AS avg_y,
+        ROUND(AVG(f.z), 4)                AS avg_z,
+        ROUND(AVG(f.magnitude), 4)        AS avg_magnitude,
+        ROUND(MAX(f.magnitude), 4)        AS max_magnitude,
+        ROUND(MIN(f.magnitude), 4)        AS min_magnitude,
+        ROUND(STDDEV(f.magnitude), 4)     AS stddev_magnitude,
+        current_timestamp                 AS ins_tmstmp,
+        current_timestamp                 AS upd_tmstmp,
+        ':batch_id'                       AS batch_id
     FROM :curated_schema.fact_accelerometer f
     LEFT JOIN :curated_schema.location_dim l
         ON f.location_key = l.location_key
        AND l.is_current = TRUE
-    WHERE f.batch_id = ':batch_id'
+    -- Literal bounds so DuckLake can prune files/row groups on timestamp stats.
+    WHERE f.timestamp >= TIMESTAMP ':window_lo'
+      AND f.timestamp <  TIMESTAMP ':window_hi'
     GROUP BY 1, 2, 3, 4, 5
 ) AS source
 ON target.hour_ts = source.hour_ts
-AND target.location_key = source.location_key
+-- Null-safe: location_key is NULL when a reading has no matching current dim row.
+AND target.location_key IS NOT DISTINCT FROM source.location_key
 WHEN MATCHED THEN
     UPDATE SET
-        sample_count     = target.sample_count + source.sample_count,
-        avg_x            = ROUND((target.avg_x + source.avg_x) / 2, 4),
-        avg_y            = ROUND((target.avg_y + source.avg_y) / 2, 4),
-        avg_z            = ROUND((target.avg_z + source.avg_z) / 2, 4),
-        avg_magnitude    = ROUND((target.avg_magnitude + source.avg_magnitude) / 2, 4),
-        max_magnitude    = GREATEST(target.max_magnitude, source.max_magnitude),
-        min_magnitude    = LEAST(target.min_magnitude, source.min_magnitude),
+        location_name    = source.location_name,
+        city             = source.city,
+        country          = source.country,
+        sample_count     = source.sample_count,
+        avg_x            = source.avg_x,
+        avg_y            = source.avg_y,
+        avg_z            = source.avg_z,
+        avg_magnitude    = source.avg_magnitude,
+        max_magnitude    = source.max_magnitude,
+        min_magnitude    = source.min_magnitude,
         stddev_magnitude = source.stddev_magnitude,
         upd_tmstmp       = current_timestamp,
         batch_id         = source.batch_id
