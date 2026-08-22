@@ -125,6 +125,25 @@ erDiagram
 	}
 ```
 
+## Mart Recomputation Semantics
+
+Both marts are **recompute-by-window**, not incremental accumulators:
+
+- The runner asks the fact table which windows the current batch touched
+  (`get_touched_windows`) and passes a literal `[window_lo, window_hi)` range
+  into the mart SQL. Untouched history is never read.
+- Every window in range is recomputed from all of its fact rows. A 30s dump
+  never fills a 1-minute FFT window, and an hour is touched ~120 times, so
+  folding a batch into a stored average cannot be done correctly without
+  carrying running sums. Recomputing keeps both marts exact and idempotent, so
+  a retried batch converges instead of drifting.
+- `accel_summary_mart` uses streaming aggregates (memory scales with group
+  count) and runs as a single call over the touched hour range.
+- `accel_fft_mart` materializes every row in range into lists for the numpy
+  UDFs, so memory scales with row count. The runner caps it at
+  `fft_windows_per_chunk` minute windows per SQL call. This is the step that
+  previously OOM'd at 19.4M rows.
+
 ## Operational Tables
 
 - `staging.processed_files_cdc`: file-level CDC status and lineage
@@ -146,6 +165,7 @@ Useful keys:
 - `ducklake_data_path`
 - `staging_schema`, `curated_schema`, `marts_schema`
 - `max_files_per_batch`
+- `fft_windows_per_chunk`
 - `duckdb_memory_limit`, `duckdb_threads`, `duckdb_preserve_insertion_order`
 - `ready_marker_name`, `worker_settle_seconds`
 - `worker_max_files_per_run`, `worker_max_retry_attempts`, `worker_retry_delay_seconds`

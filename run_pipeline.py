@@ -3,6 +3,7 @@ import sys
 import uuid
 import glob
 import time
+from datetime import timedelta
 from pathlib import Path
 from utils.connector import get_connection, close_connection
 from utils.sql_runner import run_sql_file
@@ -266,6 +267,88 @@ def run_step_with_benchmark(
 
 
 # ─────────────────────────────────────────
+# Window-scoped mart execution
+# ─────────────────────────────────────────
+WINDOW_UNIT_DELTA = {"hour": timedelta(hours=1), "minute": timedelta(minutes=1)}
+
+
+def get_touched_windows(con, config: dict, batch_id: str, unit: str) -> list:
+    """Time windows this batch actually wrote to, so marts never read untouched history."""
+    rows = con.execute(
+        f"""
+        SELECT DISTINCT DATE_TRUNC('{unit}', timestamp) AS window_ts
+        FROM {config['curated_schema']}.fact_accelerometer
+        WHERE batch_id = ?
+        ORDER BY window_ts
+        """,
+        [batch_id],
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def run_window_chunked_step(
+    con,
+    config: dict,
+    params: dict,
+    run_id: str,
+    env: str,
+    raw_file: str,
+    raw_file_size: int,
+    step_name: str,
+    sql_file: str,
+    target_table: str,
+    catalog_path: str,
+    unit: str,
+    windows_per_chunk: int,
+):
+    """Run a mart step over the batch's touched windows, at most N windows per call.
+
+    The mart SQL is scoped by a literal [window_lo, window_hi) range. Chunking
+    caps peak memory for steps whose cost scales with row count (the FFT step
+    materializes every row into lists), and keeps the range prunable by DuckLake.
+    """
+    windows = get_touched_windows(con, config, params["batch_id"], unit)
+    if not windows:
+        print(f"  No {unit} windows touched by this batch. Skipping {step_name}.")
+        return
+
+    delta = WINDOW_UNIT_DELTA[unit]
+    if windows_per_chunk <= 0:
+        windows_per_chunk = len(windows)
+    chunks = [
+        windows[i:i + windows_per_chunk]
+        for i in range(0, len(windows), windows_per_chunk)
+    ]
+    print(
+        f"  {len(windows)} {unit} window(s) touched -> "
+        f"{len(chunks)} chunk(s) of up to {windows_per_chunk}"
+    )
+
+    for idx, chunk in enumerate(chunks, start=1):
+        window_lo = chunk[0]
+        window_hi = chunk[-1] + delta
+        if len(chunks) > 1:
+            print(f"  chunk {idx}/{len(chunks)}: {window_lo} -> {window_hi}")
+        run_step_with_benchmark(
+            con,
+            config,
+            {
+                **params,
+                "window_lo": window_lo.isoformat(sep=" "),
+                "window_hi": window_hi.isoformat(sep=" "),
+            },
+            run_id,
+            env,
+            raw_file,
+            raw_file_size,
+            step_name,
+            sql_file,
+            target_table,
+            catalog_path,
+        )
+
+
+# ─────────────────────────────────────────
 # Get raw parquet files
 # ─────────────────────────────────────────
 def get_raw_files(data_path: str) -> list:
@@ -418,8 +501,10 @@ def run_for_files(raw_files: list, config: dict, batch_id: str, run_id: str, env
         )
 
         # 4. Marts - summary
+        # Streaming aggregates: memory scales with group count, so one call over
+        # the whole touched hour range is safe.
         print("\n[4/5] Marts - Hourly Summary")
-        run_step_with_benchmark(
+        run_window_chunked_step(
             con,
             config,
             params,
@@ -431,11 +516,15 @@ def run_for_files(raw_files: list, config: dict, batch_id: str, run_id: str, env
             "sql/marts/accel_summary_mart.sql",
             f"{config['marts_schema']}.accel_hourly_summary",
             catalog_path,
+            unit="hour",
+            windows_per_chunk=0,
         )
 
         # 5. Marts - FFT
+        # LIST() materializes every row in range, so cap windows per call to keep
+        # peak memory bounded on the RPi5 (this is the step that OOM'd).
         print("\n[5/5] Marts - FFT")
-        run_step_with_benchmark(
+        run_window_chunked_step(
             con,
             config,
             params,
@@ -447,6 +536,8 @@ def run_for_files(raw_files: list, config: dict, batch_id: str, run_id: str, env
             "sql/marts/accel_fft_mart.sql",
             f"{config['marts_schema']}.accel_fft_mart",
             catalog_path,
+            unit="minute",
+            windows_per_chunk=int(config.get("fft_windows_per_chunk", "60")),
         )
 
         mark_files_processed(

@@ -8,8 +8,9 @@ def load_sql(filepath: str, params: dict) -> str:
     sql = Path(filepath).read_text()
     for key, value in params.items():
         sql = sql.replace(f":{key}", str(value))
-    # Warn about any unreplaced params
-    remaining = re.findall(r":[a-zA-Z_]+", sql)
+    # Warn about any unreplaced params. The lookbehind skips the second colon of
+    # a `::TYPE` cast, which is not a param placeholder.
+    remaining = re.findall(r"(?<!:):[a-zA-Z_]+", sql)
     if remaining:
         print(f"  [WARN] Unreplaced params in {filepath}: {remaining}")
     return sql

@@ -215,3 +215,86 @@ because we dont need to block our data fetch process.
 
 Here we have a buffer of 10s, so in these 10s we need our processing to be done, and that is doable.
 Next I am going to do benchmarking on this
+
+
+## Mart Correctness Fix (marts were wrong across batches)
+
+Microbatching exposed two aggregation bugs. With 30s dumps an hour is merged
+~120 times and a 1-minute FFT window is always split across batches, so the
+per-batch MERGE logic was producing wrong numbers.
+
+1. `accel_summary_mart` folded averages as `(target.avg + source.avg) / 2`.
+That is an unweighted average of averages, so the result was dominated by
+whichever batch merged last instead of reflecting the sample distribution.
+`stddev_magnitude` was simply overwritten with the last batch's value.
+
+Reproduced: batch A = 300 samples of 1.0, batch B = 100 samples of 5.0.
+Correct `avg_x` is 2.0, the mart held 3.0. Correct stddev 1.7342, mart held 0.0.
+
+2. `accel_fft_mart` transformed only the current batch's rows, so a minute
+window merged from a 30s dump held a spectrum over half a window.
+
+Reproduced: 400 samples in one minute window across 2 batches produced
+`sample_count = 100` and 51 spectrum bins instead of 400 and 201.
+
+### Fix
+
+Both marts are now recompute-by-window. The runner derives the touched windows
+from the fact table for the current batch and passes a literal
+`[window_lo, window_hi)` range into the SQL, which recomputes each window in
+range from all of its rows. This is exact, idempotent under retries, and still
+never reads untouched history.
+
+### Why the bounds are computed in Python
+
+The first version put the range in a SQL CTE and referenced it as
+`(SELECT lo FROM bounds)` inside the join. That works on plain DuckDB but fails
+on DuckLake tables with `Error: Out of buffer` on the second MERGE (the first
+one to take the MATCHED branch). Bisected against DuckLake: every variant with
+the scalar subquery fails, every variant without it passes, and
+`IS NOT DISTINCT FROM` is not implicated. Literal timestamps also let DuckLake
+prune files and row groups on timestamp statistics.
+
+### FFT memory control
+
+`LIST(... ORDER BY timestamp)` materializes every row in range into arrays for
+four axes and marshals them into Python for numpy, so peak memory is O(rows).
+The runner now feeds the FFT step at most `fft_windows_per_chunk` minute
+windows per SQL call (default 60). The summary mart is not chunked because
+COUNT/AVG/MIN/MAX/STDDEV are streaming aggregates whose memory scales with
+group count, not row count.
+
+~~~ini
+fft_windows_per_chunk=60
+~~~
+
+### Also fixed
+
+- `sample_rate_hz` is now actually used by the FFT mart. It was hardcoded to
+  `100.0`, so the `freq_hz` axis ignored config.
+- The MERGE match is null-safe (`IS NOT DISTINCT FROM`) on `location_key`.
+  Readings with no current dim row have a NULL key, which never matched under
+  `=`, so every batch inserted another duplicate row.
+- Both marts refresh `location_name` / `city` / `country` on match, so SCD2
+  attribute changes propagate instead of going stale.
+- `config/dev.env` and `config/prod.env` were missing every documented tuning
+  and worker key, so all of them silently fell back to code defaults.
+  `prod.env` was missing `ducklake_catalog` / `ducklake_data_path` entirely,
+  which made `run_pipeline.py prod` fail with a KeyError in `attach_ducklake`.
+- `utils/sql_runner.py` no longer reports `::TYPE` casts as unreplaced params.
+
+### Known issue found while testing, NOT fixed
+
+`accel_fact.sql` inserts unconditionally, so a batch that fails after the fact
+step (the recorded OOM did exactly this) re-inserts the same readings on retry
+under a new `batch_id`. Duplicate `(timestamp, location_key)` rows make
+`LIST(... ORDER BY timestamp)` order undefined among ties, which makes the FFT
+spectrum plan-dependent. The summary mart is unaffected because its aggregates
+are order-independent, but the duplicated rows still inflate `sample_count`.
+Needs a dedup key or a delete-by-range before insert.
+
+### Note on SQL comments
+
+`utils/sql_runner.py` splits statements on `;`, so a semicolon inside a SQL
+comment splits the comment and the second half is executed as SQL.
+Do not use semicolons in comments in the files under `sql/`.
