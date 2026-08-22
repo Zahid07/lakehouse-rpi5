@@ -19,8 +19,9 @@ python -c "import duckdb; print(duckdb.__version__)"
 ```
 
 **Environment.** There is no dependency manifest in this repo yet — creating one
-is your first commit. `duckstream` needs `duckdb`, `pyarrow`, `numpy`; tests need
-`pytest`. **Pin `duckdb` exactly**: constraints 7 and 8 in `CONTEXT.md` are
+is your first commit. `duckstream` needs `duckdb`, `pyarrow`, `numpy` and
+`pyyaml`; tests need `pytest`. Declare a `duckstream` console script alongside
+`python -m duckstream`. **Pin `duckdb` exactly**: constraints 7 and 8 in `CONTEXT.md` are
 version-sensitive.
 
 **Then begin Phase 1.** Do not start with source connectors or SQL — start with
@@ -215,7 +216,10 @@ From constraint 1: bound rows, not UDF cost.
 
 | Path | Contents |
 |---|---|
-| `duckstream/model.py` | `Model` declaration, load-time validation, invariants |
+| `duckstream/model.py` | `Model` declaration, load-time validation, invariants — **the canonical representation** |
+| `duckstream/config.py` | YAML deserialiser into `Model`, `${VAR}` substitution. Parsing isolated here so the format can be swapped |
+| `duckstream/registry.py` | built-in names (`file`, `mqtt`, `table`) plus dotted-path resolution for user sources, sinks and UDFs |
+| `duckstream/cli.py` | `run` / `validate` / `status` / `models`. Thin — arg parsing only, no logic of its own |
 | `duckstream/engine.py` | trigger loop, transaction boundary, batch lifecycle |
 | `duckstream/offsets.py` | `Offset` types, checkpoint tables, commit and recovery |
 | `duckstream/watermark.py` | event-time tracking, window sealing, lateness policy |
@@ -227,7 +231,7 @@ From constraint 1: bound rows, not UDF cost.
 | `duckstream/state.py` | pluggable state store, DDL |
 | `duckstream/udf.py` | Arrow-mode UDF helpers and registration |
 | `duckstream/metrics.py` | per-batch timings, rows, lag |
-| `tests/conformance/` | **runs against both DuckDB and DuckLake backends** |
+| `tests/conformance/` | **runs against DuckLake, and through both front doors** |
 
 ## Phases
 
@@ -237,6 +241,12 @@ From constraint 1: bound rows, not UDF cost.
    sink from the start**, with inlining disabled and one snapshot per trigger.
    Prove one exactly-once batch end to end, including a fault-injected replay
    verified against the snapshot history.
+
+   **Both front doors ship in this phase**, because retrofitting config onto a
+   Python-shaped API is far more expensive than building them together: the
+   `Model` object, the registry, the YAML loader, and `run` + `validate` in the
+   CLI. `status` waits for `metrics.py`. The round-trip and parity tests below
+   are part of this phase's definition of done, not a later cleanup.
 2. **Event time.** Watermarks, tumbling windows, sealing past the lateness
    horizon, `append` and `update` output modes via merge-by-key.
 3. **Foldability.** All three tiers with load-time validation and the rejection
@@ -305,11 +315,111 @@ ATTACH 'ducklake:catalog.ducklake' AS lake;
 SELECT * FROM lake.marts.hourly_counts ORDER BY hour_ts DESC LIMIT 5;
 ```
 
-**An entry-point decision is still open** and should be settled in phase 1, since
-it shapes `model.py`: script-only as above, or also a
-`python -m duckstream run --config models.yaml` CLI. A cron-driven framework
-arguably wants the CLI more than the importable API, and the choice determines
-whether models are declared in Python or in config.
+### Two front doors, one canonical model
+
+**Both entry points are supported**: the Python API above, and a config-driven
+CLI. The failure mode to design against is drift — the config loader supporting a
+subset, the Python API growing what config cannot express, and the two paths
+diverging. Three rules prevent that:
+
+1. **`Model` is the single source of truth.** It is a plain Python object and all
+   validation lives on it.
+2. **The config loader is only a deserialiser.** It constructs the same `Model`
+   objects and then the same validation runs. There is no parallel validation and
+   no parallel execution path. `Engine.from_config(path)` returns an ordinary
+   `Engine` that Python can keep modifying.
+3. **No merge or precedence semantics.** Config is a constructor, not an override
+   layer. If you need environment differences, use `${VAR}` substitution in config
+   values, or load the config and adjust in Python. Anything more becomes a
+   configuration language.
+
+The equivalent of the script above:
+
+```yaml
+# models.yaml
+catalog: "ducklake:catalog.ducklake"
+data_path: "lake_data"
+
+settings:                                  # applied to every connection
+  ducklake_default_data_inlining_row_limit: 0
+  memory_limit: "2GB"
+  threads: 2
+
+models:
+  - name: hourly_counts
+    source:
+      type: file                           # registry name
+      path: "${DUCKSTREAM_LANDING:-landing/}"
+      marker: _READY
+      max_files_per_trigger: 10
+    time_column: event_ts
+    grain: hour
+    key: [hour_ts, sensor_id]
+    aggregates:
+      n: "count(*)"
+      total: "sum(value)"
+    sink:
+      type: table
+      table: marts.hourly_counts
+      mode: update
+```
+
+**The capability boundary is callables.** Config can express declarative
+structure but not functions. Resolve that with a **registry**: built-in names
+(`file`, `mqtt`, `table`) plus dotted-path resolution for user code, so config
+stays fully capable without becoming a programming language:
+
+```yaml
+  - name: minute_spectrum
+    source: {type: file, path: landing/, marker: _READY}
+    time_column: event_ts
+    grain: minute
+    key: [window_ts, sensor_id]
+    strategy: recompute_window             # tier 3 must be declared explicitly
+    memory_profile: materialising
+    udfs: ["my_pkg.signal:arrow_fft"]      # imported and registered before planning
+    aggregates:
+      spectrum: "arrow_fft(list(value ORDER BY event_ts))"
+    sink: {type: table, table: marts.minute_spectrum, mode: update}
+```
+
+A custom source is the same mechanism: `type: "my_pkg.sources:MySource"`.
+
+### CLI surface
+
+Exposed both as `python -m duckstream` and as a `duckstream` console script — cron
+in a venv usually calls the interpreter directly, so do not rely on the script
+being on `PATH`.
+
+| Command | Purpose |
+|---|---|
+| `run --config models.yaml [--model NAME]` | One `AvailableNow` pass. The cron entry point. |
+| `validate --config models.yaml` | Load and validate, non-zero exit on failure. **Run this at deploy time** so a bad model is caught then, not at 03:00 in a cron log. |
+| `status --config models.yaml` | Per model: offset, watermark, last batch, and **lag** — the operational metric that matters. Arrives with `metrics.py`. |
+| `models --config models.yaml` | List declared models with their resolved tier and strategy. |
+
+Cron then becomes:
+
+```cron
+* * * * * cd /opt/pipeline && ./venv/bin/python -m duckstream run --config models.yaml >> logs/duckstream.log 2>&1
+```
+
+### How drift is prevented
+
+Discipline is not sufficient; make it mechanical:
+
+- **Round-trip property test.** For every model, `Model` → dict → YAML → `Model`
+  must reconstruct an identical object. A field addable in Python but not
+  expressible in config fails this test.
+- **Every conformance scenario runs through both front doors** and must produce
+  identical output. That is the parity guarantee, enforced by the suite rather
+  than by review.
+
+Format note: YAML is chosen because nested model declarations read far better than
+the alternatives and it is the ecosystem norm for data tooling, at the cost of a
+`pyyaml` dependency. TOML via stdlib `tomllib` is the zero-dependency alternative
+if that dependency is ever unwelcome on a constrained device — the loader is small
+enough that swapping it is cheap, so keep parsing isolated in `config.py`.
 
 **Why DuckLake matters operationally here**, beyond the lakehouse features: a
 DuckDB *file* can be held by only one process at a time — while one holds it
@@ -335,6 +445,14 @@ Correctness:
   unbounded, for every `non_foldable` model.
 - **Foldability rejection.** Assert the *failure* path — an additive strategy over
   a non-foldable aggregate must be refused at load, not at runtime.
+- **Front-door parity.** Every conformance scenario runs through both the Python
+  API and the YAML/CLI path and must produce identical output. This is what stops
+  the two entry points drifting, and it belongs in the suite rather than in review.
+- **Config round-trip.** For every model, `Model` -> dict -> YAML -> `Model` must
+  reconstruct an identical object. A field addable in Python but not expressible
+  in config fails here, which is precisely the drift this catches early.
+- **`validate` is honest.** A model that fails at load must make
+  `duckstream validate` exit non-zero. Deployment scripts depend on it.
 - **Against DuckLake, always.** DuckLake is the conformance target. In-memory
   DuckDB demonstrably hides DuckLake failures (constraint 7), so a fast
   in-memory path may exist for unit tests but must never be the sole gate. Every
@@ -363,7 +481,8 @@ Performance, to publish the operating envelope:
 |---|---|
 | DuckLake inlining for low-latency small writes | **Explicitly disable** (`ducklake_default_data_inlining_row_limit = 0`). It defaults to 10 rows, so small triggers silently take the path holding ~12 open correctness bugs, making behaviour batch-size dependent. Verified: a 3-row insert writes zero data files by default, one parquet file with it off. Accept small files and compact instead (phase 4). Revisit when those bugs close — inlining is the right long-term answer to small writes. Note the docs contradict themselves on the default (`0` on the ATTACH page, `10` in source — source wins). |
 | Storage backend | **DuckLake, from phase 1.** Not optional. The plain-DuckDB `StateStore` exists only to make unit tests fast and is not a supported production backend. |
-| Entry point | **Open, settle in phase 1.** Script-only versus a `python -m duckstream run --config ...` CLI. Determines whether models are declared in Python or config, so it shapes `model.py`. |
+| Entry point | **Both, built together in phase 1.** Python API and a config-driven CLI, over one canonical `Model`. The config loader is a deserialiser only — no parallel validation, no parallel execution path, no override semantics. Drift is prevented by the round-trip and front-door-parity tests, not by discipline. |
+| Config format | **YAML** (`pyyaml`), for readable nested model declarations and ecosystem familiarity. Keep parsing isolated in `config.py` so stdlib `tomllib` can replace it if the dependency ever becomes unwelcome on a constrained device. |
 | Change feed as a source | **Post-v1**, and evaluate adopting `ducklake_cdc` first. It dies with snapshot expiry, so any consumer must **fail loudly** on a missing snapshot rather than skip silently. |
 | DuckLake maintenance | Do not rely on `CHECKPOINT` to flush inlined data (ducklake#1368). Since v1 avoids inlining, the ordinary maintenance chain suffices. |
 | Concurrency and locking | v1 is single-writer under `AvailableNow`, so contention is structurally impossible and **no lock is needed**. DuckLake additionally retries snapshot-id conflicts without rewriting data files. A portable lock arrives with `ProcessingTime`. Never `fcntl` — it is POSIX-only and breaks import on Windows. |
