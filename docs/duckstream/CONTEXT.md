@@ -149,6 +149,57 @@ in-memory DuckDB**, and must exercise at least two batches so the matched branch
 is reached. Bounds are computed in the host language and inlined as literals,
 which also lets DuckLake prune files on timestamp statistics.
 
+### 1.6 A DuckDB file cannot be shared across processes
+
+**Method.** Held `lock_test.duckdb` open read-write in one process, then tried to
+open it from a second process.
+
+| Second process | Result |
+|---|---|
+| `read_only=True` | **FAILED** — lock error naming the holding PID |
+| read-write | **FAILED** — same |
+| read-write, after the first released it | OK |
+
+**Conclusion.** While one process holds a DuckDB *file*, no other process can open
+it **even read-only**. A long-running engine on a single DuckDB file would lock
+the user out of their own warehouse.
+
+**Consequence.** Two things follow. `AvailableNow` under cron is safe because the
+process opens, drains and closes, leaving the file free between runs. And it is an
+independent argument for DuckLake as the storage layer: the catalog is a separate
+database and the data is parquet, so readers attach freely while the engine
+writes. This is what makes a `ProcessingTime` daemon viable at all.
+
+### 1.7 DuckLake inlining silently captures small batches
+
+**Method.** Fresh DuckLake catalog, `CREATE TABLE t (i INTEGER)`, then
+`INSERT INTO t SELECT * FROM range(0,3)` — 3 rows, below the default limit of 10.
+Compared `ducklake_default_data_inlining_row_limit` at its default versus `0`,
+checking both `ducklake_list_files` and parquet files on disk.
+
+| Setting | `ducklake_list_files` | parquet on disk | Where the rows went |
+|---|---|---|---|
+| default (`10`) | 0 | 0 | **inlined into the catalog** |
+| `0` | 1 | 1 | wrote a parquet data file |
+
+**Conclusion.** Inlining is on by default and captures any write smaller than 10
+rows. For a streaming engine this means **batch size decides which code path you
+are on** — and the small-batch path is the one carrying the open correctness bugs
+in 2.3. Behaviour therefore varies between a busy trigger and a quiet one, which
+is the worst kind of surface to debug.
+
+**Consequence.** The engine sets `ducklake_default_data_inlining_row_limit = 0`
+explicitly. The cost is one parquet file per trigger, which makes compaction a
+framework-owned concern rather than an operator chore. Revisit when the inlining
+bugs close — inlining is genuinely the right long-term answer to small writes, and
+DuckLake's own benchmarks show large gains from it.
+
+Also verified: **`ATTACH 'ducklake:...'` autoloads the extension** — no explicit
+`INSTALL`/`LOAD` required (`loaded=True, installed=True` afterwards). But autoload
+still needs the extension present or downloadable, so run `INSTALL ducklake` once
+on a target device while it has network. Being explicit costs nothing and avoids a
+first-run failure on a disconnected deployment.
+
 ---
 
 ## 2. Researched constraints
@@ -200,8 +251,13 @@ six-week window, concentrated in exactly these two features:
 | 1390/1391 | Dead inlined rows never reclaimed |
 | 1305 | Stale membership, concurrent reader sees a missing inlined table after flush |
 
-**Consequence.** v1 depends on **neither** inlining nor the change feed. This
-reverses an earlier recommendation in this project to raise
+**Consequence.** These are *peripheral* features, not DuckLake's core table
+storage, snapshots or transactions — so this is **not** an argument against
+building on DuckLake. It is an argument for depending on neither inlining nor the
+change feed. v1 uses DuckLake as its storage layer from phase 1, with inlining
+explicitly disabled (see 1.7) and no change-feed source.
+
+This also reverses an earlier recommendation in this project to *raise*
 `ducklake_default_data_inlining_row_limit` and to use `CHECKPOINT` for
 maintenance — both land squarely in the buggy area. Revisit only after these
 close, with a pinned version and a reconciliation check.
@@ -345,7 +401,8 @@ Do not re-litigate these without new evidence.
 | Semantics | **Micro-batch plus event time**: offsets, triggers, tumbling windows, watermarks, append/update output. | The core that makes it recognizably structured streaming. Stateful joins and arbitrary keyed state are explicitly post-v1. |
 | First sources | **File/directory tailing**, then **MQTT landing writer**. | The file source is replayable, which is what exactly-once requires. MQTT fills an empty slot but cannot itself be replayable. |
 | Guarantee | **Exactly-once via atomic commit** — offsets and data in one transaction. | Measurement 1.4 makes this nearly free, and it is a structural advantage over bolting a sink onto Spark, where offset and output stores are separate systems. |
-| Storage | **Pluggable; plain DuckDB must work.** DuckLake is one backend, added in phase 4. | Keeps the framework generic and avoids betting v1 on DuckLake's buggiest surfaces (2.3). |
+| Storage | **DuckLake, from phase 1.** Not an optional backend. The plain-DuckDB `StateStore` exists only to keep unit tests fast, and is never the sole test gate. | The deliverable is a streaming engine *for a lakehouse* — parquet data, a SQL catalog, snapshots, time travel, schema evolution. The bugs in 2.3 are in inlining and the change feed, not in core storage, so they are avoided by disabling those two features (1.7) rather than by avoiding DuckLake. Measurement 1.6 independently rules out a shared single-file DuckDB. |
+| Inlining | **Explicitly disabled** (`= 0`). | It defaults to 10 rows and silently captures small batches into the buggiest path (1.7). Accept small files, compact instead. |
 | MQTT modelling | **Landing writer, not a source.** | MQTT has no replayable offset; once a message is acked it is gone. Exactly-once is impossible directly, so land durably first and treat that as the source. |
 | Differentiator | **Foldability classification** with load-time rejection. | See below. |
 
