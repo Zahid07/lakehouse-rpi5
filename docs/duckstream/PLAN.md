@@ -30,16 +30,20 @@ its rejection test *before* any execution code: the framework's whole value
 proposition is refusing incorrect models, so that path is the specification.
 
 **Definition of done for Phase 1:** one file source, one `additive` model, one
-`AvailableNow` trigger, plain DuckDB backend, and a fault-injection test that
-kills the process between sink write and commit and proves on restart that rows
-are neither lost nor duplicated. Nothing else. Resist adding windows, DuckLake, or
-extra sources until that test passes — it is the load-bearing claim of the whole
-framework.
+`AvailableNow` trigger, **DuckLake state store and sink with inlining disabled**,
+and a fault-injection test that kills the process between sink write and commit
+and proves on restart that rows are neither lost nor duplicated. Nothing else.
+Resist adding windows or extra sources until that test passes — it is the
+load-bearing claim of the whole framework.
 
 **Working agreements:**
 
 - Every phase ends with tests passing, including the fault-injection test.
-- Never assume DuckLake behaves like DuckDB; run conformance on both (constraint 7).
+- DuckLake is the storage layer and the conformance target. Never assume it
+  behaves like plain DuckDB — it demonstrably does not (constraint 7), and
+  in-memory tests hide real failures.
+- Always set `ducklake_default_data_inlining_row_limit = 0`. It defaults to 10,
+  which silently routes small batches through DuckLake's buggiest code path.
 - When a measured number in `CONTEXT.md` conflicts with intuition, trust the
   number or re-measure it — do not reason around it.
 - Keep `duckstream/` free of any import from this repo's existing pipeline. The
@@ -62,7 +66,9 @@ DuckDB has no continuous-ingestion story. Concretely:
 The goal is a **generic micro-batch streaming framework**, modelled on Spark
 Structured Streaming: sources with durable offsets, a trigger loop, event-time
 windows with watermarks, correct incremental aggregation, and idempotent sinks —
-delivered as a Python library over DuckDB, with pluggable storage.
+delivered as a Python library over **DuckDB and DuckLake**, so the output is a
+real lakehouse: parquet data files, a SQL catalog, snapshots, time travel and
+schema evolution.
 
 ## The differentiator: foldability classification
 
@@ -95,7 +101,8 @@ Stating these prevents scope collapse:
   research-grade problem. The framework handles declared aggregate models.
 - **Not distributed.** Single process, vertical scale.
 - **Not a broker.** It reads from brokers and files, it does not replace them.
-- **Not a DuckDB extension.** See `CONTEXT.md` for why, in detail.
+- **Not a DuckDB extension.** See `CONTEXT.md` for why, in detail. It is a
+  Python process that drives an embedded DuckDB — see *Running it*.
 
 ## Architecture
 
@@ -105,7 +112,7 @@ Four planes. The trigger loop stays in the host process, never in the database.
 Trigger   AvailableNow / Once / ProcessingTime   - cron or supervisor owns it
 Plan      offsets in, bounded micro-batch out    - enforces memory limits
 Execute   SQL over (micro-batch x state)         - DuckDB
-State     offsets, watermarks, windows, metrics  - pluggable backend
+State     offsets, watermarks, windows, metrics  - DuckLake tables
 ```
 
 ### Core protocols
@@ -128,9 +135,48 @@ class StateStore(Protocol):                            # DuckDB table | DuckLake
 `Offset` is JSON-serialisable — a consumed-file set or high-water mark for files,
 a broker sequence for streams, a snapshot id for CDC sources.
 
-**Storage is pluggable and DuckLake is optional.** A plain DuckDB file must work
-as both state store and sink. This keeps the framework generic and avoids betting
-v1 on DuckLake's newest surfaces (constraint 8).
+### Storage: DuckLake is the foundation
+
+**DuckLake is the storage layer, from phase 1, not an optional backend.** The
+framework is a streaming engine *for a lakehouse* — parquet data files, a SQL
+catalog, snapshots, time travel and schema evolution are the point, not an
+add-on.
+
+The `StateStore` abstraction is retained for one reason only: a plain in-memory
+DuckDB implementation makes unit tests fast. It is **not** a supported production
+backend, and it is never the sole test gate — conformance runs against DuckLake,
+because in-memory DuckDB demonstrably hides DuckLake failures (constraint 7).
+
+Time travel is a genuine asset for this framework, not just a feature to inherit.
+Because every trigger is one snapshot (constraint 6), you can query a mart exactly
+as it stood before and after any batch. That makes the exactly-once verification
+directly inspectable rather than inferred — use it in the fault-injection tests.
+
+### Required DuckLake setup
+
+```sql
+INSTALL ducklake;                      -- ATTACH autoloads, but be explicit:
+LOAD ducklake;                         -- autoload still needs it pre-installed,
+                                       -- which an air-gapped device will not do
+ATTACH 'ducklake:catalog.ducklake' AS lake (DATA_PATH 'lake_data');
+USE lake;
+```
+
+Attaching an existing catalog omits `DATA_PATH` — it is already recorded. Deploy
+note: run `INSTALL ducklake` once on the target device while it has network, or
+the first run of a disconnected deployment fails.
+
+**Settings the engine must set explicitly**, not inherit:
+
+| Setting | Value | Why |
+|---|---|---|
+| `ducklake_default_data_inlining_row_limit` | **`0`** | Inlining defaults to **10 rows**, so any trigger writing fewer than 10 rows silently takes the inlining path — which is where the open correctness bugs are (constraint 8). Verified: a 3-row insert produces zero data files by default, one parquet file with inlining off. Leaving it on makes behaviour depend on batch size, i.e. non-deterministic across triggers. Disable it for uniformity, and revisit only when those bugs close. |
+| `ducklake_max_retry_count` | `10` (default) | Snapshot-id conflicts retry without rewriting staged data files. |
+| `memory_limit`, `threads` | per device | The buffer manager is the memory ceiling (constraint 1). |
+
+**The cost of disabling inlining is small files** — one parquet file per trigger
+per table. That makes compaction a first-class, framework-owned concern rather
+than an operator chore; see phase 4.
 
 ### Exactly-once
 
@@ -185,18 +231,25 @@ From constraint 1: bound rows, not UDF cost.
 
 ## Phases
 
-1. **Core loop.** `Model`, `Source`, `Sink`, `StateStore` protocols. File source
-   with completion markers. `AvailableNow` trigger only — no background thread;
-   cron or a supervisor drives it. Plain DuckDB backend. Prove one exactly-once
-   batch end to end, including a fault-injected replay.
+1. **Core loop on DuckLake.** `Model`, `Source`, `Sink`, `StateStore` protocols.
+   File source with completion markers. `AvailableNow` trigger only — no
+   background thread; cron or a supervisor drives it. **DuckLake state store and
+   sink from the start**, with inlining disabled and one snapshot per trigger.
+   Prove one exactly-once batch end to end, including a fault-injected replay
+   verified against the snapshot history.
 2. **Event time.** Watermarks, tumbling windows, sealing past the lateness
    horizon, `append` and `update` output modes via merge-by-key.
 3. **Foldability.** All three tiers with load-time validation and the rejection
    path. Arrow-mode UDF helpers for tier three. Window-range chunking sized from
    estimated rows.
-4. **DuckLake backend.** State store and sink on DuckLake, one snapshot per
-   trigger. Run the full conformance suite on both backends and expect divergence
-   (constraint 7). Depends on neither inlining nor the change feed.
+4. **Maintenance and small files.** Because inlining is off, every trigger writes
+   a parquet file — so compaction is part of the framework, not an operator
+   chore. A maintenance model running `ducklake_merge_adjacent_files`,
+   `ducklake_expire_snapshots` and `ducklake_cleanup_old_files` on its own
+   cadence, with the retention window set from the lateness horizon. Do **not**
+   rely on `CHECKPOINT` to flush inlined data (ducklake#1368) — moot here, but do
+   not reintroduce the dependency. Also add partitioning of sink tables by time
+   grain, which is what makes window-range scans prune to a few files.
 5. **MQTT landing writer.** Fills a genuinely empty slot — no MQTT extension for
    DuckDB exists. At-least-once into durable storage, replayable downstream.
 6. **Validation on a real workload.** Point it at a real sensor pipeline and diff
@@ -209,6 +262,63 @@ Post-v1: `ProcessingTime` trigger with portable locking, sliding and session
 windows, CDC source (evaluate adopting `ducklake_cdc` rather than building),
 Kafka (evaluate Tributary plus external offset tracking), stream-stream joins,
 native extension against the DuckDB v2.0 C ABI.
+
+## Running it
+
+Worth being explicit, because it is the first thing a user asks and it shapes the
+entry point. duckstream is **not** `INSTALL duckstream; LOAD duckstream;` — that
+is the extension model, which is out of scope. It is a Python process that drives
+an embedded DuckDB, so "running it" means running Python on a schedule.
+
+A user writes a script declaring models, and cron drives it:
+
+```python
+# pipeline.py
+import duckdb
+from duckstream import Engine, Model, FileSource, TableSink, AvailableNow
+
+con = duckdb.connect()                       # in-memory session, DuckLake holds the data
+engine = Engine(con, catalog="ducklake:catalog.ducklake", data_path="lake_data")
+
+engine.add(Model(
+    name="hourly_counts",
+    source=FileSource("landing/", marker="_READY", max_files_per_trigger=10),
+    time_column="event_ts",
+    grain="hour",
+    key=["hour_ts", "sensor_id"],
+    aggregates={"n": "count(*)", "total": "sum(value)"},   # additive tier
+    sink=TableSink("marts.hourly_counts", mode="update"),
+))
+
+engine.run(trigger=AvailableNow())           # drain what is available, then exit
+```
+
+```cron
+* * * * * cd /opt/pipeline && ./venv/bin/python pipeline.py >> logs/duckstream.log 2>&1
+```
+
+Results are ordinary DuckLake tables, so the read path is plain SQL from any
+DuckDB client — duckstream is not in it:
+
+```sql
+ATTACH 'ducklake:catalog.ducklake' AS lake;
+SELECT * FROM lake.marts.hourly_counts ORDER BY hour_ts DESC LIMIT 5;
+```
+
+**An entry-point decision is still open** and should be settled in phase 1, since
+it shapes `model.py`: script-only as above, or also a
+`python -m duckstream run --config models.yaml` CLI. A cron-driven framework
+arguably wants the CLI more than the importable API, and the choice determines
+whether models are declared in Python or in config.
+
+**Why DuckLake matters operationally here**, beyond the lakehouse features: a
+DuckDB *file* can be held by only one process at a time — while one holds it
+read-write, no other process can open it **even read-only** (measured; see
+`CONTEXT.md`). A long-running engine on a single DuckDB file would lock you out of
+your own warehouse. DuckLake avoids this entirely: the catalog is a separate
+database and the data is parquet, so readers attach freely while the engine
+writes. This is what makes a `ProcessingTime` daemon viable later, and it is
+another reason DuckLake is the foundation rather than an option.
 
 ## Verification
 
@@ -225,7 +335,15 @@ Correctness:
   unbounded, for every `non_foldable` model.
 - **Foldability rejection.** Assert the *failure* path — an additive strategy over
   a non-foldable aggregate must be refused at load, not at runtime.
-- **Both backends.** Whole suite against DuckDB and DuckLake (constraint 7).
+- **Against DuckLake, always.** DuckLake is the conformance target. In-memory
+  DuckDB demonstrably hides DuckLake failures (constraint 7), so a fast
+  in-memory path may exist for unit tests but must never be the sole gate. Every
+  suite must also run at least two batches, so the `WHEN MATCHED` merge branch is
+  reached — the constraint-7 bug appeared only on the second batch.
+- **Snapshot accounting.** One trigger produces exactly one snapshot. Assert it,
+  because it is what the exactly-once guarantee rests on.
+- **No inlined data.** Assert `ducklake_list_files` is non-empty after a small
+  batch, proving inlining stayed off and the batch did not take the buggy path.
 - **Watermark semantics.** Late data inside the horizon updates its window; data
   past the horizon is dropped **and counted**, never silently absorbed.
 
@@ -243,7 +361,9 @@ Performance, to publish the operating envelope:
 
 | Question | v1 resolution |
 |---|---|
-| DuckLake inlining for low-latency small writes | **Do not use.** ~12 open correctness bugs filed in six weeks. Revisit only after they close, with a pinned version and a reconciliation check. Note the docs contradict themselves on the default (`0` on the ATTACH page, `10` in source — source wins). |
+| DuckLake inlining for low-latency small writes | **Explicitly disable** (`ducklake_default_data_inlining_row_limit = 0`). It defaults to 10 rows, so small triggers silently take the path holding ~12 open correctness bugs, making behaviour batch-size dependent. Verified: a 3-row insert writes zero data files by default, one parquet file with it off. Accept small files and compact instead (phase 4). Revisit when those bugs close — inlining is the right long-term answer to small writes. Note the docs contradict themselves on the default (`0` on the ATTACH page, `10` in source — source wins). |
+| Storage backend | **DuckLake, from phase 1.** Not optional. The plain-DuckDB `StateStore` exists only to make unit tests fast and is not a supported production backend. |
+| Entry point | **Open, settle in phase 1.** Script-only versus a `python -m duckstream run --config ...` CLI. Determines whether models are declared in Python or config, so it shapes `model.py`. |
 | Change feed as a source | **Post-v1**, and evaluate adopting `ducklake_cdc` first. It dies with snapshot expiry, so any consumer must **fail loudly** on a missing snapshot rather than skip silently. |
 | DuckLake maintenance | Do not rely on `CHECKPOINT` to flush inlined data (ducklake#1368). Since v1 avoids inlining, the ordinary maintenance chain suffices. |
 | Concurrency and locking | v1 is single-writer under `AvailableNow`, so contention is structurally impossible and **no lock is needed**. DuckLake additionally retries snapshot-id conflicts without rewriting data files. A portable lock arrives with `ProcessingTime`. Never `fcntl` — it is POSIX-only and breaks import on Windows. |
