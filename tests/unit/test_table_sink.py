@@ -390,10 +390,32 @@ def make_model(sink, **overrides) -> Model:
     return Model(**defaults)
 
 
-def make_ctx(model: Model, batch_id: int) -> BatchContext:
+def make_append_model(sink, **overrides) -> Model:
+    """The **unwindowed** append model: a per-batch row, no fold, any tier.
+
+    Append without a grain is the tier-agnostic escape hatch, and it is what
+    the tests below are about. Append *with* a grain is a different mechanism
+    entirely -- it folds into an open-window accumulator and emits each window
+    once when the watermark seals it -- so it needs its own model, its own
+    horizon and its own tests; see the sealed-append section.
+    """
+    defaults = dict(grain=None, time_column=None, key=["sensor"])
+    defaults.update(overrides)
+    return make_model(sink, **defaults)
+
+
+def make_sealing_model(sink, **overrides) -> Model:
+    """The **windowed** append model: fold while open, emit once when sealed."""
+    defaults = dict(lateness="0 seconds")
+    defaults.update(overrides)
+    return make_model(sink, **defaults)
+
+
+def make_ctx(model: Model, batch_id: int, watermark=None) -> BatchContext:
     return BatchContext(
         model_name=model.name,
         batch_id=batch_id,
+        watermark=watermark,
         plan=BatchPlan(
             start=None,
             end={"batch": batch_id},
@@ -404,11 +426,19 @@ def make_ctx(model: Model, batch_id: int) -> BatchContext:
     )
 
 
-def write_batches(con, sink, model, batches, *, columns=_COLUMNS, types=_TYPES):
-    """Run every batch through the sink, one write per batch."""
+def write_batches(
+    con, sink, model, batches, *, columns=_COLUMNS, types=_TYPES, watermarks=None
+):
+    """Run every batch through the sink, one write per batch.
+
+    ``watermarks`` supplies one watermark per batch for the sealed-append path,
+    where the sink is told how far event time has advanced. It stays ``None``
+    everywhere else, which is what a model with no lateness horizon carries.
+    """
     for batch_id, rows in enumerate(batches, start=1):
         view = make_view(con, rows, columns=columns, types=types)
-        sink.write(con, view, model, make_ctx(model, batch_id))
+        watermark = None if watermarks is None else watermarks[batch_id - 1]
+        sink.write(con, view, model, make_ctx(model, batch_id, watermark))
 
 
 def sink_rows(con, sink, model) -> list[tuple]:
@@ -819,7 +849,7 @@ def test_append_tolerates_a_type_the_fold_could_not_bind(lake):
     # pipeline to prevent a failure that does not occur, so the type check is
     # scoped to update mode.
     sink = TableSink("marts.pre", mode="append")
-    model = make_model(sink)
+    model = make_append_model(sink)
     _make_target(lake, GOOD_COLUMNS.replace('"n" BIGINT', '"n" VARCHAR'))
 
     write_batches(lake, sink, model, BATCHES[:2])
@@ -834,7 +864,7 @@ def test_append_tolerates_a_type_the_fold_could_not_bind(lake):
 def test_append_still_reports_a_missing_column(lake):
     # append skips the *type* check, not the name check.
     sink = TableSink("marts.pre", mode="append")
-    model = make_model(sink)
+    model = make_append_model(sink)
     _make_target(lake, '"window_ts" TIMESTAMP, "sensor" VARCHAR, "n" BIGINT')
     with pytest.raises(DuckstreamError, match="'total'"):
         sink.write(lake, make_view(lake, BATCHES[0]), model, make_ctx(model, 1))
@@ -1072,7 +1102,7 @@ def test_an_all_null_batch_arriving_first_is_still_correct(lake):
 
 def test_append_inserts_without_merging(lake):
     sink = TableSink("marts.appended", mode="append")
-    model = make_model(sink)
+    model = make_append_model(sink)
     sink.ensure(lake, model)
     write_batches(lake, sink, model, BATCHES)
 
@@ -1085,7 +1115,7 @@ def test_append_inserts_without_merging(lake):
         lake.execute(f"SELECT count(*) FROM {sink.qualified_name}").fetchone()[0]
         == expected
     )
-    assert expected == 13
+    assert expected == 11
 
 
 def test_append_repeats_a_replayed_batch(lake):
@@ -1093,7 +1123,7 @@ def test_append_repeats_a_replayed_batch(lake):
     # does not deduplicate, and idempotency for append comes from the engine's
     # offset transaction alone.
     sink = TableSink("marts.appended", mode="append")
-    model = make_model(sink)
+    model = make_append_model(sink)
     write_batches(lake, sink, model, [BATCHES[0], BATCHES[0]])
     assert lake.execute(f"SELECT count(*) FROM {sink.qualified_name}").fetchone() == (
         4,
@@ -1102,7 +1132,7 @@ def test_append_repeats_a_replayed_batch(lake):
 
 def test_append_totals_equal_the_sum_of_per_batch_aggregates(lake):
     sink = TableSink("marts.appended", mode="append")
-    model = make_model(sink)
+    model = make_append_model(sink)
     write_batches(lake, sink, model, BATCHES)
     total = lake.execute(f"SELECT sum(total) FROM {sink.qualified_name}").fetchone()[0]
     assert total == sum(r[2] for batch in BATCHES for r in batch)
@@ -1112,10 +1142,214 @@ def test_append_accepts_a_non_additive_model(lake):
     # The phase-3 refusal is scoped to folding. Appending a per-batch average is
     # a legitimate thing to want and involves no fold at all.
     sink = TableSink("marts.avg_by_batch", mode="append")
-    model = make_model(sink, aggregates={"mean_val": "avg(val)"})
+    model = make_append_model(sink, aggregates={"mean_val": "avg(val)"})
     sink.ensure(lake, model)
     write_batches(lake, sink, model, BATCHES[:2])
     assert lake.execute(f"SELECT count(*) FROM {sink.qualified_name}").fetchone()[0] > 0
+
+
+# ==========================================================================
+# append over windows: fold while open, emit once when sealed
+# ==========================================================================
+#
+# The mechanism phase 2 adds, and the one that makes `append` mean what it
+# says. Phase 1's windowed append wrote a partial row per window per batch;
+# Model.validate now refuses that shape outright, and this is what replaces it.
+# The end-to-end contract -- against DuckLake, through both front doors, with
+# the watermark coming from the engine -- is tests/conformance/test_event_time.py.
+
+
+def normalise_rows(rows):
+    return sorted(tuple(r) for r in rows)
+
+
+def test_the_accumulator_sits_beside_the_target(lake):
+    sink = TableSink("marts.sealed", mode="append")
+    assert sink.open_windows_name == "sealed__open_windows"
+    assert sink.qualified_open_windows == '"marts"."sealed__open_windows"'
+
+
+def test_windowed_append_is_recognised_only_with_a_grain():
+    sink = TableSink("marts.sealed", mode="append")
+    assert sink.windowed_append(make_sealing_model(sink))
+    assert not sink.windowed_append(make_append_model(sink))
+    assert not TableSink("marts.x", mode="update").windowed_append(
+        make_sealing_model(TableSink("marts.x", mode="update"))
+    )
+
+
+def test_an_open_window_is_held_back_and_a_sealed_one_is_written(lake):
+    """The whole contract in one test: nothing before the watermark passes.
+
+    ``lateness='0 seconds'`` in ``make_sealing_model`` keeps the arithmetic
+    readable -- a window seals the moment the watermark reaches its end -- and
+    the horizon's own width is tested in test_watermark.py.
+    """
+    sink = TableSink("marts.sealed", mode="append")
+    model = make_sealing_model(sink)
+    sink.ensure(lake, model)
+
+    # BASE is 08:00; batch one lands wholly inside the 08:00 window.
+    write_batches(lake, sink, model, [BATCHES[0]], watermarks=[BASE])
+    assert lake.execute(f"SELECT count(*) FROM {sink.qualified_name}").fetchone() == (0,)
+    assert lake.execute(
+        f"SELECT count(*) FROM {sink.qualified_open_windows}"
+    ).fetchone() == (2,)
+
+    # A watermark of 09:00 ends the 08:00 window.
+    write_batches(
+        lake, sink, model, [BATCHES[0]], watermarks=[BASE + dt.timedelta(hours=1)]
+    )
+    assert lake.execute(
+        f"SELECT count(*) FROM {sink.qualified_open_windows}"
+    ).fetchone() == (0,)
+    assert lake.execute(f"SELECT count(*) FROM {sink.qualified_name}").fetchone() == (2,)
+
+
+def test_a_window_is_emitted_once_however_many_batches_fed_it(lake):
+    """The phase-1 defect, asserted from the other side.
+
+    Four batches touch the 08:00 window; exactly one row per key comes out of
+    it, carrying the fold of all four.
+    """
+    sink = TableSink("marts.sealed", mode="append")
+    model = make_sealing_model(sink)
+    sink.ensure(lake, model)
+
+    open_ = [None, None, None, BASE + dt.timedelta(hours=1)]
+    write_batches(lake, sink, model, BATCHES, watermarks=open_)
+
+    rows = sink_rows(lake, sink, model)
+    windows = [row[0] for row in rows]
+    assert len(windows) == len(set(zip(windows, [r[1] for r in rows]))), rows
+    assert all(row[0] == BASE for row in rows), (
+        f"only the 08:00 window should have sealed at this watermark: {rows}"
+    )
+
+    # And its values are the fold of every batch that fed it, not of the last.
+    expected = lake.execute(
+        sink.aggregation_sql(make_view(lake, [r for b in BATCHES for r in b]), model)
+        + f" HAVING {sink._window_expression(model)} = TIMESTAMP '{BASE}'"
+    ).fetchall()
+    assert normalise_rows(rows) == normalise_rows(expected)
+
+
+def test_nothing_seals_before_a_watermark_exists(lake):
+    """No watermark, no completeness claim -- but the mart still exists, empty.
+
+    An empty mart that is visibly empty is worth more than a mart that does not
+    exist: the first is a stream that has not sealed anything yet, the second
+    is indistinguishable from a broken deployment.
+    """
+    sink = TableSink("marts.sealed", mode="append")
+    model = make_sealing_model(sink)
+    write_batches(lake, sink, model, BATCHES[:2], watermarks=[None, None])
+
+    assert sink.existing_columns(lake) == sink.output_columns(model)
+    assert lake.execute(f"SELECT count(*) FROM {sink.qualified_name}").fetchone() == (0,)
+    assert lake.execute(
+        f"SELECT count(*) FROM {sink.qualified_open_windows}"
+    ).fetchone()[0] > 0
+
+
+def test_a_later_batch_at_the_same_watermark_emits_nothing_further(lake):
+    """Emission and eviction are one transaction, so nothing is left to re-emit.
+
+    The second batch lands entirely in the *next* window, which the unchanged
+    watermark has not reached, so the mart must be untouched. If eviction had
+    not accompanied emission, the already-emitted 08:00 window would still be
+    sitting in the accumulator and would be written a second time here.
+    """
+    sink = TableSink("marts.sealed", mode="append")
+    model = make_sealing_model(sink)
+    high = BASE + dt.timedelta(hours=1)
+    write_batches(lake, sink, model, [BATCHES[0]], watermarks=[high])
+    first = sink_rows(lake, sink, model)
+    assert first, "the 08:00 window should have sealed"
+
+    write_batches(lake, sink, model, [[row(80, "a", 8)]], watermarks=[high])
+    assert sink_rows(lake, sink, model) == first
+
+
+def test_the_sink_does_not_filter_late_rows_itself(lake):
+    """A contract boundary worth pinning: the engine filters, the sink folds.
+
+    Handed a row belonging to a window it has already emitted, the sink folds
+    it and emits that window again -- it has no watermark history and no way to
+    know. That is not a defect to be fixed here; duplicating the check would put
+    the same decision in two places, and the sink's copy would be the one
+    without the committed watermark to check against.
+    ``duckstream.engine`` removes such rows before ``write`` ever sees them, and
+    ``tests/conformance/test_event_time.py`` is where that is proved end to end.
+    """
+    sink = TableSink("marts.sealed", mode="append")
+    model = make_sealing_model(sink)
+    high = BASE + dt.timedelta(hours=1)
+    write_batches(lake, sink, model, [BATCHES[0]], watermarks=[high])
+    emitted = len(sink_rows(lake, sink, model))
+
+    write_batches(lake, sink, model, [[row(1, "a", 99)]], watermarks=[high])
+    assert len(sink_rows(lake, sink, model)) == emitted + 1
+
+
+def test_the_seal_and_evict_statements_carry_no_scalar_subquery(lake):
+    """``CONTEXT.md`` 1.5, applied to the statements phase 2 adds.
+
+    A ``(SELECT ...)`` here would fail against DuckLake with ``Out of buffer``
+    and, as in 1.5, only once the matched branch had been reached -- so a
+    structural check is cheap insurance that a behavioural one cannot give.
+    """
+    sink = TableSink("marts.sealed", mode="append")
+    model = make_sealing_model(sink)
+    cutoff = BASE + dt.timedelta(hours=1)
+
+    for statement in (sink.seal_sql(model, cutoff), sink.evict_sql(cutoff)):
+        assert "(SELECT" not in statement.upper().replace("( SELECT", "(SELECT")
+        assert quote_literal(cutoff) in statement
+
+    # The accumulator merge is the one that takes a WHEN MATCHED branch, so it
+    # gets the same check the target merge already has elsewhere.
+    merge = sink.merge_sql(
+        make_view(lake, BATCHES[0]), model, into=sink.qualified_open_windows
+    )
+    on_clause = merge.split("\n   ON ", 1)[1].split("\n WHEN ", 1)[0]
+    assert "(SELECT" not in on_clause.upper()
+    assert sink.qualified_open_windows in merge
+    assert f"MERGE INTO {sink.qualified_name} AS" not in merge
+
+
+def test_the_accumulator_is_type_checked_because_it_is_merged_into(lake):
+    """The fold binds against the accumulator, so that is where types matter.
+
+    The target only ever receives an ``INSERT ... SELECT`` from the accumulator,
+    which is why the type check follows the *fold* rather than the mode name.
+    """
+    sink = TableSink("marts.sealed", mode="append")
+    model = make_sealing_model(sink)
+    lake.execute("CREATE SCHEMA IF NOT EXISTS marts")
+    lake.execute(
+        f"CREATE TABLE {sink.qualified_open_windows} ("
+        f'"window_ts" TIMESTAMP, "sensor" VARCHAR, "n" VARCHAR, "total" DOUBLE)'
+    )
+    with pytest.raises(DuckstreamError) as excinfo:
+        write_batches(lake, sink, model, [BATCHES[0]], watermarks=[None])
+    message = str(excinfo.value)
+    assert "open_windows" in message and "'n'" in message
+
+
+def test_a_non_additive_windowed_append_is_refused(lake):
+    """Sealing folds across batches, so it needs a foldable aggregate.
+
+    Unwindowed append accepts any tier because it never folds. Windowed append
+    does fold -- that is the whole mechanism -- so the phase-3 refusal applies
+    to it exactly as it does to update mode.
+    """
+    sink = TableSink("marts.sealed", mode="append")
+    model = make_sealing_model(sink, aggregates={"mean_val": "avg(val)"})
+    with pytest.raises(DuckstreamError, match="sufficient_statistics"):
+        sink.ensure(lake, model)
+    with pytest.raises(DuckstreamError, match="sufficient_statistics"):
+        write_batches(lake, sink, model, [BATCHES[0]], watermarks=[None])
 
 
 # ==========================================================================

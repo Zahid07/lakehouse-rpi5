@@ -761,10 +761,13 @@ def test_to_config_expresses_every_field_of_a_fully_populated_model() -> None:
         key=[WINDOW_COLUMN, "sensor_id"],
         time_column="event_ts",
         grain="minute",
+        lateness="10 minutes",
         strategy="recompute_window",
         memory_profile="materialising",
         udfs=["my_pkg.signal:arrow_fft"],
         limits=BatchLimits(max_rows_per_trigger=100_000, max_files_per_trigger=10),
+        on_failure="halt",
+        max_attempts=3,
     )
     model.validate()
 
@@ -781,7 +784,17 @@ def test_to_config_expresses_every_field_of_a_fully_populated_model() -> None:
 
 def test_to_config_omits_fields_left_at_their_default() -> None:
     config = make_model().to_config()
-    for absent in ("time_column", "grain", "strategy", "memory_profile", "udfs", "limits"):
+    for absent in (
+        "time_column",
+        "grain",
+        "lateness",
+        "strategy",
+        "memory_profile",
+        "udfs",
+        "limits",
+        "on_failure",
+        "max_attempts",
+    ):
         assert absent not in config
     assert set(config) == {"name", "source", "sink", "aggregates", "key"}
 

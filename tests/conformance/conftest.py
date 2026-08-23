@@ -73,6 +73,13 @@ SINGLE_DOOR_EXEMPTIONS: dict[str, str] = {
         "invocations PLAN.md requires (python -m duckstream and the console "
         "script). A Python-API variant would not exercise anything new."
     ),
+    "test_a_healthy_batch_creates_no_extra_view": (
+        "needs a RecordingConnection to prove a *negative* -- that no filter "
+        "view was created for a batch with nothing to filter. The CLI door "
+        "builds its own Engine and owns its connection, which is the property "
+        "test_cli_contract.py verifies, so it cannot be given one. The claim is "
+        "about the engine's batch lifecycle, which both doors share verbatim."
+    ),
     "test_run_once_commits_a_single_batch": (
         "`--once` is a CLI flag. The Python API expresses the same thing as "
         "Once(), which harness.World.run(once=True) already drives through both "
@@ -244,11 +251,27 @@ def landing(tmp_path: Path) -> Landing:
 
 @pytest.fixture
 def make_parity(tmp_path: Path, landing: Landing) -> Callable[..., Parity]:
-    """Build a :class:`~harness.Parity` for a scenario, over the shared tree."""
+    """Build a :class:`~harness.Parity` for a scenario, over the shared tree.
+
+    The two *doors* of one parity share a landing tree on purpose -- if they
+    read different trees, a parity failure could be a fixture difference rather
+    than a duckstream difference.
+
+    Two *parities* in one test must not, and ``landing=`` is how a test says so.
+    A file source scans the whole tree, so a second parity over the same one
+    would consume the first's drops as well as its own, and the failure looks
+    exactly like a double-count in the engine. Pass ``landing=Landing(tmp_path /
+    "somewhere_else")`` whenever a test drives more than one parity.
+    """
 
     made: list[Parity] = []
 
-    def factory(scenario: Scenario = ADDITIVE, *, name: str | None = None) -> Parity:
+    def factory(
+        scenario: Scenario = ADDITIVE,
+        *,
+        name: str | None = None,
+        landing: Landing = landing,
+    ) -> Parity:
         label = name or f"case{len(made)}"
         parity = Parity(tmp_path / label, landing, scenario)
         made.append(parity)

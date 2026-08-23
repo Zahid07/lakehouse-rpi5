@@ -79,6 +79,7 @@ __all__ = [
     "ADDITIVE",
     "build_model",
     "normalise",
+    "replay",
     "same_rows",
     "spawn",
 ]
@@ -286,12 +287,15 @@ class Scenario:
     recompute_sql: str
     time_column: str | None = "event_ts"
     grain: str | None = "hour"
+    lateness: str | None = None
     mode: str = "update"
     table: str = "marts.out"
     strategy: str | None = None
     memory_profile: str | None = None
     max_files_per_trigger: int | None = None
     max_rows_per_trigger: int | None = None
+    on_failure: str = "quarantine"
+    max_attempts: int = 5
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -350,8 +354,11 @@ def build_model(scenario: Scenario, landing: Landing | Path) -> Model:
         key=list(scenario.key),
         time_column=scenario.time_column,
         grain=scenario.grain,
+        lateness=scenario.lateness,
         strategy=scenario.strategy,
         memory_profile=scenario.memory_profile,
+        on_failure=scenario.on_failure,
+        max_attempts=scenario.max_attempts,
     )
 
 
@@ -481,6 +488,7 @@ class World:
         once: bool = False,
         model: str | None = None,
         con: Any | None = None,
+        expect_failure: bool = False,
     ) -> RunSummary:
         """One pass through this world's front door.
 
@@ -489,14 +497,22 @@ class World:
         owns its own connection and that is exactly the property being tested.
         """
         if self.door == "python":
-            return self._run_python(once=once, model=model, con=con)
+            return self._run_python(
+                once=once, model=model, con=con, expect_failure=expect_failure
+            )
         assert con is None, "the yaml/CLI door owns its own connection"
-        return self._run_cli(once=once, model=model)
+        return self._run_cli(once=once, model=model, expect_failure=expect_failure)
 
     def _run_python(
-        self, *, once: bool, model: str | None, con: Any | None
+        self,
+        *,
+        once: bool,
+        model: str | None,
+        con: Any | None,
+        expect_failure: bool = False,
     ) -> RunSummary:
         from duckstream import AvailableNow, Engine, Once
+        from duckstream.errors import BatchFailed
 
         owned = con is None
         connection = duckdb.connect() if owned else con
@@ -508,7 +524,16 @@ class World:
                 settings=dict(SETTINGS),
             )
             engine.add(self.model())
-            report = engine.run(trigger=Once() if once else AvailableNow(), model=model)
+            try:
+                report = engine.run(
+                    trigger=Once() if once else AvailableNow(), model=model
+                )
+            except BatchFailed as failure:
+                # A scenario about failure needs the report, not the traceback.
+                # Anything that did *not* ask for a failure still gets one.
+                if not expect_failure:
+                    raise
+                report = failure.report
         finally:
             if owned:
                 connection.close()
@@ -523,7 +548,9 @@ class World:
             empty_passes=sum(1 for r in report if r.is_empty),
         )
 
-    def _run_cli(self, *, once: bool, model: str | None) -> RunSummary:
+    def _run_cli(
+        self, *, once: bool, model: str | None, expect_failure: bool = False
+    ) -> RunSummary:
         """The real CLI, in process.
 
         ``duckstream.cli.main`` is the exact code path ``python -m duckstream
@@ -542,6 +569,15 @@ class World:
             argv += ["--model", model]
         out, err = io.StringIO(), io.StringIO()
         code = main(argv, out=out, err=err)
+        if expect_failure:
+            assert code != 0, (
+                "the CLI exited 0 for a run expected to fail, so a broken "
+                "pipeline would look healthy to cron"
+            )
+            return RunSummary(
+                door=self.door, returncode=code,
+                stdout=out.getvalue() + err.getvalue(),
+            )
         assert code == 0, f"cli run failed ({code}):\n{err.getvalue()}"
         return RunSummary(
             door=self.door, returncode=code, stdout=out.getvalue() + err.getvalue()
@@ -602,10 +638,54 @@ class World:
             offset = store.load_offset(con, self.scenario.name)
         return sorted((offset or {}).get("consumed", {}))
 
+    def quarantined(self) -> list[dict[str, Any]]:
+        """Batches this world gave up on, straight from the catalog."""
+        with self.connect() as con:
+            store = DuckLakeStateStore(STATE_SCHEMA, catalog=ALIAS)
+            return store.quarantined(con, self.scenario.name)
+
+    def status(self) -> Any:
+        """What ``duckstream status`` would report for this world."""
+        from duckstream.metrics import status_for
+
+        with self.connect() as con:
+            store = DuckLakeStateStore(STATE_SCHEMA, catalog=ALIAS)
+            return status_for(con, store, self.model())
+
     def batch_history(self) -> list[dict[str, Any]]:
         with self.connect() as con:
             store = DuckLakeStateStore(STATE_SCHEMA, catalog=ALIAS)
             return store.batch_history(con, self.scenario.name)
+
+    def watermark(self) -> dt.datetime | None:
+        """The committed watermark, read back the way a restart would read it."""
+        with self.connect() as con:
+            store = DuckLakeStateStore(STATE_SCHEMA, catalog=ALIAS)
+            return store.load_watermark(con, self.scenario.name)
+
+    def drop_counts(self) -> list[tuple[int, int | None, int | None]]:
+        """``(batch_id, rows_late, rows_undated)`` per committed batch.
+
+        Durable, not in-process: read out of ``duckstream.batches`` in the
+        catalog, because ``PLAN.md`` asks for late data to be counted and a
+        count that only ever existed in a return value has not been.
+        """
+        return [
+            (row["batch_id"], row["rows_late"], row["rows_undated"])
+            for row in self.batch_history()
+        ]
+
+    def open_windows(self) -> list[tuple] | None:
+        """The sealed-append accumulator, or ``None`` if this model has none."""
+        with self.connect() as con:
+            try:
+                return normalise(
+                    con.execute(
+                        f"SELECT * FROM {self.scenario.table}__open_windows"
+                    ).fetchall()
+                )
+            except duckdb.Error:
+                return None
 
     def recompute(self, files: Sequence[str] | None = None) -> list[tuple]:
         """Ground truth: the scenario's own SQL over the eligible source files."""
@@ -716,17 +796,33 @@ class Parity:
         }
         self.runs = 0
         self.committed_batches = 0
+        #: Rows landed since the last :meth:`run`, then one entry per run. An
+        #: event-time scenario needs the batch boundaries to reproduce the
+        #: watermark trajectory, and inferring them afterwards would be
+        #: guessing at exactly the thing under test.
+        self.batches: list[list[Row]] = []
+        self._pending: list[Row] = []
 
     # -- input -----------------------------------------------------------
 
     def land(self, name: str, payload: Sequence[Row] | Sequence[tuple], **kw) -> Path:
         """One drop, visible to both doors -- they share the landing tree."""
+        self._pending.extend(
+            r if isinstance(r, Row) else Row(*r) for r in payload
+        )
         return self.landing.drop(name, payload, **kw)
 
     # -- advancing -------------------------------------------------------
 
-    def run(self, *, once: bool = False) -> dict[str, RunSummary]:
-        summaries = {door: w.run(once=once) for door, w in self.worlds.items()}
+    def run(
+        self, *, once: bool = False, expect_failure: bool = False
+    ) -> dict[str, RunSummary]:
+        self.batches.append(list(self._pending))
+        self._pending = []
+        summaries = {
+            door: w.run(once=once, expect_failure=expect_failure)
+            for door, w in self.worlds.items()
+        }
         self.runs += 1
         python = summaries["python"]
         if python.committed:
@@ -759,6 +855,16 @@ class Parity:
                 f"front doors disagree on snapshot count: "
                 f"{reference_door}={expected_snapshots}, "
                 f"{door}={world.snapshot_count()}"
+            )
+            assert world.watermark() == reference.watermark(), (
+                f"front doors disagree on the committed watermark:\n"
+                f"  {reference_door}: {reference.watermark()}\n"
+                f"  {door}: {world.watermark()}"
+            )
+            assert world.drop_counts() == reference.drop_counts(), (
+                f"front doors disagree on what they dropped:\n"
+                f"  {reference_door}: {reference.drop_counts()}\n"
+                f"  {door}: {world.drop_counts()}"
             )
 
     def assert_matches_ground_truth(self) -> list[tuple]:
@@ -811,6 +917,143 @@ class Parity:
             f"MERGE never took its WHEN MATCHED branch, which is the branch "
             f"CONTEXT.md 1.5's DuckLake failure hid behind"
         )
+
+
+# --------------------------------------------------------------------------
+# An independent event-time reference
+# --------------------------------------------------------------------------
+
+
+#: What :func:`replay` can compute. Deliberately not read off the scenario --
+#: a reference that derived its arithmetic from the model's SQL would be
+#: comparing duckstream to itself, which is the failure ``harness``'s header
+#: warns about for ``recompute_sql``.
+REFERENCE_AGGREGATES = ("n", "total", "lo", "hi")
+
+_GRAIN_SECONDS = {"minute": 60, "hour": 3600, "day": 86400}
+
+
+def _floor(moment: dt.datetime, grain: str) -> dt.datetime:
+    """Window start, by epoch arithmetic rather than by field truncation.
+
+    Deliberately a different method from both ``date_trunc`` and
+    :func:`duckstream.windows.floor_to_grain`, which agree with each other by
+    replacing fields. Flooring the epoch second modulo the grain gets there a
+    different way, so the two implementations failing identically would take a
+    coincidence rather than a shared assumption.
+    """
+    epoch = int(moment.replace(tzinfo=dt.timezone.utc).timestamp())
+    seconds = _GRAIN_SECONDS[grain]
+    start = epoch - epoch % seconds
+    return dt.datetime.fromtimestamp(start, dt.timezone.utc).replace(tzinfo=None)
+
+
+@dataclass(frozen=True)
+class Replay:
+    """What :func:`replay` says should be true after the last batch."""
+
+    mart: list[tuple]
+    """Expected sink contents: every window for ``update``, sealed only for
+    ``append``."""
+
+    open_windows: list[tuple]
+    """Windows still accumulating. Empty for ``update``, which never evicts."""
+
+    watermark: dt.datetime | None
+    late: list[int]
+    undated: list[int]
+
+
+def replay(
+    batches: Sequence[Sequence[Row]],
+    *,
+    grain: str,
+    lateness: dt.timedelta,
+    mode: str = "update",
+) -> Replay:
+    """The event-time contract, implemented again, in plain Python.
+
+    This is ground truth for a scenario with a lateness horizon. The plain
+    ``recompute_sql`` cannot serve: what the sink should hold depends on the
+    *watermark trajectory* -- which rows were dropped as late, and which
+    windows had sealed -- and that is a function of the batch boundaries, not
+    of the file contents. So the contract is written out a second time here,
+    from ``PLAN.md``'s description rather than from duckstream's code:
+
+    * the watermark is ``max(event time seen) - lateness`` and never regresses;
+    * a batch is judged against the watermark **committed before it**, so a row
+      is late when its window ``[ws, ws + grain)`` had already ended by then;
+    * a row with no event time belongs to no window;
+    * a window seals when the watermark reaches its end, and in ``append`` mode
+      it moves to the sink exactly once at that moment.
+
+    Aggregates are fixed to :data:`REFERENCE_AGGREGATES` -- count, sum, min,
+    max of ``value`` grouped by window and sensor -- because a reference that
+    interpreted the model's own SQL would not be independent of it.
+    """
+    assert mode in ("update", "append"), mode
+    watermark: dt.datetime | None = None
+    accumulated: dict[tuple, dict] = {}
+    emitted: list[tuple] = []
+    late: list[int] = []
+    undated: list[int] = []
+
+    for batch in batches:
+        rows = [r if isinstance(r, Row) else Row(*r) for r in batch]
+        cutoff = None if watermark is None else watermark - _interval(grain)
+        dated = [r for r in rows if r.event_ts is not None]
+        undated.append(len(rows) - len(dated))
+        if cutoff is None:
+            kept, dropped = dated, []
+        else:
+            kept = [r for r in dated if _floor(r.event_ts, grain) > cutoff]
+            dropped = [r for r in dated if _floor(r.event_ts, grain) <= cutoff]
+        late.append(len(dropped))
+
+        for row in kept:
+            key = (_floor(row.event_ts, grain), row.sensor_id)
+            cell = accumulated.setdefault(
+                key, {"n": 0, "total": 0.0, "lo": None, "hi": None}
+            )
+            cell["n"] += 1
+            cell["total"] += row.value
+            cell["lo"] = row.value if cell["lo"] is None else min(cell["lo"], row.value)
+            cell["hi"] = row.value if cell["hi"] is None else max(cell["hi"], row.value)
+
+        # The maximum is taken over the whole batch, dropped rows included: the
+        # watermark tracks what has been *observed*, and a late row was still
+        # observed. (It cannot raise the watermark anyway -- it is older than
+        # what already moved it -- but saying so is not the same as relying on
+        # it.)
+        newest = max((r.event_ts for r in dated), default=None)
+        if newest is not None:
+            candidate = newest - lateness
+            watermark = candidate if watermark is None else max(watermark, candidate)
+
+        if mode == "append" and watermark is not None:
+            seal = watermark - _interval(grain)
+            for key in sorted(
+                (k for k in accumulated if k[0] <= seal),
+                key=lambda k: (k[0], k[1] is None, str(k[1])),
+            ):
+                cell = accumulated.pop(key)
+                emitted.append((key[0], key[1], cell["n"], cell["total"], cell["lo"], cell["hi"]))
+
+    remaining = [
+        (key[0], key[1], cell["n"], cell["total"], cell["lo"], cell["hi"])
+        for key, cell in accumulated.items()
+    ]
+    return Replay(
+        mart=normalise(emitted if mode == "append" else remaining),
+        open_windows=normalise(remaining if mode == "append" else []),
+        watermark=watermark,
+        late=late,
+        undated=undated,
+    )
+
+
+def _interval(grain: str) -> dt.timedelta:
+    return dt.timedelta(seconds=_GRAIN_SECONDS[grain])
 
 
 # --------------------------------------------------------------------------
@@ -873,12 +1116,15 @@ def _scenario_payload(scenario: Scenario) -> dict[str, Any]:
         "recompute_sql": scenario.recompute_sql,
         "time_column": scenario.time_column,
         "grain": scenario.grain,
+        "lateness": scenario.lateness,
         "mode": scenario.mode,
         "table": scenario.table,
         "strategy": scenario.strategy,
         "memory_profile": scenario.memory_profile,
         "max_files_per_trigger": scenario.max_files_per_trigger,
         "max_rows_per_trigger": scenario.max_rows_per_trigger,
+        "on_failure": scenario.on_failure,
+        "max_attempts": scenario.max_attempts,
     }
 
 

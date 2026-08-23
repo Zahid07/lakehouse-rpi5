@@ -41,7 +41,8 @@ Timestamps are stored naive, in UTC. ``TIMESTAMP WITH TIME ZONE`` values need
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from duckstream.errors import DuckstreamError
@@ -51,6 +52,8 @@ __all__ = [
     "DEFAULT_STATE_SCHEMA",
     "DuckLakeStateStore",
     "MemoryStateStore",
+    "Position",
+    "backoff_delay",
     "decode_offset",
     "encode_offset",
 ]
@@ -111,6 +114,56 @@ def encode_offset(offset: Any) -> str:
         ) from exc
 
 
+#: How much of an exception message is stored. Long enough for a stack-free
+#: DuckDB error, short enough that a runaway message cannot bloat the state.
+_ERROR_LIMIT = 2000
+
+#: How much of a batch payload is stored alongside a quarantine record.
+_PAYLOAD_LIMIT = 8000
+
+
+def encode_offset_or_none(offset: Any) -> str | None:
+    """:func:`encode_offset`, but ``None`` passes through as SQL NULL.
+
+    Only the failure path uses this. Everywhere else a null offset is refused,
+    because committing one would replay the source from the beginning.
+    """
+    return None if offset is None else encode_offset(offset)
+
+
+def _describe(error: Any) -> str | None:
+    """A one-line description of a failure, or ``None``.
+
+    An exception is rendered as ``TypeName: message`` because the type alone is
+    often the actionable half -- ``duckdb.IOException`` and
+    ``duckdb.ConversionException`` want completely different responses.
+    """
+    if error is None:
+        return None
+    if isinstance(error, BaseException):
+        text = f"{type(error).__name__}: {error}"
+    else:
+        text = str(error)
+    return " ".join(text.split())[:_ERROR_LIMIT]
+
+
+def _encode_payload(payload: Any) -> str | None:
+    """The batch's own description of itself, for the quarantine record.
+
+    Best effort and never fatal: this runs while already handling a failure, so
+    a payload that will not serialise must not raise on top of the error being
+    recorded. ``default=repr`` catches the exotic cases, and the whole thing is
+    truncated -- a batch of ten thousand file paths is not worth storing whole.
+    """
+    if payload is None:
+        return None
+    try:
+        text = json.dumps(payload, sort_keys=True, default=repr)
+    except Exception:  # pragma: no cover - default=repr handles almost all
+        text = repr(payload)
+    return text[:_PAYLOAD_LIMIT]
+
+
 def decode_offset(text: str | None) -> Any:
     """Inverse of :func:`encode_offset`. ``None`` in, ``None`` out."""
     if text is None:
@@ -145,6 +198,68 @@ def _coerce_timestamp(value: Any, *, what: str) -> datetime | None:
         f"{what} must be a datetime, a date, ISO-8601 text or None, got "
         f"{type(value).__name__}"
     )
+
+
+#: Retry backoff: 1s, 2s, 4s … capped. Deliberately short and deliberately not
+#: configurable. Under cron each attempt is already a whole tick apart, so this
+#: exists for the *drain loop* -- without it a source that fails instantly would
+#: burn every attempt in a few hundred milliseconds and quarantine data that a
+#: two-second-old transient would have let through.
+BACKOFF_BASE = timedelta(seconds=1)
+BACKOFF_CAP = timedelta(minutes=5)
+
+
+def backoff_delay(attempt: int) -> timedelta:
+    """How long to wait before attempt number ``attempt + 1``.
+
+    Capped exponential, the pattern ``CONTEXT.md`` section 5 records from this
+    repository's own queue worker. ``attempt`` is the number of failures so far;
+    zero means no wait.
+    """
+    if attempt < 1:
+        return timedelta(0)
+    # Cap the exponent before shifting, so a large attempt count cannot build a
+    # huge intermediate value on its way to being clamped.
+    steps = min(attempt - 1, 20)
+    return min(BACKOFF_BASE * (2 ** steps), BACKOFF_CAP)
+
+
+@dataclass(frozen=True)
+class Position:
+    """Where a model is, **and how that is going**.
+
+    The two belong together and are stored together, in one row of ``offsets``,
+    for a reason that is entirely about cost: ``CONTEXT.md`` 1.11 measured a
+    scalar read of a DuckLake state table inside a trigger at ~10 ms, and the
+    engine already pays one of those to learn its offset. Keeping the retry
+    state in a second table would have doubled it on **every** trigger to carry
+    information that matters only when something is broken.
+
+    A failure therefore appends a row carrying the *same* offset it had before
+    -- the position did not move, because nothing committed -- plus the attempt
+    count, the time and the error. A success appends the advanced offset with
+    the counters cleared. Newest row wins either way, so
+    :meth:`_StateStoreBase.load_offset` keeps working unchanged.
+    """
+
+    offset: Any | None = None
+    """The committed offset, or ``None`` if this model has never committed."""
+
+    attempt: int = 0
+    """Consecutive failed attempts at this offset. Zero after any success."""
+
+    failed_at: datetime | None = None
+    error: str | None = None
+
+    @property
+    def failing(self) -> bool:
+        return self.attempt > 0
+
+    def ready_at(self) -> datetime | None:
+        """When the next attempt may run, or ``None`` if it may run now."""
+        if not self.failing or self.failed_at is None:
+            return None
+        return self.failed_at + backoff_delay(self.attempt)
 
 
 class _StateStoreBase:
@@ -206,6 +321,16 @@ class _StateStoreBase:
         """Fully qualified name of the batch-history table."""
         return self._qualified("batches")
 
+    @property
+    def quarantine_table(self) -> str:
+        """Fully qualified name of the quarantine table.
+
+        Holds one row per batch duckstream gave up on and skipped past. It is
+        the durable record that data was lost, so nothing prunes it -- see
+        :meth:`prune`.
+        """
+        return self._qualified("quarantine")
+
     def _schema_qualified(self) -> str:
         if self._catalog_sql is None:
             return self._schema_sql
@@ -220,7 +345,10 @@ class _StateStoreBase:
                     model_name VARCHAR,
                     offset_json VARCHAR,
                     batch_id BIGINT,
-                    updated_at TIMESTAMP
+                    updated_at TIMESTAMP,
+                    attempt BIGINT,
+                    failed_at TIMESTAMP,
+                    error VARCHAR
                 )""",
             f"""CREATE TABLE IF NOT EXISTS {self.watermarks_table} (
                     model_name VARCHAR,
@@ -228,13 +356,26 @@ class _StateStoreBase:
                     batch_id BIGINT,
                     updated_at TIMESTAMP
                 )""",
+            f"""CREATE TABLE IF NOT EXISTS {self.quarantine_table} (
+                    model_name VARCHAR,
+                    batch_id BIGINT,
+                    skipped_from VARCHAR,
+                    skipped_to VARCHAR,
+                    payload_json VARCHAR,
+                    rows_in BIGINT,
+                    attempts BIGINT,
+                    error VARCHAR,
+                    quarantined_at TIMESTAMP
+                )""",
             f"""CREATE TABLE IF NOT EXISTS {self.batches_table} (
                     model_name VARCHAR,
                     batch_id BIGINT,
                     started_at TIMESTAMP,
                     committed_at TIMESTAMP,
                     rows_in BIGINT,
-                    rows_out BIGINT
+                    rows_out BIGINT,
+                    rows_late BIGINT,
+                    rows_undated BIGINT
                 )""",
         ]
 
@@ -249,12 +390,55 @@ class _StateStoreBase:
         try:
             for statement in self._ddl():
                 con.execute(statement)
+            self._migrate(con)
             if owns_transaction:
                 con.execute("COMMIT")
         except BaseException:
             if owns_transaction:
                 self._rollback_quietly(con)
             raise
+
+    def _migrate(self, con) -> None:
+        """Add columns a catalog written by an earlier duckstream is missing.
+
+        ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already
+        exists, so a catalog created before phase 2 has a ``batches`` table
+        without the event-time counters, and every insert into it would fail on
+        the column count. Schema evolution is one of the reasons ``PLAN.md``
+        chose DuckLake in the first place, so the fix is to use it: verified on
+        DuckLake 1.5.5 that ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``
+        succeeds and leaves existing rows NULL in the new column.
+
+        Costs one catalog read per :meth:`ensure`, which the engine calls once
+        per process, and adds no snapshot when there is nothing to add -- a
+        fresh catalog gets these columns from the ``CREATE`` above and never
+        reaches the ``ALTER``.
+        """
+        for table, qualified, columns in (
+            ("batches", self.batches_table, {"rows_late": "BIGINT", "rows_undated": "BIGINT"}),
+            (
+                "offsets",
+                self.offsets_table,
+                {"attempt": "BIGINT", "failed_at": "TIMESTAMP", "error": "VARCHAR"},
+            ),
+        ):
+            existing = {
+                row[0]
+                for row in con.execute(
+                    "SELECT column_name FROM duckdb_columns() "
+                    "WHERE database_name = current_database() "
+                    "  AND schema_name = ? AND table_name = ?",
+                    [self.schema, table],
+                ).fetchall()
+            }
+            if not existing:  # pragma: no cover - the DDL above just created it
+                continue
+            for column, kind in columns.items():
+                if column not in existing:
+                    con.execute(
+                        f"ALTER TABLE {qualified} ADD COLUMN IF NOT EXISTS "
+                        f"{_quote_identifier(column)} {kind}"
+                    )
 
     # -- transaction control --------------------------------------------
 
@@ -320,14 +504,35 @@ class _StateStoreBase:
         assigned once per model per commit and strictly increases, whereas two
         timestamps could in principle tie.
         """
+        return self.load_position(con, model_name).offset
+
+    def load_position(self, con, model_name: str) -> Position:
+        """The committed offset **and** the retry state, in one read.
+
+        One query, because the engine runs this on every trigger and
+        ``CONTEXT.md`` 1.11 measured a second one at ~10 ms. See
+        :class:`Position` for why the two live in the same row.
+
+        A failure row carries the offset it had before -- the position did not
+        move -- so "newest row wins" is still the whole rule. ``offset_json`` is
+        NULL only when a model failed before it had ever committed anything,
+        which decodes to ``None``: replay from the beginning, exactly as a model
+        that has never run.
+        """
         row = con.execute(
-            f"SELECT offset_json FROM {self.offsets_table} WHERE model_name = ? "
+            f"SELECT offset_json, attempt, failed_at, error "
+            f"FROM {self.offsets_table} WHERE model_name = ? "
             f"ORDER BY batch_id DESC LIMIT 1",
             [model_name],
         ).fetchone()
         if row is None:
-            return None
-        return decode_offset(row[0])
+            return Position()
+        return Position(
+            offset=decode_offset(row[0]),
+            attempt=int(row[1] or 0),
+            failed_at=row[2],
+            error=row[3],
+        )
 
     def load_watermark(self, con, model_name: str) -> datetime | None:
         """The committed watermark for ``model_name``, or ``None``.
@@ -342,14 +547,30 @@ class _StateStoreBase:
         return None if row is None else row[0]
 
     def next_batch_id(self, con, model_name: str) -> int:
-        """One past the highest recorded batch id for ``model_name``; 1-based.
+        """One past the highest batch id **either** table has seen; 1-based.
+
+        Both tables, and that is not belt-and-braces. ``batches`` records only
+        batches that committed, while ``offsets`` also carries a row for every
+        recorded *failure*. A fresh process that consulted only ``batches``
+        would hand back an id a failure had already used, and the offsets table
+        would then hold two rows sharing one id -- which makes
+        ``ORDER BY batch_id DESC LIMIT 1`` pick between them arbitrarily. The
+        symptom is a model that replays correctly and then reads back a stale
+        offset, so it is worth the extra column scan on a path that runs once
+        per model per process.
 
         Computed in Python from a scalar read rather than inlined as a subquery,
-        for the reason in the module docstring.
+        for the reason in the module docstring. The ``UNION ALL`` is a derived
+        table, not a scalar subquery in a join condition, so ``CONTEXT.md`` 1.5
+        does not apply to it.
         """
         row = con.execute(
-            f"SELECT max(batch_id) FROM {self.batches_table} WHERE model_name = ?",
-            [model_name],
+            f"SELECT max(batch_id) FROM ("
+            f"  SELECT batch_id FROM {self.batches_table} WHERE model_name = ?"
+            f"  UNION ALL"
+            f"  SELECT batch_id FROM {self.offsets_table} WHERE model_name = ?"
+            f") AS seen",
+            [model_name, model_name],
         ).fetchone()
         current = row[0] if row and row[0] is not None else 0
         return int(current) + 1
@@ -377,21 +598,42 @@ class _StateStoreBase:
         cached = self._last_batch_id.get(model_name)
         if cached is not None:
             return cached + 1
-        row = con.execute(
-            f"SELECT max(batch_id) FROM {self.offsets_table} WHERE model_name = ?",
-            [model_name],
-        ).fetchone()
-        current = row[0] if row and row[0] is not None else 0
-        return int(current) + 1
+        return self.next_batch_id(con, model_name)
 
     def _append_offset(
-        self, con, model_name: str, offset: Any, batch_id: int, now: datetime
+        self,
+        con,
+        model_name: str,
+        offset: Any,
+        batch_id: int,
+        now: datetime,
+        *,
+        attempt: int = 0,
+        failed_at: datetime | None = None,
+        error: str | None = None,
     ) -> None:
-        payload = encode_offset(offset)
+        # A *failure* row may legitimately carry NULL: a model can fail before
+        # it has ever committed anything, and there is then no position to
+        # record. Every other path goes through encode_offset, which refuses
+        # None -- committing a null offset would make the next run start over
+        # and duplicate every row. Keep that guard reachable.
+        if offset is None and attempt:
+            payload = None
+        else:
+            payload = encode_offset(offset)
         con.execute(
             f"INSERT INTO {self.offsets_table} "
-            f"(model_name, offset_json, batch_id, updated_at) VALUES (?, ?, ?, ?)",
-            [model_name, payload, int(batch_id), now],
+            f"(model_name, offset_json, batch_id, updated_at, attempt, "
+            f"failed_at, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                model_name,
+                payload,
+                int(batch_id),
+                now,
+                int(attempt),
+                failed_at,
+                None if error is None else str(error)[:_ERROR_LIMIT],
+            ],
         )
 
     def _append_watermark(
@@ -468,6 +710,138 @@ class _StateStoreBase:
         finally:
             self._open_batches.clear()
 
+    # -- failure and quarantine -------------------------------------------
+
+    def record_failure(
+        self,
+        con,
+        model_name: str,
+        batch_id: int,
+        position: "Position",
+        error: Any,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Record that an attempt failed. Returns the new attempt count.
+
+        Runs in **its own transaction**, because the batch's transaction has
+        already been rolled back by the time anything calls this -- that
+        rollback is what makes the failure safe, and it also means there is no
+        transaction left to write into.
+
+        The appended row carries the offset the model already had, so the
+        position does not move and the next run replays exactly the same batch.
+        What it adds is the attempt count, the time and the message, which is
+        what :meth:`load_position` reads back to decide on backoff and, when the
+        attempts run out, on quarantine.
+
+        The batch id advances even though nothing was produced. That is
+        deliberate: ``ORDER BY batch_id DESC LIMIT 1`` is the whole ordering
+        rule for this table, so two rows sharing an id would make "the newest
+        row" ambiguous. An id spent on a failed attempt is also the honest
+        record -- the attempt happened.
+        """
+        attempt = int(position.attempt) + 1
+        stamp = _coerce_timestamp(now, what="failure time") or _utcnow()
+        owns = self._begin_if_possible(con)
+        try:
+            self._append_offset(
+                con,
+                model_name,
+                position.offset,
+                batch_id,
+                stamp,
+                attempt=attempt,
+                failed_at=stamp,
+                error=_describe(error),
+            )
+            if owns:
+                con.execute("COMMIT")
+        except BaseException:
+            if owns:
+                self._rollback_quietly(con)
+            raise
+        finally:
+            self._open_batches.pop(model_name, None)
+        self._last_batch_id[model_name] = batch_id
+        return attempt
+
+    def quarantine(
+        self,
+        con,
+        model_name: str,
+        batch_id: int,
+        position: "Position",
+        skipped_to: Any,
+        *,
+        payload: Any = None,
+        rows_in: int | None = None,
+        attempts: int = 0,
+        error: Any = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Give up on a batch: skip past it, and record that it was skipped.
+
+        Two appends in **one** transaction, so the offset can never advance
+        without the record of why. The offset row carries ``skipped_to`` -- the
+        position beyond the data that could not be processed -- with the attempt
+        counters cleared, so the next trigger reads new data. The quarantine row
+        carries everything needed to understand and re-drive the loss by hand:
+        the offsets either side of the gap, the source's own description of the
+        batch, how many rows it held, how many attempts it took and the error.
+
+        This is the one place duckstream advances past data it did not process.
+        It exists because a stream blocked on one malformed file does not
+        preserve that file's data -- it stops collecting everything after it too
+        -- so continuing loses strictly less than halting. It is not silent: the
+        row below is permanent, ``prune`` will not touch it, ``status`` reports
+        it, and ``duckstream run`` exits non-zero on the run that wrote it.
+        """
+        stamp = _coerce_timestamp(now, what="quarantine time") or _utcnow()
+        owns = self._begin_if_possible(con)
+        try:
+            con.execute(
+                f"INSERT INTO {self.quarantine_table} "
+                f"(model_name, batch_id, skipped_from, skipped_to, payload_json, "
+                f"rows_in, attempts, error, quarantined_at) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    model_name,
+                    int(batch_id),
+                    encode_offset_or_none(position.offset),
+                    encode_offset_or_none(skipped_to),
+                    _encode_payload(payload),
+                    None if rows_in is None else int(rows_in),
+                    int(attempts),
+                    _describe(error),
+                    stamp,
+                ],
+            )
+            self._append_offset(con, model_name, skipped_to, batch_id, stamp)
+            if owns:
+                con.execute("COMMIT")
+        except BaseException:
+            if owns:
+                self._rollback_quietly(con)
+            raise
+        finally:
+            self._open_batches.pop(model_name, None)
+        self._last_batch_id[model_name] = batch_id
+
+    def quarantined(self, con, model_name: str | None = None) -> list[dict[str, Any]]:
+        """Every quarantined batch, oldest first. History, so it never empties."""
+        where = "" if model_name is None else "WHERE model_name = ? "
+        params = [] if model_name is None else [model_name]
+        cursor = con.execute(
+            f"SELECT model_name, batch_id, skipped_from, skipped_to, payload_json, "
+            f"rows_in, attempts, error, quarantined_at "
+            f"FROM {self.quarantine_table} {where}"
+            f"ORDER BY quarantined_at, batch_id",
+            params,
+        )
+        columns = [d[0] for d in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
     # -- batch history ----------------------------------------------------
 
     def record_batch_start(
@@ -509,6 +883,8 @@ class _StateStoreBase:
         *,
         rows_in: int | None = None,
         rows_out: int | None = None,
+        rows_late: int | None = None,
+        rows_undated: int | None = None,
         committed_at: Any | None = None,
     ) -> None:
         """Append the finished batch row: one insert, both timestamps.
@@ -522,6 +898,15 @@ class _StateStoreBase:
         ``started_at`` comes from the matching :meth:`record_batch_start`; with
         no matching start it is left NULL rather than invented, so history never
         silently loses a batch that ran.
+
+        ``rows_late`` and ``rows_undated`` are the event-time drop counts, and
+        they are stored rather than merely logged because ``PLAN.md`` requires
+        that data past the lateness horizon be "dropped **and counted**, never
+        silently absorbed" -- and a count that exists only in a cron log has
+        been absorbed by the next log rotation. Both stay NULL for a model with
+        no lateness horizon, which is different from zero and says so: such a
+        model drops nothing because it has no horizon, not because nothing was
+        late.
         """
         finished = _coerce_timestamp(committed_at, what="committed_at") or _utcnow()
         open_batch = self._open_batches.get(model_name)
@@ -530,8 +915,9 @@ class _StateStoreBase:
             started = open_batch["started_at"]
         con.execute(
             f"INSERT INTO {self.batches_table} "
-            f"(model_name, batch_id, started_at, committed_at, rows_in, rows_out) "
-            f"VALUES (?, ?, ?, ?, ?, ?)",
+            f"(model_name, batch_id, started_at, committed_at, rows_in, "
+            f"rows_out, rows_late, rows_undated) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 model_name,
                 int(batch_id),
@@ -539,6 +925,8 @@ class _StateStoreBase:
                 finished,
                 None if rows_in is None else int(rows_in),
                 None if rows_out is None else int(rows_out),
+                None if rows_late is None else int(rows_late),
+                None if rows_undated is None else int(rows_undated),
             ],
         )
 
@@ -546,8 +934,8 @@ class _StateStoreBase:
         """Recorded batches for ``model_name``, oldest first."""
         cursor = con.execute(
             f"SELECT model_name, batch_id, started_at, committed_at, rows_in, "
-            f"rows_out FROM {self.batches_table} WHERE model_name = ? "
-            f"ORDER BY batch_id",
+            f"rows_out, rows_late, rows_undated FROM {self.batches_table} "
+            f"WHERE model_name = ? ORDER BY batch_id",
             [model_name],
         )
         columns = [description[0] for description in cursor.description]
@@ -564,10 +952,17 @@ class _StateStoreBase:
     ) -> dict[str, int]:
         """Drop all but the newest ``keep_last`` rows per model, per table.
 
-        Append-only state grows by three rows per trigger and nothing here
-        reclaims that on its own, so this is the tool that bounds it. Phase-4
+        Append-only state grows by two rows per committed trigger -- the
+        offset and the batch record -- and by three for a model with a lateness
+        horizon, which also appends a watermark. Nothing here reclaims that on
+        its own, so this is the tool that bounds it. Phase-4
         maintenance is expected to schedule it alongside
         ``ducklake_expire_snapshots``; nothing calls it automatically yet.
+
+        **The quarantine table is never pruned.** It is not per-trigger state
+        that grows with time; it is the record that data was lost, one row per
+        incident, and discarding it would leave a mart quietly short of rows
+        with nothing to say why.
 
         Pruning is the one place in this module that deletes, and a matching
         DuckLake ``DELETE`` costs ~26 ms (``CONTEXT.md`` 1.10) — which is fine

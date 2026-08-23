@@ -73,6 +73,11 @@ _EXPORTS: dict[str, str] = {
     # the canonical declaration
     "Model": "duckstream.model",
     "Tier": "duckstream.aggregates",
+    "GRAINS": "duckstream.model",
+    "WINDOW_COLUMN": "duckstream.model",
+    "WatermarkPolicy": "duckstream.watermark",
+    "parse_lateness": "duckstream.watermark",
+    "format_lateness": "duckstream.watermark",
     # protocols and the shapes they pass around
     "BatchLimits": "duckstream.protocols",
     "BatchPlan": "duckstream.protocols",
@@ -99,6 +104,9 @@ _EXPORTS: dict[str, str] = {
     "available_sinks": "duckstream.registry",
     "available_udfs": "duckstream.registry",
     # errors
+    "RunLock": "duckstream.lock",
+    "LockError": "duckstream.lock",
+    "BatchFailed": "duckstream.errors",
     "DuckstreamError": "duckstream.errors",
     "ModelValidationError": "duckstream.errors",
     "ConfigError": "duckstream.errors",

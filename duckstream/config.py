@@ -990,7 +990,13 @@ class _Deserialiser:
                     )
             return [str(item) for item in value]
 
-        if key in ("time_column", "grain", "strategy", "memory_profile"):
+        if key in (
+            "time_column",
+            "grain",
+            "strategy",
+            "memory_profile",
+            "on_failure",
+        ):
             if value is not None and not isinstance(value, str):
                 self.fail(
                     path,

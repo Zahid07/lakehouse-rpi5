@@ -111,6 +111,36 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_argument(validate)
     validate.set_defaults(handler=_cmd_validate)
 
+    status = commands.add_parser(
+        "status",
+        help="per model: lag, throughput, and anything currently wrong",
+        description=(
+            "Read-only, against the catalog rather than the engine, so it can "
+            "be pointed at a live deployment from another process. Exits "
+            "non-zero when any model is unhealthy, so it doubles as a health "
+            "check without its output needing to be parsed. 'Lag' is reported "
+            "three ways because they fail independently: event-time lag is how "
+            "far behind the data is, time-since-run is how long since the "
+            "engine did anything, and backlog is what the source is holding."
+        ),
+    )
+    _add_config_argument(status)
+    status.add_argument(
+        "--model",
+        metavar="NAME",
+        default=None,
+        help="report only this model",
+    )
+    status.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "emit one JSON object per model instead of a table, for a "
+            "monitoring probe that should not have to parse columns"
+        ),
+    )
+    status.set_defaults(handler=_cmd_status)
+
     models = commands.add_parser(
         "models",
         help="list declared models with their resolved tier and strategy",
@@ -167,15 +197,159 @@ def _cmd_models(args: argparse.Namespace, out: TextIO) -> int:
             # rendered with str() wherever it leaves Python.
             str(model.tier),
             model.resolved_strategy,
+            _describe_windowing(model),
             _describe_source(model),
             _describe_sink(model),
         )
         for model in document.models
     ]
-    headers = ("MODEL", "TIER", "STRATEGY", "SOURCE", "SINK")
+    headers = ("MODEL", "TIER", "STRATEGY", "WINDOW", "SOURCE", "SINK")
     for line in _table(headers, rows):
         print(line, file=out)
     return EXIT_OK
+
+
+def _cmd_status(args: argparse.Namespace, out: TextIO) -> int:
+    """Per model: lag, throughput, and whatever is currently wrong.
+
+    Read-only, and against the catalog rather than the engine, so it can be
+    pointed at a live deployment from another process -- ``CONTEXT.md`` 1.6 is
+    what makes that possible, since a DuckLake catalog is not a file one process
+    holds open.
+
+    Exits non-zero when any model is unhealthy, so it doubles as a health check
+    for a supervisor or a monitoring probe without needing its output parsed.
+    """
+    import duckdb
+
+    from duckstream.config import load_config
+    from duckstream.lake import attach_lake
+    from duckstream.metrics import collect
+    from duckstream.state import DuckLakeStateStore
+
+    document = load_config(args.config)
+    models = document.models
+    if args.model:
+        models = [document.model(args.model)]
+
+    con = duckdb.connect()
+    try:
+        attach_lake(
+            con,
+            document.catalog,
+            data_path=document.data_path,
+            settings=document.settings,
+        )
+        store = DuckLakeStateStore(catalog="lake")
+        store.ensure(con)
+        snapshot = collect(con, store, models)
+    finally:
+        con.close()
+
+    if getattr(args, "json", False):
+        import json as _json
+
+        for m in snapshot.models:
+            print(_json.dumps(_status_json(m), default=str), file=out)
+        return EXIT_OK if snapshot.healthy else EXIT_ERROR
+
+    headers = (
+        "MODEL", "STATE", "EVENT LAG", "SINCE RUN", "BACKLOG",
+        "BATCHES", "ROWS IN", "ROWS OUT", "LATE", "QUARANTINED",
+    )
+    rows = [
+        (
+            m.name,
+            m.state,
+            _duration(m.event_lag),
+            _duration(m.processing_lag),
+            "-" if m.backlog is None else str(m.backlog),
+            str(m.batches),
+            str(m.rows_in),
+            str(m.rows_out),
+            str(m.rows_late + m.rows_undated),
+            str(m.quarantined),
+        )
+        for m in snapshot.models
+    ]
+    for line in _table(headers, rows):
+        print(line, file=out)
+
+    # A table of numbers does not say what to do. Anything unhealthy gets a
+    # sentence underneath it that does.
+    for m in snapshot.models:
+        if m.attempt:
+            when = "" if m.retry_at is None else f", next attempt after {m.retry_at}"
+            print(
+                f"\n{m.name}: {m.attempt} failed attempt(s){when}\n"
+                f"  {m.error}",
+                file=out,
+            )
+        if m.quarantined:
+            print(
+                f"\n{m.name}: {m.quarantined} batch(es) skipped after repeated "
+                f"failure, most recently {m.last_quarantine}. "
+                f"Data was lost; SELECT * FROM duckstream.quarantine "
+                f"WHERE model_name = '{m.name}' for what and why.",
+                file=out,
+            )
+        if m.behind_horizon:
+            print(
+                f"\n{m.name}: event-time lag ({_duration(m.event_lag)}) exceeds "
+                f"the lateness horizon ({_duration(m.lateness)}), so windows are "
+                f"sealing before late data arrives. {m.rows_late} row(s) have "
+                f"already been dropped as late.",
+                file=out,
+            )
+    return EXIT_OK if snapshot.healthy else EXIT_ERROR
+
+
+def _status_json(m: Any) -> dict:
+    """One model's status as plain JSON.
+
+    Durations go out as **seconds**, not as the human strings the table uses: a
+    probe wants to compare against a threshold, and "3m12s" is not a number.
+    """
+
+    def seconds(value):
+        return None if value is None else value.total_seconds()
+
+    return {
+        "model": m.name,
+        "state": m.state,
+        "healthy": m.healthy,
+        "event_lag_seconds": seconds(m.event_lag),
+        "lateness_seconds": seconds(m.lateness),
+        "behind_horizon": m.behind_horizon,
+        "processing_lag_seconds": seconds(m.processing_lag),
+        "backlog": m.backlog,
+        "batches": m.batches,
+        "rows_in": m.rows_in,
+        "rows_out": m.rows_out,
+        "rows_late": m.rows_late,
+        "rows_undated": m.rows_undated,
+        "attempt": m.attempt,
+        "error": m.error,
+        "quarantined": m.quarantined,
+        "watermark": m.watermark,
+        "last_committed_at": m.last_committed_at,
+    }
+
+
+def _duration(value: Any) -> str:
+    """A timedelta as something readable in a fixed-width column."""
+    if value is None:
+        return "-"
+    seconds = int(value.total_seconds())
+    sign = "-" if seconds < 0 else ""
+    seconds = abs(seconds)
+    if seconds < 60:
+        return f"{sign}{seconds}s"
+    if seconds < 3600:
+        return f"{sign}{seconds // 60}m{seconds % 60:02d}s"
+    if seconds < 86400:
+        return f"{sign}{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{sign}{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
 
 
 def _cmd_run(args: argparse.Namespace, out: TextIO) -> int:
@@ -183,30 +357,122 @@ def _cmd_run(args: argparse.Namespace, out: TextIO) -> int:
     from duckstream.engine import Engine
     from duckstream.trigger import AvailableNow, Once
 
+    from duckstream.errors import BatchFailed
+
     document = load_config(args.config)
     trigger = Once() if args.once else AvailableNow()
     engine = Engine.from_document(document)
     try:
-        report = engine.run(trigger=trigger, model=args.model)
+        try:
+            report = engine.run(trigger=trigger, model=args.model)
+        except BatchFailed as exc:
+            # Every model already had its turn; the exception is the run's
+            # verdict, not an interruption. Print what happened first and let
+            # the exit code carry the verdict, rather than replacing a useful
+            # per-model summary with a traceback.
+            report = exc.report
     finally:
         engine.close()
 
+    healthy = True
     for name in report.model_names:
         results = report.for_model(name)
         committed = [r for r in results if r.committed]
-        if not committed:
+        if committed:
+            rows = sum(r.rows_in or 0 for r in committed)
+            written = sum(r.rows_out or 0 for r in committed)
+            batches = len(committed)
+            plural = "" if batches == 1 else "es"
+            last = committed[-1]
+            print(
+                f"{name}: {batches} batch{plural}, {rows} source rows, "
+                f"{written} rows out, through batch {last.batch_id}"
+                f"{_describe_drops(committed)}",
+                file=out,
+            )
+
+        # Anything that did not commit gets its own line. Folding these into
+        # the summary above -- or worse, letting a model that failed print
+        # "nothing to do" because it committed nothing -- is how a cron log
+        # ends up reassuring about a pipeline that is stuck.
+        for result in results:
+            if result.committed or result.is_empty:
+                continue
+            healthy = False
+            print(_describe_outcome(result), file=out)
+
+        if not committed and all(r.is_empty for r in results):
             print(f"{name}: nothing to do", file=out)
-            continue
-        rows = sum(r.rows_in or 0 for r in committed)
-        batches = len(committed)
-        plural = "" if batches == 1 else "es"
-        last = committed[-1]
-        print(
-            f"{name}: {batches} batch{plural}, {rows} source rows, "
-            f"through batch {last.batch_id}",
-            file=out,
+
+    # Non-zero whenever a model is not healthy, including a model that is
+    # merely waiting out its backoff: the underlying failure is unresolved, and
+    # a run that exited 0 would hide it until somebody happened to look.
+    return EXIT_OK if healthy else EXIT_ERROR
+
+
+def _describe_outcome(result: Any) -> str:
+    """One line for a pass that did not commit, saying what to do about it."""
+    name = result.model
+    if result.outcome == "quarantined":
+        return (
+            f"{PROGRAM}: QUARANTINED {name!r} batch {result.batch_id} after "
+            f"{result.attempt} attempts and skipped past it. Data was lost: "
+            f"{result.error}"
         )
-    return EXIT_OK
+    if result.outcome == "halted":
+        return (
+            f"{PROGRAM}: {name!r} is halted after {result.attempt} attempts and "
+            f"will not advance past this batch until the cause is fixed: "
+            f"{result.error}"
+        )
+    if result.outcome == "backoff":
+        return (
+            f"{PROGRAM}: {name!r} is waiting out a backoff after "
+            f"{result.attempt} failed attempt(s): {result.error}"
+        )
+    return (
+        f"{PROGRAM}: {name!r} attempt {result.attempt} failed, will retry: "
+        f"{result.error}"
+    )
+
+
+def _describe_drops(committed: Sequence[Any]) -> str:
+    """What this run refused to aggregate, if anything.
+
+    ``PLAN.md`` requires data past the lateness horizon to be dropped **and
+    counted**. It is counted durably in ``duckstream.batches`` either way; this
+    puts it in front of whoever is reading the cron log, because a drop nobody
+    is told about is a drop nobody investigates. Silent when there is nothing to
+    say, so a healthy line stays a healthy line.
+    """
+    late = sum(r.rows_late or 0 for r in committed)
+    undated = sum(r.rows_undated or 0 for r in committed)
+    parts = []
+    if late:
+        parts.append(f"{late} late")
+    if undated:
+        parts.append(f"{undated} undated")
+    if not parts:
+        return ""
+    watermark = next(
+        (r.watermark for r in reversed(committed) if r.watermark is not None), None
+    )
+    suffix = "" if watermark is None else f", watermark {watermark:%Y-%m-%d %H:%M:%S}"
+    return f" -- dropped {', '.join(parts)}{suffix}"
+
+
+def _describe_windowing(model: Any) -> str:
+    """``hour +10 minutes`` -- the grain and, when declared, the horizon.
+
+    Worth a column of its own: the horizon is what decides whether windows ever
+    seal, and therefore whether an ``append`` mart is being written at all. An
+    operator reading this table should not have to open the YAML to find out.
+    """
+    grain = getattr(model, "grain", None)
+    if grain is None:
+        return "-"
+    lateness = getattr(model, "lateness", None)
+    return grain if lateness is None else f"{grain} +{lateness}"
 
 
 def _describe_source(model: Any) -> str:

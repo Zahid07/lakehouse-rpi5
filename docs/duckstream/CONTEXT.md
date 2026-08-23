@@ -17,7 +17,8 @@ noted to approximate a Raspberry Pi 5.
 ## 1. Measured constraints
 
 These are the load-bearing numbers. **If one conflicts with your intuition, trust
-the number or re-measure it — do not reason around it.**
+the number or re-measure it — do not reason around it.** §1.8, §1.9 and §1.10
+were measured during the phase-1 build; §1.11 during phase 2.
 
 ### 1.1 The memory ceiling is DuckDB's buffer manager, not Python
 
@@ -309,6 +310,63 @@ successful commit, so a rollback leaves it untouched — is what took `sink +
 offset` from 39 ms to 14.9 ms. Sound only because v1 is single-writer under
 `AvailableNow` (§2.5); revisit it the moment a second writer exists.
 
+### 1.11 A watermark read per trigger costs 10.4 ms; the same fix applies
+
+**Method.** Measured while building phase 2, on the same box, `threads=2`, 40
+repetitions, median. Four variants of an otherwise identical model were run
+**interleaved** — one trigger of each, in turn — because a first attempt that
+ran them one after another gave a baseline of 100.8 ms on one run and 67.8 ms
+on the next. Machine drift over a two-minute run swamped the effect. Interleave
+anything measured on this box that takes minutes.
+
+The per-trigger breakdown, against a DuckLake state table holding 40 rows:
+
+| Operation | Median |
+|---|---|
+| `load_offset` — phase 1 already pays this | 11.90 ms |
+| **`load_watermark` — the new per-trigger read** | **10.36 ms** |
+| `count(*)` over the bound batch — phase 1 | 1.84 ms |
+| one scan for counts + `max(event_ts)` — the new one | 2.10 ms |
+| appending one offset row in a transaction | 9.41 ms |
+| appending one watermark row in a transaction | 9.62 ms |
+
+**Conclusion, and it is §1.10 again.** The extra *scan* of the batch is free:
+reading the newest event time and both drop counts alongside the row count
+costs **0.26 ms** more than the `count(*)` it replaces, because it is the same
+single pass. What is not free is re-reading a value the process wrote itself.
+`load_watermark` is `ORDER BY batch_id DESC LIMIT 1` against a DuckLake table,
+and it costs the same ~10 ms as the `max(batch_id)` scan §1.10 already removed.
+
+**Consequence.** The engine memoises the committed watermark per model, exactly
+as it memoises the batch id, and writes the cache **only after a successful
+commit** so a rolled-back batch leaves it at the last durable value. Same
+soundness argument, same expiry condition: it holds because v1 is single-writer
+(§2.5), and both memos need revisiting together the day a second writer exists.
+
+Whole-trigger cost, interleaved, 40 reps, median, 100-row batches:
+
+| Trigger shape | Before the memo | After |
+|---|---|---|
+| `update`, no horizon (phase 1) | baseline | baseline |
+| `update`, horizon, nothing dropped | +30.6 ms | **+5.1 ms** |
+| `update`, horizon, a late row every 4th batch | +36.6 ms | **+6.4 ms** |
+| `append`, horizon, sealing every window | +49.2 ms | **+20.4 ms** |
+
+**So a lateness horizon costs about one extra state append — ~5 ms — and that
+is irreducible**: the watermark has to become durable in the same transaction
+as the offset, or a restart resumes reading from one point in the stream and
+judging lateness from another. Filtering adds ~1 ms more, and only when
+something is actually dropped: the engine creates the filter view only if the
+scan reported rows to remove, so a healthy stream never builds a second view.
+
+Sealed `append` costs ~20 ms more than phase 1, which buys three extra
+statements in the same transaction — the merge into the open-window
+accumulator, the insert of sealed windows into the target, and the delete that
+evicts them. The delete is the one §1.10 warns about, and it is deliberate
+here: it fires per *window sealed*, not per trigger, and it is what bounds the
+accumulator by the lateness horizon instead of by the age of the stream. §1.3's
+own caveat asks for exactly this.
+
 ---
 
 ## 2. Researched constraints
@@ -397,8 +455,29 @@ processes**, PostgreSQL for multi-user, MySQL not recommended. Real-world report
 (ducklake#233) show many small concurrent committers exhaust retries — **fewer,
 fatter commits beat many thin ones.**
 
-**Consequence.** v1 is single-writer under an `AvailableNow` trigger, so
-contention is structurally impossible and no lock is required.
+**Consequence.** v1 is single-writer under an `AvailableNow` trigger.
+
+**Corrected during phase 2b.** This section previously said contention was
+"structurally impossible and no lock is required". That is very nearly true and
+not quite, and the gap is a real 3am incident. `AvailableNow` drains until the
+source is empty, so a backlog can make one cron tick outlast the interval that
+started it, and the next tick then begins while the first is still running.
+
+What prevents corruption is not the trigger — it is §1.6, the DuckDB file lock
+on the catalog. Verified by running it: the second process fails to attach with
+
+```
+Binder Error: Failed to attach DuckLake MetaData "__ducklake_metadata_lake"
+at path "…/catalog.ducklake" Unique file handle conflict: Cannot attach …
+```
+
+So the *safety* claim stands and only the *reasoning* was wrong. duckstream now
+takes an advisory lock (`duckstream/lock.py`) before touching the catalog, so
+the failure reads as "another duckstream run already holds this catalog: pid N
+on host, running for Ns" instead. The advisory lock is never trusted for safety
+— a lock trusted for safety is one that fails open on a filesystem it does not
+understand — and `AvailableNow(max_batches=N)` is the knob that stops a tick
+outrunning its own schedule in the first place.
 
 ### 2.6 Why not a DuckDB extension
 
@@ -517,6 +596,12 @@ Do not re-litigate these without new evidence.
 | Config format | **YAML** via `pyyaml`, parsing isolated in `config.py`. | Nested model declarations read far better than the alternatives, and YAML is the norm for data tooling. Isolating the parser keeps stdlib `tomllib` a cheap swap if the dependency becomes unwelcome on a constrained device. |
 | Callables in config | **Registry with dotted-path resolution.** | Config expresses declarative structure but cannot express functions. Built-in names (`file`, `mqtt`, `table`) plus `my_pkg.mod:obj` for user sources, sinks and UDFs keeps config fully capable without turning it into a programming language. |
 | Differentiator | **Foldability classification** with load-time rejection. | See below. |
+| Unprocessable data | **Quarantine by default** (`on_failure`), after a bounded retry budget: skip the batch, record the loss permanently in `duckstream.quarantine`, exit non-zero. `halt` never advances past it. | Halting does not preserve the unprocessable data — a stream blocked on one bad file stops collecting everything behind it too — so continuing loses strictly less. It is a *policy* rather than a defect only because it is never silent: skip and record are one transaction, the table is never pruned, and `status` keeps reporting it after the log has rotated. |
+| Retry state | **In the `offsets` row**, not a second table. | §1.11: a scalar read of a DuckLake state table costs ~10 ms and the engine already pays one per trigger. A second table would double that on every trigger to carry information that only matters when something is broken. |
+| Attempt accounting | **Only failures that fail cleanly spend an attempt.** A hard kill records nothing. | A crash-looping deployment must not be able to quarantine its own data; infrastructure trouble is not bad data. |
+| Lateness horizon | **Opt-in per model** (`lateness`), and it is what turns a model on to event time. Without it there is no watermark, every window stays open forever, and nothing is ever dropped — which is exactly phase-1 behaviour. | A horizon is a claim about the data, not a default anyone can pick correctly on a user's behalf. Making it opt-in also means the phase-1 path keeps costing what it cost (§1.11), so event time is paid for only by models that asked for it. |
+| Windowed `append` | **Requires a horizon**, refused at load without one. Each window is folded in an open-window accumulator beside the target and written to the target **once**, when the watermark passes its end. | Phase 1 accepted `append` with a `grain` and wrote one *partial* row per window per batch. That equals the truth only when no two batches ever touch the same window — a condition the user cannot enforce and the engine never checked. It is the §4 bug class in the one place the framework had left it, so phase 2 refuses it and offers the correct mechanism instead. |
+| Rows outside the horizon | **Dropped and counted**, durably, in `duckstream.batches`. Late rows (`rows_late`) and rows with no event time (`rows_undated`) are counted apart. | `PLAN.md` requires "dropped **and counted**, never silently absorbed", and a count that lives only in a return value or a rotated log has not been counted. Late and undated are separated because "arriving later than declared" and "carrying no timestamp" are different operational problems with different fixes. |
 
 ### Why foldability is the thing worth building
 

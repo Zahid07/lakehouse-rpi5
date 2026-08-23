@@ -80,10 +80,17 @@ ROUND_TRIP_MODELS = {
         key=["window_ts", "sensor_id"],
         time_column="event_ts",
         grain="day",
+        # Windowed append needs a horizon -- Model._check_output_mode -- which
+        # is convenient here, since this model exists to set every field.
+        lateness="90 minutes",
         strategy="delta_merge",
         memory_profile="streaming",
         udfs=["my_pkg.signal:arrow_fft"],
         limits=BatchLimits(max_rows_per_trigger=500, max_files_per_trigger=3),
+        # Both off their defaults, so the round trip covers them. 'halt' is the
+        # non-default policy; see Model._check_failure_policy.
+        on_failure="halt",
+        max_attempts=9,
     ),
     "no_marker": Model(
         name="no_marker",

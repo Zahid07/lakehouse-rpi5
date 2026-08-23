@@ -37,7 +37,15 @@ import json
 
 import pytest
 
-from harness import ADDITIVE, DOORS, Landing, World, kill_run, same_rows
+from harness import (
+    ADDITIVE,
+    DOORS,
+    Landing,
+    Scenario,
+    World,
+    kill_run,
+    same_rows,
+)
 
 T = dt.datetime
 
@@ -334,4 +342,80 @@ def test_snapshot_count_equals_committed_batches(make_world, landing, door):
     # burning one, so a gap would mean an uncommitted batch left a trace.
     assert [row["batch_id"] for row in committed] == list(
         range(1, len(committed) + 1)
+    )
+
+
+# --------------------------------------------------------------------------
+# The watermark is checkpointed by the same commit, so it replays too
+# --------------------------------------------------------------------------
+
+
+#: The additive scenario with a lateness horizon. Same shape, same aggregates,
+#: so any difference in behaviour under a kill is event time's doing.
+HORIZON_SCENARIO = Scenario(
+    name="hourly_horizon_kill",
+    aggregates=dict(ADDITIVE.aggregates),
+    key=ADDITIVE.key,
+    recompute_sql=ADDITIVE.recompute_sql,
+    grain="hour",
+    lateness="10 minutes",
+    table="marts.hourly_horizon_kill",
+)
+
+
+@pytest.fixture(params=DOORS)
+def horizon_world(request, make_world) -> World:
+    return make_world(request.param, HORIZON_SCENARIO)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("point", ["after_sink_write", "before_commit"])
+def test_a_killed_batch_does_not_advance_the_watermark(horizon_world, landing, point):
+    """The watermark is state, so it is subject to the same guarantee as the offset.
+
+    A watermark that survived a killed batch would be strictly worse than one
+    that did not: the restart would replay the batch from the stored offset but
+    judge its rows against a horizon that had already moved past them, so the
+    replayed rows would be dropped as late. Data present in the source and
+    accounted for by no error -- the exact shape of loss this framework exists
+    to make impossible.
+
+    It cannot happen structurally, because ``state.commit`` appends the
+    watermark inside the same transaction as the offset (``CONTEXT.md`` 1.9
+    leaves no other option: they are in one catalog and one snapshot). This
+    test is what turns "cannot" into "does not".
+    """
+    from duckstream.state import DuckLakeStateStore
+
+    def watermark(world: World):
+        with world.connect() as con:
+            store = DuckLakeStateStore("duckstream", catalog="lake")
+            return store.load_watermark(con, HORIZON_SCENARIO.name)
+
+    landing.drop("d1", DROPS["d1"])
+    _assert_clean(kill_run(horizon_world))
+    before = watermark(horizon_world)
+    assert before is not None, "the first clean batch should establish a watermark"
+
+    # A drop whose newest row is far later, so a leaked watermark would be
+    # unmistakable rather than a near miss.
+    landing.drop("late", [(T(2026, 1, 1, 9, 0), "a", 256.0)])
+    _assert_died(kill_run(horizon_world, fault=point), point)
+
+    assert watermark(horizon_world) == before, (
+        "a killed batch moved the watermark, so the horizon and the offset are "
+        "not checkpointed together"
+    )
+
+    report = _assert_clean(kill_run(horizon_world))
+    committed = report["committed"]
+    assert committed, "the killed batch did not replay"
+    assert committed[-1]["rows_late"] == 0, (
+        "the replayed batch was judged against a horizon that had already "
+        "moved past it, so its rows were dropped as late"
+    )
+    assert watermark(horizon_world) == dt.datetime(2026, 1, 1, 8, 50)
+    assert same_rows(horizon_world.rows(), horizon_world.recompute()), (
+        "after replaying a killed event-time batch the mart is not a full "
+        "recompute: rows were lost or double-counted"
     )

@@ -13,6 +13,7 @@ dependency.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -85,6 +86,21 @@ class BatchContext:
     batch_id: int
     plan: BatchPlan
 
+    watermark: datetime | None = None
+    """Event-time watermark **after** this batch, or ``None`` if the model
+    declares no lateness horizon.
+
+    A sink uses it to decide which windows are complete: window ``[ws, ws + G)``
+    is sealed once ``ws + G <= watermark``. It is the watermark this batch is
+    about to commit, not the one it inherited, so a window closed by this very
+    batch seals inside the same transaction that folded the rows closing it.
+
+    Added after the phase-1 interface was frozen. Keyword-only in practice --
+    every construction in duckstream names its arguments -- and defaulted, so a
+    sink written against the phase-1 shape keeps working and simply never seals
+    anything, which is the correct behaviour for a sink that does not window.
+    """
+
 
 @runtime_checkable
 class Source(Protocol):
@@ -122,8 +138,17 @@ class Sink(Protocol):
     def ensure(self, con, model: "Model") -> None:
         """Create whatever DDL the sink needs. Must be idempotent."""
 
-    def write(self, con, batch_view: str, model: "Model", ctx: BatchContext) -> None:
-        """Write the batch. Called inside the engine's transaction, never outside."""
+    def write(
+        self, con, batch_view: str, model: "Model", ctx: BatchContext
+    ) -> int | None:
+        """Write the batch. Called inside the engine's transaction, never outside.
+
+        Returns the number of output rows written, or ``None`` if the sink
+        cannot say. The engine records it as ``rows_out`` in the batch history
+        and leaves the column NULL for ``None``, so a sink written against the
+        phase-1 signature -- which returned nothing -- keeps working and simply
+        reports no count.
+        """
 
     def to_config(self) -> dict[str, Any]:
         """Round-trippable declaration, including the ``"type"`` registry name."""

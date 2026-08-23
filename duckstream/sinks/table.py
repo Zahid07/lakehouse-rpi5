@@ -53,6 +53,7 @@ from duckstream.sql import (
     quote_literal,
     split_qualified,
 )
+from duckstream.windows import seal_cutoff, window_expression
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from duckstream.model import Model
@@ -61,8 +62,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = ["TableSink", "MODES", "TARGET_ALIAS", "SOURCE_ALIAS"]
 
 
-#: The two output modes phase 1 supports. ``append`` writes every batch's rows;
-#: ``update`` folds them into one row per key.
+#: The two output modes. ``update`` folds every batch into one row per key.
+#: ``append`` means one of two things depending on whether the model windows:
+#: with no ``grain`` it writes the batch's rows and never merges; with a
+#: ``grain`` (and therefore a lateness horizon) it folds each window in an
+#: accumulator and writes it once, when the watermark seals it.
 MODES: tuple[str, ...] = ("append", "update")
 
 #: Aliases used in the generated MERGE. Short on purpose — they appear in every
@@ -75,6 +79,10 @@ SOURCE_ALIAS = "s"
 #: but DuckDB requires a subquery in ``FROM`` to be named.
 _SHAPE_ALIAS = "ds_shape"
 
+#: Suffix of the open-window accumulator that ``append`` mode folds into while
+#: a window is still open. Beside the target, in the target's own schema.
+_OPEN_SUFFIX = "__open_windows"
+
 #: What a type string may contain before duckstream will interpolate it into a
 #: castability probe. A type name is not a value and cannot be passed as a
 #: literal, so it is screened instead. Every built-in type passes —
@@ -83,6 +91,28 @@ _SHAPE_ALIAS = "ds_shape"
 #: *name* carries a quote does not, and falls back to exact-match comparison:
 #: stricter, never unsafe.
 _SAFE_TYPE = re.compile(r"^[A-Za-z0-9_ ,()\[\]]+$")
+
+
+def _affected(result: Any) -> int | None:
+    """The affected-row count DuckDB returns from a write, or ``None``.
+
+    ``INSERT``, ``MERGE`` and ``DELETE`` each come back as a single row holding
+    a single count -- verified on 1.5.5 against DuckLake tables, for a MERGE
+    taking the matched branch as well as the not-matched one. Wrapped in a
+    ``try`` because this is bookkeeping: a build that stopped returning a count,
+    or returned some other shape, must cost a NULL in the metrics rather than
+    the batch.
+    """
+    try:
+        row = result.fetchall()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    if not row or not row[0] or row[0][0] is None:
+        return None
+    try:
+        return int(row[0][0])
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
 
 
 class TableSink:
@@ -96,8 +126,42 @@ class TableSink:
         unqualified name lands in ``main``, which is what plain SQL would do.
     mode:
         ``"update"`` (default) merges on the model's key, folding each aggregate
-        into the stored value. ``"append"`` inserts the batch's aggregated rows
-        and never merges.
+        into the stored value. ``"append"`` writes each output row once and
+        never revises it -- see "Output modes" below, because what that takes
+        depends on whether the model windows.
+
+    Output modes
+    ------------
+    ``update`` merges the batch into the target on the model's key. A row keeps
+    being revised for as long as its window can still receive data, which -- if
+    the model declares a lateness horizon -- means until that window seals.
+
+    ``append`` **without a grain** inserts the batch's aggregated rows. There is
+    no key to deduplicate on and no memory of previous batches; replaying a
+    batch appends its rows again. Any tier is accepted, because nothing folds.
+
+    ``append`` **with a grain** is the sealed-window path, and it is a different
+    mechanism rather than a variation on the first. The batch is folded into an
+    open-window accumulator beside the target -- ``<name>__open_windows``, same
+    schema, so it shares the catalog as ``CONTEXT.md`` 1.9 requires -- using
+    exactly the ``MERGE`` ``update`` mode uses. When ``ctx.watermark`` passes a
+    window's end, that window is inserted into the target and evicted from the
+    accumulator, in the same transaction. So each window reaches the target
+    once, complete, and is never revised: the target is genuinely append-only
+    and a reader can treat a row it has seen as final.
+
+    A model in that shape necessarily declares a lateness horizon --
+    ``Model.validate`` refuses it otherwise, because without a watermark no
+    window is ever knowably complete and each batch would append a partial row
+    per window. It also necessarily folds across batches, so unlike unwindowed
+    append it requires the additive tier.
+
+    **This sink does not decide what is late.** Rows whose window has already
+    sealed are removed by the engine before ``write`` is called; handed one, the
+    sink folds it and emits that window a second time, because it has no
+    watermark history to check against. Duplicating the check here would put the
+    decision in two places and this would be the copy without the committed
+    watermark.
 
     Schema and table creation
     -------------------------
@@ -128,10 +192,12 @@ class TableSink:
 
     Foldability
     -----------
-    ``update`` supports the **additive** tier only in phase 1. A model whose
-    resolved strategy is ``sufficient_statistics`` or ``recompute_window`` is
-    refused, loudly, rather than folded as if it were additive. That refusal is
-    the framework's reason to exist; see ``CONTEXT.md`` section 4.
+    Every path that folds -- ``update``, and windowed ``append`` -- supports the
+    **additive** tier only so far. A model whose resolved strategy is
+    ``sufficient_statistics`` or ``recompute_window`` is refused, loudly, rather
+    than folded as if it were additive. That refusal is the framework's reason
+    to exist; see ``CONTEXT.md`` section 4. Unwindowed ``append`` is exempt
+    because it never folds.
     """
 
     type_name: ClassVar[str] = "table"
@@ -157,6 +223,36 @@ class TableSink:
         """The target as SQL: ``"marts"."hourly"``."""
         return qualified(self.schema, self.name)
 
+    @property
+    def open_windows_name(self) -> str:
+        """Unqualified name of the open-window accumulator for ``append`` mode."""
+        return f"{self.name}{_OPEN_SUFFIX}"
+
+    @property
+    def qualified_open_windows(self) -> str:
+        """The accumulator as SQL: ``"marts"."hourly__open_windows"``.
+
+        It lives in the **target's own schema**, deliberately. It must be in the
+        same catalog as the target, because sealing moves rows from one to the
+        other inside the engine's single transaction and ``CONTEXT.md`` 1.9
+        measured that a transaction cannot span two attached databases. Putting
+        it beside the target rather than hiding it in the state schema also
+        makes it inspectable: it holds the user's own not-yet-complete windows,
+        and "why is this hour missing from my mart" is answered by selecting
+        from it.
+        """
+        return qualified(self.schema, self.open_windows_name)
+
+    def windowed_append(self, model: "Model") -> bool:
+        """Is this the sealed-window append path?
+
+        ``append`` over a windowed aggregation. ``Model.validate`` guarantees
+        such a model also declares a lateness horizon, so a watermark exists
+        and windows can actually seal; ``append`` with no grain is the plain
+        per-batch insert and is not this.
+        """
+        return self.mode == "append" and model.grain is not None
+
     # -- shape derived from the model --------------------------------------
 
     def key_expressions(self, model: "Model") -> list[tuple[str, str]]:
@@ -179,6 +275,13 @@ class TableSink:
         return expressions
 
     def _window_expression(self, model: "Model") -> str:
+        """``date_trunc(<grain>, <time column>)``, from :mod:`duckstream.windows`.
+
+        The arithmetic is not duplicated here. Whether a window has sealed is
+        decided in Python against a cutoff, and the row-to-window mapping is
+        decided in SQL by this expression; the two have to agree exactly, so
+        both come from the one module that owns window boundaries.
+        """
         grain = model.grain
         if grain not in GRAINS:
             raise DuckstreamError(
@@ -191,10 +294,7 @@ class TableSink:
                 f"time_column, so there is no column to truncate into "
                 f"{WINDOW_COLUMN!r}"
             )
-        # The grain is inlined as a literal rather than interpolated raw: it
-        # arrives from config, and quote_literal is the only thing standing
-        # between a config file and the SQL text.
-        return f"date_trunc({quote_literal(grain)}, {quote_ident(model.time_column)})"
+        return window_expression(grain, model.time_column)
 
     def _key_columns(self, model: "Model") -> list[str]:
         key = list(model.key or [])
@@ -250,7 +350,9 @@ class TableSink:
             f" GROUP BY {grouping}"
         )
 
-    def create_table_sql(self, batch_view: str, model: "Model") -> str:
+    def create_table_sql(
+        self, batch_view: str, model: "Model", *, into: str | None = None
+    ) -> str:
         """DDL creating the target from the aggregation's *shape*, with no rows.
 
         ``WHERE false`` is applied outside the aggregation, not inside it. An
@@ -261,7 +363,7 @@ class TableSink:
         """
         aggregation = self.aggregation_sql(batch_view, model)
         return (
-            f"CREATE TABLE IF NOT EXISTS {self.qualified_name} AS\n"
+            f"CREATE TABLE IF NOT EXISTS {into or self.qualified_name} AS\n"
             f"SELECT * FROM (\n{aggregation}\n) AS {quote_ident(_SHAPE_ALIAS)} "
             f"WHERE false"
         )
@@ -276,7 +378,9 @@ class TableSink:
         aggregation = self.aggregation_sql(batch_view, model)
         return f"INSERT INTO {self.qualified_name} ({columns})\n{aggregation}"
 
-    def merge_sql(self, batch_view: str, model: "Model") -> str:
+    def merge_sql(
+        self, batch_view: str, model: "Model", *, into: str | None = None
+    ) -> str:
         """The fold, as one ``MERGE INTO`` statement.
 
         Shape::
@@ -306,6 +410,7 @@ class TableSink:
         """
         self._require_additive(model)
         aggregation = self.aggregation_sql(batch_view, model)
+        into = into or self.qualified_name
         target = TARGET_ALIAS
         source = SOURCE_ALIAS
 
@@ -325,12 +430,55 @@ class TableSink:
 
         indented = "\n".join("       " + line for line in aggregation.splitlines())
         return (
-            f"MERGE INTO {self.qualified_name} AS {target}\n"
+            f"MERGE INTO {into} AS {target}\n"
             f"USING (\n{indented}\n) AS {source}\n"
             f"   ON {on_clause}\n"
             f" WHEN MATCHED THEN UPDATE SET\n         {updates}\n"
             f" WHEN NOT MATCHED THEN INSERT ({insert_columns})\n"
             f"      VALUES ({insert_values})"
+        )
+
+    # -- sealing ------------------------------------------------------------
+
+    def seal_sql(self, model: "Model", cutoff: Any) -> str:
+        """Move every sealed window from the accumulator into the target.
+
+        ``cutoff`` is the largest ``window_ts`` that is complete, computed in
+        Python by :func:`duckstream.windows.seal_cutoff` and inlined here as a
+        single literal. That is not a style choice: ``CONTEXT.md`` 1.5 measured
+        a scalar subquery in a DuckLake statement of this shape failing with
+        ``Out of buffer`` on the *second* batch, and a literal additionally
+        lets DuckLake prune data files on the ``window_ts`` statistics it keeps.
+
+        Columns are named explicitly so the statement does not depend on either
+        table's physical column order.
+        """
+        columns = ", ".join(quote_ident(c) for c in self.output_columns(model))
+        return (
+            f"INSERT INTO {self.qualified_name} ({columns})\n"
+            f"SELECT {columns} FROM {self.qualified_open_windows}\n"
+            f" WHERE {quote_ident(WINDOW_COLUMN)} <= {quote_literal(cutoff)}"
+        )
+
+    def evict_sql(self, cutoff: Any) -> str:
+        """Drop the windows :meth:`seal_sql` has just emitted.
+
+        Runs in the same transaction as the insert, so the two are one snapshot
+        and a window can never be both emitted and still open, nor evicted
+        without being emitted.
+
+        This is the one ``DELETE`` on duckstream's write path, and it is
+        deliberate. ``CONTEXT.md`` 1.10 measured a matching DuckLake ``DELETE``
+        at ~26 ms because it writes a tombstone, which is why *per-trigger*
+        state is append-only -- but this is not per-trigger state. It fires
+        only when a window actually seals, it is what keeps the accumulator
+        bounded by the lateness horizon rather than by the age of the stream,
+        and ``CONTEXT.md`` 1.3's caveat asks for exactly this ("if state
+        reaches millions of open windows, add eviction of sealed windows").
+        """
+        return (
+            f"DELETE FROM {self.qualified_open_windows} "
+            f"WHERE {quote_ident(WINDOW_COLUMN)} <= {quote_literal(cutoff)}"
         )
 
     # -- foldability guard --------------------------------------------------
@@ -362,7 +510,9 @@ class TableSink:
 
     # -- catalog introspection ---------------------------------------------
 
-    def existing_column_types(self, con: Any) -> dict[str, str]:
+    def existing_column_types(
+        self, con: Any, name: str | None = None
+    ) -> dict[str, str]:
         """``{column name: declared type}`` for the target, in physical order.
 
         Empty when the table does not exist — a table always has at least one
@@ -376,14 +526,14 @@ class TableSink:
             "SELECT column_name, data_type FROM duckdb_columns() "
             "WHERE database_name = current_database() "
             f"  AND schema_name = {quote_literal(self.schema)} "
-            f"  AND table_name = {quote_literal(self.name)} "
+            f"  AND table_name = {quote_literal(name or self.name)} "
             "ORDER BY column_index"
         ).fetchall()
         return {row[0]: row[1] for row in rows}
 
-    def existing_columns(self, con: Any) -> list[str]:
+    def existing_columns(self, con: Any, name: str | None = None) -> list[str]:
         """Column names of the target as the catalog currently sees it."""
-        return list(self.existing_column_types(con))
+        return list(self.existing_column_types(con, name))
 
     def incoming_column_types(
         self, con: Any, batch_view: str, model: "Model"
@@ -450,7 +600,14 @@ class TableSink:
         return bool(row and row[0])
 
     def _check_target_matches(
-        self, con: Any, batch_view: str, model: "Model", existing: dict[str, str]
+        self,
+        con: Any,
+        batch_view: str,
+        model: "Model",
+        existing: dict[str, str],
+        *,
+        table: str | None = None,
+        folding: bool | None = None,
     ) -> None:
         """Refuse a pre-existing table this batch cannot be written into.
 
@@ -478,8 +635,11 @@ class TableSink:
         list column) DuckDB raises a conversion error of its own naming both
         types.
         """
-        self._validate_existing(model, list(existing))
-        if self.mode != "update":
+        table = table or self.table
+        if folding is None:
+            folding = self.mode == "update"
+        self._validate_existing(model, list(existing), table=table)
+        if not folding:
             return
         incoming = self.incoming_column_types(con, batch_view, model)
         for column, incoming_type in incoming.items():
@@ -494,13 +654,13 @@ class TableSink:
                 else ""
             )
             raise DuckstreamError(
-                f"table {self.table!r} cannot receive model {model.name!r}: "
+                f"table {table!r} cannot receive model {model.name!r}: "
                 f"column {column!r} is {target_type} in the table but the model "
                 f"produces {incoming_type}{origin}. DuckDB has no implicit cast "
                 f"in either direction between {incoming_type} and "
                 f"{target_type}, so the merge cannot even be built. Either the "
                 f"table predates this model or the model changed: drop or alter "
-                f"{self.table!r}, or change the aggregate so its type matches. "
+                f"{table!r}, or change the aggregate so its type matches. "
                 f"duckstream checks this before writing rather than letting the "
                 f"MERGE fail part-way through your transaction."
             )
@@ -526,7 +686,7 @@ class TableSink:
                 model writes, naming the columns rather than leaving the
                 operator to diff two schemas by eye.
         """
-        if self.mode == "update":
+        if self.mode == "update" or self.windowed_append(model):
             self._require_additive(model)
         self.output_columns(model)
         con.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.schema)}")
@@ -535,14 +695,17 @@ class TableSink:
             return
         self._validate_existing(model, existing)
 
-    def _validate_existing(self, model: "Model", existing: list[str]) -> None:
+    def _validate_existing(
+        self, model: "Model", existing: list[str], *, table: str | None = None
+    ) -> None:
+        table = table or self.table
         present = set(existing)
         required = self.output_columns(model)
         missing = [column for column in required if column not in present]
         if not missing:
             return
         raise DuckstreamError(
-            f"table {self.table!r} already exists but does not match model "
+            f"table {table!r} already exists but does not match model "
             f"{model.name!r}: missing column"
             f"{'s' if len(missing) > 1 else ''} "
             f"{', '.join(repr(c) for c in missing)}. The model writes "
@@ -559,7 +722,7 @@ class TableSink:
         batch_view: str,
         model: "Model",
         ctx: "BatchContext",
-    ) -> None:
+    ) -> int | None:
         """Write one batch. Called inside the engine's transaction, never outside.
 
         In ``update`` mode this is a ``MERGE`` on the model's key, folding each
@@ -591,25 +754,118 @@ class TableSink:
         evolution needlessly painful. It does mean a *renamed* aggregate leaves
         its predecessor behind, silently NULL, so a rename wants a migration.
 
-        ``ctx`` is accepted for the protocol and is not used: idempotency comes
-        from the merge key, not from the batch id, so nothing about the write
-        depends on which batch this is.
+        Returns the number of rows written, which DuckDB hands back from the
+        ``INSERT`` or ``MERGE`` itself -- so it costs nothing. Phase 1 left
+        ``rows_out`` NULL on the belief that obtaining it meant running the
+        aggregation a second time; measured on 1.5.5, ``con.execute`` on an
+        ``INSERT``, a ``MERGE`` and a ``DELETE`` each return a one-row, one-
+        column result carrying the affected count, and this method was already
+        throwing it away.
+
+        For sealed ``append`` the count reported is the number of rows that
+        reached the **target** -- windows that actually sealed -- not the number
+        folded into the accumulator. That is the honest reading of "rows out":
+        an open window has not been output yet.
+
+        ``ctx.watermark`` is what the sealed-append path uses; ``ctx`` is
+        otherwise accepted for the protocol and unused, because idempotency
+        comes from the merge key rather than from the batch id.
         """
+        if self.windowed_append(model):
+            return self._write_sealed(con, batch_view, model, ctx)
         if self.mode == "update":
             self._require_additive(model)
-        self._prepare_target(con, batch_view, model)
+        self._prepare_table(con, batch_view, model)
         statement = (
             self.insert_sql(batch_view, model)
             if self.mode == "append"
             else self.merge_sql(batch_view, model)
         )
-        con.execute(statement)
+        return _affected(con.execute(statement))
 
-    def _prepare_target(self, con: Any, batch_view: str, model: "Model") -> None:
-        """Create the target if absent, otherwise check the batch fits it."""
-        existing = self.existing_column_types(con)
+    def _write_sealed(
+        self, con: Any, batch_view: str, model: "Model", ctx: "BatchContext"
+    ) -> int | None:
+        """``append`` over windows: fold while open, emit once when sealed.
+
+        Three statements, all inside the engine's one transaction, so they are
+        one DuckLake snapshot and the intermediate states are never observable:
+
+        1. **fold** the batch into the accumulator, with exactly the ``MERGE``
+           ``update`` mode uses on the target — same key match, same
+           ``IS NOT DISTINCT FROM``, same additive fold expressions. A window
+           accumulates there for as long as it is open, however many batches
+           touch it;
+        2. **seal**: insert every window the watermark has passed into the real
+           target;
+        3. **evict** those windows from the accumulator.
+
+        This is what makes ``append`` mean what it says. Each window reaches the
+        target exactly once, complete, and is never updated afterwards — so the
+        target is genuinely append-only and a downstream reader can treat a row
+        it has seen as final. Phase 1's append over a windowed model wrote a
+        *partial* row per window per batch, which was equal to the truth only
+        when no two batches shared a window; ``Model.validate`` now refuses that
+        shape rather than letting it be silently wrong.
+
+        A model reaching here has a lateness horizon (``Model.validate``
+        guarantees it), so ``ctx.watermark`` is the watermark this batch is
+        about to commit. It may still be ``None`` on the very first batch of a
+        stream whose every row was undated, in which case nothing seals and the
+        target is created empty — an empty mart being visibly empty is worth
+        more than a mart that does not exist.
+        """
+        self._require_additive(model)
+        self._prepare_table(
+            con,
+            batch_view,
+            model,
+            table=f"{self.table}{_OPEN_SUFFIX}",
+            name=self.open_windows_name,
+            into=self.qualified_open_windows,
+            folding=True,
+        )
+        con.execute(self.merge_sql(batch_view, model, into=self.qualified_open_windows))
+
+        # The target takes its shape from the accumulator rather than from the
+        # aggregation, so the two can never disagree about a column type: the
+        # rows about to be inserted come from the accumulator, not the batch.
+        con.execute(
+            f"CREATE TABLE IF NOT EXISTS {self.qualified_name} AS "
+            f"SELECT * FROM {self.qualified_open_windows} WHERE false"
+        )
+        self._validate_existing(model, self.existing_columns(con))
+
+        cutoff = seal_cutoff(ctx.watermark, model.grain)
+        if cutoff is None:
+            return 0
+        sealed = _affected(con.execute(self.seal_sql(model, cutoff)))
+        con.execute(self.evict_sql(cutoff))
+        return sealed
+
+    def _prepare_table(
+        self,
+        con: Any,
+        batch_view: str,
+        model: "Model",
+        *,
+        table: str | None = None,
+        name: str | None = None,
+        into: str | None = None,
+        folding: bool | None = None,
+    ) -> None:
+        """Create a destination if absent, otherwise check the batch fits it.
+
+        Serves both the target and, for sealed ``append``, the open-window
+        accumulator. ``folding`` says whether rows will be *merged* into it,
+        which is what decides whether column types are checked as well as
+        column names — see :meth:`_check_target_matches`.
+        """
+        existing = self.existing_column_types(con, name)
         if existing:
-            self._check_target_matches(con, batch_view, model, existing)
+            self._check_target_matches(
+                con, batch_view, model, existing, table=table, folding=folding
+            )
             return
         # write() may be the first thing that ever touches this sink — the
         # engine calls ensure(), but a library user driving the sink directly
@@ -617,7 +873,7 @@ class TableSink:
         # Nothing to type-check on this path: the table is about to be created
         # from this very aggregation, so its types are the incoming ones.
         con.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.schema)}")
-        con.execute(self.create_table_sql(batch_view, model))
+        con.execute(self.create_table_sql(batch_view, model, into=into))
 
     def to_config(self) -> dict[str, Any]:
         """Round-trippable declaration: ``type``, ``table``, ``mode``.
