@@ -249,6 +249,42 @@ From constraint 1: bound rows, not UDF cost.
    are part of this phase's definition of done, not a later cleanup.
 2. **Event time.** Watermarks, tumbling windows, sealing past the lateness
    horizon, `append` and `update` output modes via merge-by-key.
+2b. **Operability and failure handling.** Added to this plan after phases 1
+   and 2 shipped, because the gap it closes was not in it: the framework had a
+   complete answer for what happens when the *process* dies and no answer at
+   all for what happens when the *data* will not process. A corrupt file made
+   the offset stop advancing, so every trigger from then on retried it and the
+   pipeline stopped, quietly, forever.
+
+   - **A retry budget with capped backoff**, and a declared policy for what
+     happens when it runs out. `on_failure: quarantine` (the default) skips the
+     batch and records the loss permanently in `duckstream.quarantine`;
+     `on_failure: halt` never advances past data it could not process. The
+     default is `quarantine` because halting does not preserve the unprocessable
+     data either — it stops collecting everything that arrives after it too — so
+     continuing loses strictly less. Both are loud: `duckstream run` exits
+     non-zero on the run that quarantines.
+   - **Failures are recorded, not merely raised**, in the same row of `offsets`
+     the engine already reads once a trigger, so the budget survives the process
+     exiting between cron ticks and costs no extra read (constraint 11).
+   - **Every model gets its turn before a run reports failure**, so one corrupt
+     file in one model cannot cost an unrelated model its trigger.
+   - **`metrics.py` and `status`**, which `PLAN.md` deferred from phase 1
+     pending exactly this module. Lag is reported three ways because they fail
+     independently: event-time lag (`now - watermark`), processing lag
+     (`now - last commit`) and source backlog. `status` exits non-zero when any
+     model is unhealthy, so it doubles as a health probe.
+   - **`rows_out`**, which phase 1 recorded as NULL believing it cost a second
+     aggregation pass. Measured: `con.execute` on the `INSERT`/`MERGE` the sink
+     already issues returns the affected count, and the sink was discarding it.
+   - **An explicit run lock.** `AvailableNow` drains until empty, so a backlog
+     can make one tick outlast the interval that started it. Two overlapping
+     ticks were previously stopped by DuckDB's own catalog file lock, reporting
+     `Unique file handle conflict` — no corruption, but a message about a
+     metadata handle rather than about two copies of the pipeline running. The
+     lock is advisory, portable (no `fcntl`), and breaks a lock whose owner is
+     provably dead on this host.
+
 3. **Foldability.** All three tiers with load-time validation and the rejection
    path. Arrow-mode UDF helpers for tier three. Window-range chunking sized from
    estimated rows.
@@ -260,13 +296,47 @@ From constraint 1: bound rows, not UDF cost.
    rely on `CHECKPOINT` to flush inlined data (ducklake#1368) — moot here, but do
    not reintroduce the dependency. Also add partitioning of sink tables by time
    grain, which is what makes window-range scans prune to a few files.
+
+   Three further items belong here, deferred from the phase-2b sweep because
+   they are data-lifecycle concerns rather than failure-handling ones:
+
+   - **Schedule `DuckLakeStateStore.prune()`.** It exists and nothing calls it.
+     State grows by two rows per committed trigger, three with a horizon. The
+     `quarantine` table is explicitly excluded from pruning — it is the record
+     that data was lost, and discarding it would leave a mart quietly short of
+     rows with nothing to say why.
+   - **A migration path for a renamed aggregate.** Today a rename leaves its
+     predecessor column behind, silently NULL, and the type check refuses a
+     *changed* type with a good error but offers no way forward. `ensure` should
+     be able to report the diff, and there should be a documented procedure —
+     not an automatic `ALTER`, which would be a silent coercion of exactly the
+     kind section 4 is about.
+   - **Compaction of the open-window accumulator.** Sealed `append` writes to
+     `<target>__open_windows` every trigger and deletes from it on every seal,
+     so it accumulates both small files and tombstones faster than the target
+     does.
 5. **MQTT landing writer.** Fills a genuinely empty slot — no MQTT extension for
    DuckDB exists. At-least-once into durable storage, replayable downstream.
-6. **Validation on a real workload.** Point it at a real sensor pipeline and diff
-   against a full recompute. This repo's accelerometer marts are a convenient
-   reference case, exercising all three tiers (counts, averages/stddev, and a
-   windowed FFT). Purely a test consumer — the framework must not acquire any
-   dependency on it.
+6. **Validation on a real workload, and a release.** Point it at a real sensor
+   pipeline and diff against a full recompute. This repo's accelerometer marts
+   are a convenient reference case, exercising all three tiers (counts,
+   averages/stddev, and a windowed FFT). Purely a test consumer — the framework
+   must not acquire any dependency on it.
+
+   Everything measured so far was measured on a Windows dev box with
+   `threads=2` as a Pi proxy, against synthetic fixtures. This phase is where
+   that stops being an assumption:
+
+   - **A soak run.** Days, not minutes, on the actual hardware. The state store
+     was only ever measured to 6,000 rows (constraint 3) and the open-window
+     accumulator has never been measured at all.
+   - **The two unmeasured numbers** from section 6 of `CONTEXT.md`: the memory
+     ratio per tier, and the UDF parallelism penalty.
+   - **Release discipline**, which a library other people depend on needs and
+     `0.1.0` does not have: semantic versioning, a deprecation policy, and an
+     upgrade note for the state-store migrations that have already accumulated
+     (`rows_late`/`rows_undated` on `batches`, `attempt`/`failed_at`/`error` on
+     `offsets`, and the `quarantine` table).
 
 Post-v1: `ProcessingTime` trigger with portable locking, sliding and session
 windows, CDC source (evaluate adopting `ducklake_cdc` rather than building),
@@ -464,6 +534,15 @@ Correctness:
   batch, proving inlining stayed off and the batch did not take the buggy path.
 - **Watermark semantics.** Late data inside the horizon updates its window; data
   past the horizon is dropped **and counted**, never silently absorbed.
+- **Unprocessable data does not stop the stream, and is not lost silently.** A
+  corrupt source file must be retried a bounded number of times, then skipped
+  with a permanent record of what was skipped and why — or halt the model, if
+  that is what it declared. Either way the run exits non-zero, and `status`
+  keeps reporting it after the log has rotated.
+- **One model's failure does not cost another model its trigger.**
+- **`status` is honest about lag.** Event-time lag, processing lag and source
+  backlog fail independently; a pipeline whose cron entry was deleted has
+  perfect event-time lag until you look at the second one.
 
 Performance, to publish the operating envelope:
 

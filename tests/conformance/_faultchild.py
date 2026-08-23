@@ -94,7 +94,15 @@ def main(argv: list[str]) -> int:
         json.dumps(
             {
                 "committed": [
-                    {"batch_id": r.batch_id, "rows_in": r.rows_in}
+                    {
+                        "batch_id": r.batch_id,
+                        "rows_in": r.rows_in,
+                        "rows_late": r.rows_late,
+                        "rows_undated": r.rows_undated,
+                        "watermark": (
+                            None if r.watermark is None else r.watermark.isoformat()
+                        ),
+                    }
                     for r in report
                     if r.committed
                 ],

@@ -32,6 +32,14 @@ transaction cannot write to two attached databases: doing it inside would raise
 store must both live in the DuckLake catalog — which is what makes the single
 commit below possible at all.
 
+Event time sits inside step (2) and step (3). A model that declares a
+``lateness`` horizon has its bound batch scanned once for its counts and its
+newest event time, rows whose window already sealed are filtered out through a
+second temp view — created only when there is actually something to drop — and
+the new watermark is committed in the same transaction as the offset. A model
+that declares no horizon skips all of it and behaves exactly as it did in phase
+1: no watermark is read, none is written, and no row is filtered.
+
 **The commit is the entire exactly-once guarantee.** Output rows, batch history
 and the source offset become durable together, as one DuckLake snapshot
 (``CONTEXT.md`` 1.4). A crash before it replays from the stored offset because
@@ -55,22 +63,31 @@ something a test reaches in by monkeypatching privates. See :class:`FaultHooks`.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping
 
-from duckstream.errors import DuckstreamError
+from duckstream.errors import BatchFailed, DuckstreamError
 from duckstream.lake import DEFAULT_ALIAS, attach_lake
+from duckstream.lock import RunLock
 from duckstream.model import Model
 from duckstream.protocols import BatchContext, BatchPlan, Offset
 from duckstream.sql import quote_ident
-from duckstream.state import DEFAULT_STATE_SCHEMA, DuckLakeStateStore
+from duckstream.state import (
+    DEFAULT_STATE_SCHEMA,
+    DuckLakeStateStore,
+    Position,
+    backoff_delay,
+)
 from duckstream.trigger import AvailableNow, Trigger
+from duckstream.watermark import WatermarkPolicy, policy_for
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from duckstream.config import ConfigDocument
 
 __all__ = [
     "Engine",
+    "RunLock",
     "BatchResult",
     "RunReport",
     "FaultEvent",
@@ -257,10 +274,79 @@ class BatchResult:
     end_offset: Offset | None = None
     view: str | None = None
 
+    rows_out: int | None = None
+    """Output rows the sink wrote, as the sink itself reported them.
+
+    ``None`` when the sink does not report a count. For a sealed ``append``
+    model this counts rows that reached the target -- windows that sealed --
+    rather than rows folded into the open-window accumulator.
+    """
+
+    rows_late: int | None = None
+    """Rows dropped because their window had already sealed.
+
+    ``None`` for a model with no lateness horizon, which is not the same as
+    ``0``: that model drops nothing because it has no horizon, not because
+    nothing arrived late. ``PLAN.md`` requires late data to be "dropped **and
+    counted**, never silently absorbed", and this is the count.
+    """
+
+    rows_undated: int | None = None
+    """Rows dropped because their event-time column was NULL.
+
+    Under event-time semantics a row with no event time belongs to no window,
+    so it can never be sealed or emitted. ``None`` when no horizon is declared,
+    where a NULL event time still produces a NULL ``window_ts`` as in phase 1.
+    """
+
+    watermark: datetime | None = None
+    """The watermark this batch committed, or ``None`` if the model has none."""
+
+    outcome: str = "committed"
+    """What became of this pass.
+
+    ``committed``
+        Ordinary success: output rows written, offset advanced, one snapshot.
+    ``empty``
+        Nothing to read, so no transaction was opened and no snapshot appeared.
+    ``failed``
+        The batch raised. The attempt was recorded and it will be retried.
+    ``quarantined``
+        The attempts ran out under ``on_failure='quarantine'``. The batch was
+        skipped and the loss recorded permanently.
+    ``halted``
+        The attempts ran out under ``on_failure='halt'``. Nothing was skipped
+        and nothing further was written; the model retries every tick until the
+        underlying problem is fixed.
+    ``backoff``
+        A previous attempt failed too recently to try again yet.
+    """
+
+    attempt: int = 0
+    """Failed attempts at this position, including this one if it failed."""
+
+    error: str | None = None
+    """Why this pass failed, when it did."""
+
+    @property
+    def rows_dropped(self) -> int:
+        """Rows this batch read and deliberately did not aggregate."""
+        return (self.rows_late or 0) + (self.rows_undated or 0)
+
     @property
     def committed(self) -> bool:
-        """True when this pass wrote a snapshot."""
-        return not self.is_empty
+        """True when this pass wrote output rows and advanced the offset."""
+        return self.outcome == "committed"
+
+    @property
+    def quarantined(self) -> bool:
+        """True when this pass gave up on a batch and skipped past it."""
+        return self.outcome == "quarantined"
+
+    @property
+    def failed(self) -> bool:
+        """True when this pass could not process its batch and did not skip it."""
+        return self.outcome in ("failed", "halted")
 
 
 @dataclass(frozen=True)
@@ -287,6 +373,41 @@ class RunReport:
     def rows_in(self) -> int:
         """Total source rows read across committed batches."""
         return sum(r.rows_in or 0 for r in self.results)
+
+    @property
+    def rows_out(self) -> int:
+        """Total output rows written across committed batches."""
+        return sum(r.rows_out or 0 for r in self.results)
+
+    @property
+    def quarantined(self) -> tuple["BatchResult", ...]:
+        """Passes that gave up on a batch and skipped past it.
+
+        Non-empty means this run lost data on purpose, on the model's declared
+        policy. The CLI exits non-zero when it is, because losing data should
+        page somebody exactly once.
+        """
+        return tuple(r for r in self.results if r.quarantined)
+
+    @property
+    def failures(self) -> tuple["BatchResult", ...]:
+        """Passes that raised and are due to be retried."""
+        return tuple(r for r in self.results if r.failed)
+
+    @property
+    def rows_late(self) -> int:
+        """Total rows dropped across this run because their window had sealed."""
+        return sum(r.rows_late or 0 for r in self.results)
+
+    @property
+    def rows_undated(self) -> int:
+        """Total rows dropped across this run for having no event time."""
+        return sum(r.rows_undated or 0 for r in self.results)
+
+    @property
+    def rows_dropped(self) -> int:
+        """Every row this run read and deliberately did not aggregate."""
+        return self.rows_late + self.rows_undated
 
     def for_model(self, name: str) -> tuple[BatchResult, ...]:
         """Every result belonging to ``name``."""
@@ -369,6 +490,7 @@ class Engine:
         settings: Mapping[str, Any] | None = None,
         state: Any | None = None,
         state_schema: str = DEFAULT_STATE_SCHEMA,
+        lock: bool = True,
         _owns_connection: bool = False,
     ) -> None:
         if con is None:
@@ -385,6 +507,12 @@ class Engine:
         self.settings: dict[str, Any] = dict(settings or {})
         self._owns_connection = _owns_connection
 
+        #: Guards one catalog against two concurrent runs. See
+        #: :mod:`duckstream.lock` -- this exists to turn DuckDB's
+        #: "Unique file handle conflict" into a sentence about what actually
+        #: happened. Pass ``lock=False`` for a second engine that deliberately
+        #: shares a catalog within one process, which is what some tests do.
+
         #: Fault-injection points. Empty, and only ever filled by an explicit
         #: call — see :class:`FaultHooks`.
         self.faults = FaultHooks()
@@ -398,6 +526,8 @@ class Engine:
         self._prepared_models: set[str] = set()
         self._registered_udfs: set[str] = set()
         self._next_ids: dict[str, int] = {}
+        self._policies: dict[str, WatermarkPolicy | None] = {}
+        self._watermarks: dict[str, datetime | None] = {}
 
         attach_lake(
             con,
@@ -409,6 +539,7 @@ class Engine:
         self.state = state if state is not None else DuckLakeStateStore(
             state_schema, catalog=alias
         )
+        self.lock = RunLock(catalog, enabled=lock)
 
     # -- construction from config ------------------------------------------
 
@@ -555,11 +686,27 @@ class Engine:
                 "load a configuration with Engine.from_config(path)."
             )
 
-        self._prepare()
-        results: list[BatchResult] = []
-        for target in selected:
-            results.extend(self._drain(target, trigger))
-        return RunReport(tuple(results))
+        with self.lock:
+            self._prepare()
+            results: list[BatchResult] = []
+            for target in selected:
+                results.extend(self._drain(target, trigger))
+        report = RunReport(tuple(results))
+
+        # Every model got its turn before this fires. A failure that raised
+        # where it happened would stop the models after it from running at all,
+        # which is the wrong trade: one corrupt file in one model should not
+        # stop an unrelated model from draining.
+        failures = report.failures
+        if failures:
+            detail = "; ".join(
+                f"{r.model!r} attempt {r.attempt}: {r.error}" for r in failures
+            )
+            raise BatchFailed(
+                f"{len(failures)} batch(es) failed and will be retried: {detail}",
+                report=report,
+            )
+        return report
 
     def _select(self, model: str | Iterable[str] | None) -> list[Model]:
         if model is None:
@@ -699,7 +846,14 @@ class Engine:
         while True:
             result = self._run_batch(model)
             results.append(result)
-            if result.is_empty:
+            if result.is_empty or not result.committed:
+                # Empty, backed off, failed, or quarantined -- all of them end
+                # this model's turn. Quarantine stops the drain too, and that is
+                # the point: a source where *every* batch is unprocessable would
+                # otherwise burn through the whole backlog in a single run,
+                # quarantining it batch by batch before anyone saw the first
+                # one. One quarantine per model per run bounds the damage to
+                # something an operator can still catch on the next tick.
                 break
             committed += 1
 
@@ -724,11 +878,25 @@ class Engine:
 
     def _run_batch(self, model: Model) -> BatchResult:
         """One pass of the lifecycle. See the module docstring for the order."""
-        source = model.source
-        sink = model.sink
+        position = self._position(model)
+        start = position.offset
 
+        if position.failing:
+            waiting = self._backoff_remaining(position)
+            if waiting is not None:
+                return BatchResult(
+                    model=model.name,
+                    is_empty=False,
+                    has_more=False,
+                    outcome="backoff",
+                    attempt=position.attempt,
+                    error=position.error,
+                    start_offset=start,
+                    end_offset=start,
+                )
+
+        source = model.source
         with self._model_context(model):
-            start = self.state.load_offset(self.con, model.name)
             end = source.latest_offset()
             plan = source.plan(start, end, model.limits)
 
@@ -738,9 +906,28 @@ class Engine:
                 model=model.name,
                 is_empty=True,
                 has_more=False,
+                outcome="empty",
                 start_offset=start,
                 end_offset=start,
             )
+
+        try:
+            return self._attempt_batch(model, plan, position)
+        except Exception as exc:
+            # The batch's own transaction is already rolled back -- the inner
+            # handler in _attempt_batch does that, and it is what makes the
+            # failure safe. What is left is to record the attempt, decide
+            # whether this batch has had enough of them, and hand back a result
+            # rather than an exception, so the models after this one still run.
+            return self._handle_failure(model, plan, position, exc)
+
+    def _attempt_batch(
+        self, model: Model, plan: BatchPlan, position: Position
+    ) -> BatchResult:
+        """The batch lifecycle proper, for a plan already known to be non-empty."""
+        source = model.source
+        sink = model.sink
+        start = position.offset
 
         batch_id = self._batch_id(model.name)
         ctx = BatchContext(model_name=model.name, batch_id=batch_id, plan=plan)
@@ -755,30 +942,42 @@ class Engine:
         # one transaction cannot write two attached databases (CONTEXT.md 1.9).
         with self._model_context(model):
             view = source.bind(self.con, plan)
+        views = [view]
         try:
-            rows_in = self._count_rows(view)
+            with self._model_context(model):
+                event_time = self._observe_event_time(model, view)
+            written = event_time.view
+            if written != view:
+                views.append(written)
+            ctx = replace(ctx, watermark=event_time.watermark)
             self.faults.fire(
                 "after_bind",
-                FaultEvent("after_bind", self, model, self.con, plan, ctx, view),
+                FaultEvent("after_bind", self, model, self.con, plan, ctx, written),
             )
 
             self.state.begin(self.con)
             try:
                 with self._model_context(model):
-                    sink.write(self.con, view, model, ctx)
+                    rows_out = sink.write(self.con, written, model, ctx)
                 self.faults.fire(
                     "after_sink_write",
                     FaultEvent(
-                        "after_sink_write", self, model, self.con, plan, ctx, view
+                        "after_sink_write", self, model, self.con, plan, ctx, written
                     ),
                 )
                 self.state.record_batch_end(
-                    self.con, model.name, batch_id, rows_in=rows_in
+                    self.con,
+                    model.name,
+                    batch_id,
+                    rows_in=event_time.rows_in,
+                    rows_out=rows_out if isinstance(rows_out, int) else None,
+                    rows_late=event_time.rows_late,
+                    rows_undated=event_time.rows_undated,
                 )
                 self.faults.fire(
                     "before_commit",
                     FaultEvent(
-                        "before_commit", self, model, self.con, plan, ctx, view
+                        "before_commit", self, model, self.con, plan, ctx, written
                     ),
                 )
             except BaseException:
@@ -788,26 +987,238 @@ class Engine:
                 self._rollback()
                 raise
 
-            # Sink rows, batch record and offset become durable together, as one
-            # DuckLake snapshot. This call is the exactly-once guarantee.
-            self.state.commit(self.con, {model.name: plan.end}, {})
+            # Sink rows, batch record, watermark and offset become durable
+            # together, as one DuckLake snapshot. This call is the exactly-once
+            # guarantee, and the watermark riding along in it is what makes the
+            # sealing decision recoverable: a killed process resumes from the
+            # same horizon it resumes reading from.
+            watermarks = (
+                {} if event_time.watermark is None
+                else {model.name: event_time.watermark}
+            )
+            self.state.commit(self.con, {model.name: plan.end}, watermarks)
             self._next_ids[model.name] = batch_id + 1
+            if event_time.watermark is not None:
+                self._watermarks[model.name] = event_time.watermark
             self.faults.fire(
                 "after_commit",
-                FaultEvent("after_commit", self, model, self.con, plan, ctx, view),
+                FaultEvent("after_commit", self, model, self.con, plan, ctx, written),
             )
         finally:
-            self._drop_view(view)
+            for name in views:
+                self._drop_view(name)
 
         return BatchResult(
             model=model.name,
             is_empty=False,
             has_more=bool(plan.has_more),
             batch_id=batch_id,
-            rows_in=rows_in,
+            rows_in=event_time.rows_in,
+            rows_out=rows_out if isinstance(rows_out, int) else None,
+            rows_late=event_time.rows_late,
+            rows_undated=event_time.rows_undated,
+            watermark=event_time.watermark,
             start_offset=plan.start,
             end_offset=plan.end,
             view=view,
+        )
+
+    # -- failure --------------------------------------------------------------
+
+    def _position(self, model: Model) -> Position:
+        """Where this model is and how it is going, in one read.
+
+        The same single read the engine has always done to learn its offset --
+        ``load_position`` returns the retry state from the same row, so knowing
+        whether the last attempt failed costs nothing extra. ``CONTEXT.md`` 1.11
+        is the reason that matters: a second scalar read of a DuckLake state
+        table would have added ~10 ms to *every* trigger to carry information
+        that is only interesting when something is broken.
+        """
+        with self._model_context(model):
+            return self.state.load_position(self.con, model.name)
+
+    @staticmethod
+    def _backoff_remaining(position: Position) -> "timedelta | None":
+        """How much longer this model must wait, or ``None`` if it may run now.
+
+        Capped exponential on the time since the last failure. Under cron this
+        almost never bites -- consecutive attempts are already a whole tick
+        apart -- and that is fine, because the case it exists for is the drain
+        loop, where a source that fails instantly would otherwise spend its
+        whole attempt budget in a few hundred milliseconds and quarantine data
+        that a two-second-old transient would have let through.
+        """
+        ready = position.ready_at()
+        if ready is None:
+            return None
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return ready - now if ready > now else None
+
+    def _handle_failure(
+        self, model: Model, plan: BatchPlan, position: Position, exc: Exception
+    ) -> BatchResult:
+        """Record a failed attempt, and decide whether this batch gets another.
+
+        The two policies differ in exactly one respect -- whether the offset is
+        ever allowed past data that would not process:
+
+        ``halt``
+            never. The attempt is recorded, the position stays put, and every
+            later trigger retries the same batch until a human intervenes. A gap
+            in the output is worse than a stall. Once the attempts are spent the
+            verdict stops being re-recorded -- a halted model retries on every
+            tick, cheaply and silently, so that fixing the underlying problem is
+            all it takes to recover, but it writes nothing further.
+
+        ``quarantine`` (the default)
+            once ``max_attempts`` is reached, the offset moves past the batch
+            and a permanent row in ``duckstream.quarantine`` records exactly
+            what was skipped and why. The argument is that halting does not
+            preserve the unprocessable data either -- it just stops collecting
+            everything that arrives after it as well -- so continuing loses
+            strictly less.
+
+        Either way the failure is durable before this returns, so a process
+        killed immediately afterwards resumes with the attempt already counted
+        rather than starting the budget over.
+        """
+        batch_id = self._batch_id(model.name)
+        # A model that has already spent its budget is one that halted: the
+        # verdict is on record, so this attempt adds an attempt but no new
+        # information. Anything below the ceiling counts up to it, and the
+        # attempt that *reaches* the ceiling is recorded like any other -- the
+        # stored counter has to be able to say "max_attempts attempts were
+        # made", or a halted model reads as one try short of its own limit.
+        at_ceiling = position.attempt >= model.max_attempts
+        attempt = position.attempt if at_ceiling else position.attempt + 1
+        exhausted = attempt >= model.max_attempts
+        wrote = True
+
+        with self._model_context(model):
+            if exhausted and model.on_failure == "quarantine":
+                self.state.quarantine(
+                    self.con,
+                    model.name,
+                    batch_id,
+                    position,
+                    plan.end,
+                    payload=plan.payload,
+                    attempts=attempt,
+                    error=exc,
+                )
+                outcome, end_offset = "quarantined", plan.end
+            elif exhausted and at_ceiling:
+                # Halted, and already recorded as such. Writing the same verdict
+                # again on every tick would append a row and a DuckLake snapshot
+                # a minute for as long as nobody fixes the underlying problem,
+                # which is exactly the situation where a growing catalog helps
+                # least. The stored record already says how many attempts it
+                # took and when; nothing new has been learned.
+                outcome, end_offset, wrote = "halted", position.offset, False
+            else:
+                self.state.record_failure(
+                    self.con, model.name, batch_id, position, exc
+                )
+                outcome = "halted" if exhausted else "failed"
+                end_offset = position.offset
+
+        if wrote:
+            # Recording spent this batch id, so the next attempt must not reuse
+            # it -- two rows sharing an id would make "newest row wins"
+            # ambiguous in the offsets table.
+            self._next_ids[model.name] = batch_id + 1
+
+        return BatchResult(
+            model=model.name,
+            is_empty=False,
+            has_more=False,
+            outcome=outcome,
+            batch_id=batch_id,
+            attempt=attempt,
+            error=f"{type(exc).__name__}: {exc}",
+            start_offset=position.offset,
+            end_offset=end_offset,
+        )
+
+    # -- event time ----------------------------------------------------------
+
+    def _committed_watermark(self, model: Model) -> datetime | None:
+        """The watermark previous batches committed, read once per process.
+
+        Straight from ``CONTEXT.md`` 1.10, which measured the same shape for
+        the batch id: a scalar read of a DuckLake state table inside the
+        trigger costs ~11 ms, and here it measured **10.4 ms** — a third of
+        everything a lateness horizon adds to a trigger, spent re-reading a
+        value this process wrote itself. So it is read once and then kept in
+        memory.
+
+        The rule that makes it safe is the same one: the cache is written
+        **only after a successful commit**, so a rolled-back batch leaves it at
+        the last durable value and the next attempt filters against exactly the
+        horizon a fresh process would have loaded. Sound because v1 is
+        single-writer under ``AvailableNow`` (``CONTEXT.md`` 2.5) — nothing else
+        advances this model's watermark while the engine runs. It is on the
+        list to revisit the day a second writer exists, alongside the memoised
+        batch id it copies.
+
+        ``None`` is a real cached value (no dated row has been seen yet), so
+        membership decides whether to read, not truthiness.
+        """
+        if model.name in self._watermarks:
+            return self._watermarks[model.name]
+        watermark = self.state.load_watermark(self.con, model.name)
+        self._watermarks[model.name] = watermark
+        return watermark
+
+    def _watermark_policy(self, model: Model) -> WatermarkPolicy | None:
+        """The model's event-time policy, resolved once per model per process.
+
+        ``None`` for a model with no lateness horizon, and that ``None`` is the
+        whole phase-1 path: no watermark read, none written, no row filtered.
+        """
+        try:
+            return self._policies[model.name]
+        except KeyError:
+            policy = policy_for(model)
+            self._policies[model.name] = policy
+            return policy
+
+    def _observe_event_time(self, model: Model, view: str) -> "_EventTime":
+        """Measure the bound batch in event time and decide what the sink sees.
+
+        For a model with no horizon this is the phase-1 ``count(*)`` and
+        nothing else. For one with a horizon it is a single scan yielding the
+        row count, both drop counts and the batch's newest event time — and
+        then, **only if something would actually be dropped**, a second temp
+        view with those rows filtered out. In the healthy case no extra view is
+        created and no row is read twice, which matters because this is on
+        every trigger of every event-time model.
+
+        The filter uses the **committed** watermark, never the one this batch is
+        about to write; :mod:`duckstream.watermark` explains why at length, but
+        the short version is that a batch may legitimately span a wide range of
+        event times and must not be judged against its own maximum.
+        """
+        policy = self._watermark_policy(model)
+        if policy is None:
+            return _EventTime(view=view, rows_in=self._count_rows(view))
+
+        previous = self._committed_watermark(model)
+        observation = policy.observe(self.con, view, previous)
+        previous = policy.advance(previous, observation.max_event_ts)
+        observation = policy.observe(self.con, view, previous)
+        written = (
+            policy.on_time_view(self.con, view, previous)
+            if observation.drops_anything
+            else view
+        )
+        return _EventTime(
+            view=written,
+            rows_in=observation.rows_in,
+            rows_late=observation.rows_late,
+            rows_undated=observation.rows_undated,
+            watermark=policy.advance(previous, observation.max_event_ts),
         )
 
     # -- helpers -------------------------------------------------------------
@@ -898,6 +1309,24 @@ class Engine:
     def __repr__(self) -> str:  # pragma: no cover - convenience only
         names = ", ".join(self._models) or "no models"
         return f"Engine(catalog={self.catalog!r}, alias={self.alias!r}, {names})"
+
+
+@dataclass(frozen=True)
+class _EventTime:
+    """What one batch looked like in event time, and what the sink will read.
+
+    ``view`` is the batch view the sink is handed: the source's own view when
+    nothing is dropped, and a filtered temp view over it when something is. The
+    counts stay ``None`` for a model with no lateness horizon, so "no horizon"
+    and "horizon that dropped nothing" remain distinguishable all the way out
+    to :class:`BatchResult`.
+    """
+
+    view: str
+    rows_in: int | None = None
+    rows_late: int | None = None
+    rows_undated: int | None = None
+    watermark: datetime | None = None
 
 
 class _ModelContext:

@@ -20,6 +20,10 @@ supervisor owns the cadence**, not a daemon inside the database.
 - **Not distributed.** Single process, vertical scale, single writer.
 - **Not a broker.** It reads from files (and later brokers); it does not replace
   one.
+- **Not multi-tenant.** A config document resolves dotted paths to your own
+  code, by design — that is how sources, sinks and UDFs stay expressible without
+  the config becoming a programming language. It means a `models.yaml` is
+  trusted input, exactly like a Python file: do not load one you would not run.
 - **Not incremental view maintenance for arbitrary SQL.** That is a
   research-grade problem. duckstream maintains *declared aggregate models*, and
   it is deliberate about which ones it can maintain correctly — see below.
@@ -184,6 +188,7 @@ models:
       max_files_per_trigger: 10
     time_column: event_ts
     grain: hour
+    lateness: 10 minutes                   # optional; see "Event time"
     key: [window_ts, sensor_id]
     aggregates:
       n: "count(*)"
@@ -202,11 +207,14 @@ $ duckstream validate --config models.yaml
 models.yaml: ok, 1 model (hourly_counts)
 
 $ duckstream models --config models.yaml
-MODEL          TIER      STRATEGY     SOURCE          SINK
-hourly_counts  additive  delta_merge  file(landing/)  table(marts.hourly_counts, update)
+MODEL          TIER      STRATEGY     WINDOW            SOURCE          SINK
+hourly_counts  additive  delta_merge  hour +10 minutes  file(landing/)  table(marts.hourly_counts, update)
 
 $ duckstream run --config models.yaml
 hourly_counts: 1 batch, 100 source rows, through batch 1
+
+$ duckstream run --config models.yaml
+hourly_counts: 1 batch, 7 source rows, through batch 3 -- dropped 6 late, watermark 2026-08-23 12:50:00
 
 $ duckstream run --config models.yaml
 hourly_counts: nothing to do
@@ -228,6 +236,237 @@ registry: built-in names (`file`, `table`) plus dotted paths for your own code
 (`type: my_pkg.sources:MySource`). Nothing on a dotted path is imported at load
 time, which is what lets `duckstream validate` check a document on a deploy box
 where your UDF package is not installed.
+
+## Event time: watermarks, lateness and sealing
+
+Everything above works on the timestamps in your data with no notion of *now*.
+Declare a `lateness` horizon and the model gains one:
+
+```python
+engine.add(Model(
+    name="hourly_counts",
+    source=FileSource("landing/", marker="_READY"),
+    time_column="event_ts",
+    grain="hour",
+    lateness="10 minutes",              # or datetime.timedelta(minutes=10)
+    key=["window_ts", "sensor_id"],
+    aggregates={"n": "count(*)", "total": "sum(value)"},
+    sink=TableSink("marts.hourly_counts", mode="update"),
+))
+```
+
+The **watermark** is `max(event time seen so far) - lateness`, it never goes
+backwards, and it is committed in the same transaction as the source offset, so
+a restart resumes reading and judging lateness from the same point.
+
+A window `[start, start + grain)` is **sealed** once the watermark reaches its
+end. Sealing is what the horizon buys, and it means two different things
+depending on the output mode.
+
+### What counts as late
+
+**A row is late when its *window* has already sealed — not when its timestamp is
+older than the watermark.** The distinction is the whole point of a horizon, and
+it is easy to get backwards:
+
+> `grain="hour"`, `lateness="10 minutes"`. A row at 10:30 puts the watermark at
+> 10:20. A row for 10:05 now arrives — *older than the watermark*. Its window
+> `[10:00, 11:00)` has not ended, so it is folded normally. Only once some row
+> at 11:10 or later pushes the watermark past 11:00 does that window seal, and
+> only then is a 10:05 row refused.
+
+Rows that are refused are **dropped and counted**, never silently absorbed:
+
+| Counter | Meaning |
+|---|---|
+| `rows_late` | the row's window had already sealed |
+| `rows_undated` | the row's `time_column` was NULL, so it belongs to no window |
+
+Each is on the per-batch `BatchResult`, stored durably in `duckstream.batches`,
+and totalled on the `RunReport`; `duckstream run` prints them when they are
+non-zero. On a `BatchResult` and in the catalog they are `NULL` — not `0` — for
+a model with no horizon, because that model drops nothing for want of a horizon
+rather than for want of late data. The `RunReport` totals are plain sums and so
+are always integers.
+
+```python
+report = engine.run()
+report.rows_late, report.rows_undated, report.rows_dropped
+```
+
+**Batch boundaries matter, and that is inherent.** The watermark is a function
+of what has been *observed*, so whether a given row is late depends on which
+trigger carried it: two rows read in one batch are both folded, while the same
+two split across triggers may see the second arrive after the first has already
+sealed its window. Every micro-batch engine works this way. The practical
+consequence is that `max_files_per_trigger` and `max_rows_per_trigger` are not
+purely a memory knob once a horizon exists — chunking more finely lets the
+watermark advance more often, and drops more.
+
+### Output modes
+
+| | `mode="update"` | `mode="append"` |
+|---|---|---|
+| when a row is written | every batch that touches the window | once, when the window seals |
+| what a reader sees | a row that keeps changing until its window seals | a row that is final the moment it appears |
+| where an open window lives | the target itself | `<target>__open_windows`, beside the target |
+| needs a horizon? | no | **yes, with a `grain`** |
+
+`update` merges each batch into the target on the model key, exactly as it did
+without a horizon. Adding a horizon changes one thing: once a window seals, no
+later batch can modify it.
+
+`append` folds each window in an open-window accumulator next to the target and
+moves it into the target **once**, complete, when the watermark passes its end.
+The accumulator is an ordinary table you can query — it is the answer to "why is
+this hour missing from my mart":
+
+```sql
+SELECT * FROM lake.marts.hourly_counts__open_windows ORDER BY window_ts;
+```
+
+The emit and the evict happen in the same transaction as the offset, so a window
+is never both emitted and still open, and never evicted without being emitted.
+
+**`append` with a `grain` requires a `lateness`, and is refused at load without
+one.** This is a deliberate change from the first release, which accepted the
+combination and wrote one *partial* row per window per batch — correct only if
+no two batches ever touched the same window, which nothing enforced or checked.
+The error names all three ways forward, because they mean different things:
+
+```
+sink mode 'append' is declared together with grain 'hour', but no lateness
+horizon is. [...] Either declare how late data may be, e.g.
+lateness='10 minutes', and each window is written once when it seals; or drop
+`grain` if per-batch rows are genuinely what you want; or use mode='update',
+which folds each batch into the stored row and needs no horizon.
+```
+
+`append` *without* a grain is unchanged: one row per key per batch, no fold, any
+tier. Windowed `append` does fold across batches, so in this release it needs
+the additive tier, like `update`.
+
+### Choosing a horizon
+
+It is a claim about your data, so duckstream has no default. Make it as large as
+the worst arrival delay you are willing to absorb: too small and real data is
+dropped as late; too large and windows stay open longer, so `append` output
+lags and the accumulator holds more. Watch `rows_late` and widen it if it is
+not zero. `lateness="0 seconds"` is legal and means a window seals the instant
+the watermark reaches its end.
+
+Units are `second`, `minute`, `hour` and `day`, singular or plural
+(`"90 minutes"`, `"1 hour"`). A `datetime.timedelta` works through the Python
+door and is stored in the canonical string form, so the same model built either
+way — or loaded from YAML — compares equal.
+
+## When the data will not process
+
+Exactly-once says what happens when the *process* dies. It says nothing about
+what happens when the *data* is unprocessable — a truncated upload, a file that
+is not parquet, a UDF that raises on one row — and the answer has to be
+something, because the naive one is that the offset stops advancing and every
+trigger from then on retries the same file. That is not a crash. Nothing raises
+an alarm. The pipeline just stops, quietly, until somebody notices.
+
+So a batch gets a bounded number of attempts, spaced by a capped exponential
+backoff, and then the model's declared policy applies:
+
+```python
+Model(
+    ...,
+    on_failure="quarantine",   # the default
+    max_attempts=5,
+)
+```
+
+| | `quarantine` (default) | `halt` |
+|---|---|---|
+| when the attempts run out | skip the batch, record the loss | never advance past it |
+| the stream afterwards | live, processing new data | stopped until a human intervenes |
+| what you lose | that batch | that batch **and everything after it** |
+| `duckstream run` exit code | non-zero, on the run that skipped | non-zero, every run |
+
+**Quarantine is the default, and the reason is that halting does not actually
+preserve anything.** A stream blocked on one bad file stops collecting
+everything that arrives behind it too, so continuing loses strictly less. Choose
+`halt` when a *gap* is worse than a *stall* — billing, or anything reconciled
+downstream.
+
+What makes quarantine a policy rather than a bug is that it is never silent. The
+skip and the record of the skip are one transaction, so the offset cannot move
+past data without the row explaining why:
+
+```sql
+SELECT batch_id, skipped_from, skipped_to, rows_in, attempts, error, quarantined_at
+FROM lake.duckstream.quarantine WHERE model_name = 'hourly_counts';
+```
+
+That table is never pruned, and `status` keeps reporting it long after the log
+line has rotated away.
+
+Two consequences worth knowing:
+
+- **Only clean failures spend an attempt.** A process that dies hard — SIGKILL,
+  the OOM killer, a power cut — records nothing, so a crash-looping deployment
+  can never quarantine its own data. That is deliberate: infrastructure trouble
+  should not be mistaken for bad data.
+- **One quarantine per model per run.** A source where *every* batch is
+  unprocessable would otherwise burn through the whole backlog in a single run,
+  skipping it batch by batch before anyone saw the first record.
+
+## Seeing what it is doing
+
+```
+$ duckstream status --config models.yaml
+MODEL          STATE   EVENT LAG  SINCE RUN  BACKLOG  BATCHES  ROWS IN  ROWS OUT  LATE  QUARANTINED
+hourly_counts  ok      3m12s      41s        0        184      412000   2208      6     0
+```
+
+`status` reads the catalog and nothing else, so you can point it at a live
+deployment from another process — that is what a DuckLake catalog buys you, and
+it is why a long-running engine on a plain DuckDB file was never an option. It
+exits non-zero when any model is unhealthy, so it works as a health probe
+without its output being parsed.
+
+**Lag is three numbers because they fail independently**, and any one of them
+alone is reassuring at the wrong moment:
+
+| | what it means | what it catches |
+|---|---|---|
+| `EVENT LAG` | `now - watermark` | data arriving late, or a backfill |
+| `SINCE RUN` | `now - last commit` | a deleted cron entry — event lag looks perfect |
+| `BACKLOG` | what the source still holds | a source nobody is writing to any more |
+
+A model whose event-time lag exceeds its own lateness horizon is called out
+separately, because that is the point at which windows start sealing before
+their late data arrives and `LATE` begins to climb.
+
+`STATE` is one word, ordered by what to look at first: `failing` (actionable
+now), `quarantined` (actionable, historical), `behind` (a tuning problem),
+`idle` (never run), `ok`.
+
+## One writer at a time
+
+`AvailableNow` drains until the source is empty, so a backlog can make one cron
+tick outlast the interval that started it — and then the next tick begins while
+the first is still going. duckstream takes an advisory lock beside the catalog
+and refuses the second one by name:
+
+```
+duckstream: another duckstream run already holds this catalog: pid 4123 on pi5,
+running for 92s (lock file '/opt/pipeline/catalog.ducklake.lock').
+...
+Either let the running pass finish, or bound how long a tick may take with
+AvailableNow(max_batches=N) so it cannot outrun your schedule.
+```
+
+Without it you would still be safe — DuckDB's own file lock on the catalog
+refuses the second process — but the message would be about a metadata handle
+rather than about two copies of your pipeline running. A lock whose owner is
+provably dead **on this host** is broken automatically, so a hard kill does not
+need manual clearing; a lock from another machine never is, because liveness
+cannot be checked from here.
 
 ## The guarantee, stated honestly
 
@@ -281,10 +520,21 @@ Measured on a development box with `threads=2`, against `duckdb==1.5.5`:
 | Idle trigger — reads, writes nothing, no snapshot | **~1.3 ms** |
 | Full trigger — sink insert, offset, watermark, batch record | **~25.7 ms** |
 | Process cold start under cron — interpreter, `LOAD`, `ATTACH`, settings | **~235 ms** |
+| A `lateness` horizon, on top of the same trigger without one | **~+5 ms** |
+| …when it actually drops rows, so a filter view is built | **~+6 ms** |
+| Sealed `append`: accumulator merge, emit and evict | **~+20 ms** |
+| Recording a failed attempt (own transaction, so its own snapshot) | **~+15 ms** |
 
 The floor is the snapshot, not the query. A DuckLake transaction that writes
 nothing costs about what plain DuckDB costs; the moment it writes anything, it
 pays for the commit.
+
+Event time is priced the same way. Reading the newest event time and both drop
+counts is folded into the row count the trigger already did, so it costs about
+0.3 ms; the horizon's ~5 ms is the extra **state append** that makes the
+watermark durable, and it is irreducible for the same reason the offset append
+is. The filter that removes out-of-horizon rows is only built when the scan says
+there is something to remove, so a healthy stream never pays for it.
 
 **The practical conclusion: seconds, not sub-second.** Under cron the real floor
 is roughly 0.3 s before any work happens, so a sub-second trigger interval is
@@ -296,15 +546,20 @@ headroom.
 
 ## Limits, and what is not in v1
 
-- **No event time yet.** Watermarks, window sealing and lateness policy are
-  phase 2. `grain` gives tumbling windows over a timestamp column, but late data
-  simply lands in its window whenever it arrives; nothing is dropped, and
-  nothing is counted as late.
+- **Tumbling windows only.** `minute`, `hour` and `day`. Sliding and session
+  windows are post-v1, and `month` is absent on purpose: its length varies, and
+  the seal boundary is computed as a single fixed offset from the watermark.
+- **One horizon per model, and no per-source horizons.** A model with several
+  sources would need a watermark per source and a rule for combining them; v1
+  has one source per model, so it has one watermark.
 - **Only the additive tier executes.** Tiers two and three are classified,
-  reported by `duckstream models`, and then **refused rather than executed** by
-  `mode="update"`. The `sufficient_statistics` and `recompute_window` strategies
-  arrive in phase 3. Until then a tier-two or tier-three model either uses
-  `mode="append"` or is reduced to `count`/`sum`/`min`/`max`.
+  reported by `duckstream models`, and then **refused rather than executed**
+  wherever a fold is involved — `mode="update"`, and windowed `append`, which
+  folds into its accumulator. The `sufficient_statistics` and
+  `recompute_window` strategies arrive in phase 3. Until then a tier-two or
+  tier-three model either drops its `grain` and uses `mode="append"` (which
+  never folds, so any tier is fine) or is reduced to
+  `count`/`sum`/`min`/`max`.
 - **Single writer.** One process, models run sequentially, no locking — under a
   drain-and-exit trigger contention is structurally impossible rather than
   merely unlikely. A portable lock arrives with a long-running trigger.
@@ -319,16 +574,29 @@ And the small honest ones:
 - **A file rewritten with identical size *and* mtime is not detected.** File
   identity is `(path, size, mtime)`, so a rewrite that changes neither is
   indistinguishable from no rewrite. Write new files, or touch them.
-- **State grows by three rows per trigger** — offset, watermark, batch record —
-  and nothing reclaims it automatically. That is deliberate: append-only state
+- **The open-window accumulator is bounded by the horizon, not by the stream.**
+  Sealing evicts, so it holds roughly the windows still inside `lateness`. A
+  window whose key never appears again stays open until some *other* row pushes
+  the watermark past its end — which for a sensor that stops reporting entirely
+  means its last window seals only when a later-timestamped row arrives from
+  anywhere in the same model.
+- **State grows by two rows per committed trigger** — the offset and the batch
+  record — plus a third, the watermark, for a model with a lateness horizon.
+  Nothing reclaims it automatically. That is deliberate: append-only state
   measured about 4x faster than mutating one row per model, because a matching
   DuckLake `DELETE` writes a tombstone file and costs ~26 ms, and it is strictly
   safer under a crash, since an uncommitted append is simply invisible.
   `DuckLakeStateStore.prune()` bounds the growth; schedule it with your other
   maintenance.
-- **`rows_out` is recorded as NULL.** Obtaining it would mean running the
-  aggregation twice. It arrives with the metrics module, along with the `status`
-  command.
+- **A halted model retries on every tick.** Cheaply, and writing nothing after
+  the first verdict — so fixing the underlying problem is all it takes to
+  recover — but it does re-read and re-plan its batch each time.
+- **Quarantine is whole-batch.** The unit skipped is the batch, not the row or
+  the file, so `max_files_per_trigger: 1` is what makes it precise. Narrowing a
+  failing batch to isolate the offending file is not implemented.
+- **Compaction is still phase 4**, and the open-window accumulator makes it more
+  pressing rather than less: sealed `append` writes to it every trigger and
+  deletes from it on every seal.
 
 ## Requirements
 

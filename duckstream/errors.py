@@ -25,6 +25,32 @@ class DuckstreamError(Exception):
     """Base class for every error duckstream raises."""
 
 
+class BatchFailed(DuckstreamError):
+    """Raised at the end of a run in which some batch would not process.
+
+    Deliberately raised *after* every model has had its turn rather than at the
+    moment of failure, so one broken model cannot stop the others from running.
+    It carries the :class:`~duckstream.engine.RunReport`, so a caller can still
+    see everything that did succeed:
+
+    .. code-block:: python
+
+        try:
+            report = engine.run()
+        except BatchFailed as failure:
+            report = failure.report          # the successful batches are here
+
+    A *quarantined* batch does not raise. Quarantine is the outcome the model
+    asked for, and it is recorded permanently in ``duckstream.quarantine``, so
+    the run has done what it was told; ``RunReport.quarantined`` is how a caller
+    notices, and ``duckstream run`` exits non-zero when it is non-empty.
+    """
+
+    def __init__(self, message: str, *, report: object = None) -> None:
+        super().__init__(message)
+        self.report = report
+
+
 class ModelValidationError(DuckstreamError):
     """A model declaration is invalid and must not be executed.
 

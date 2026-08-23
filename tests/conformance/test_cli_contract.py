@@ -271,6 +271,62 @@ def test_run_once_commits_a_single_batch(tmp_path, landing):
 
 
 @pytest.mark.slow
+def test_status_reports_a_model_that_has_never_run(good_config):
+    """Idle is not broken, and a health probe must not say it is."""
+    result = spawn(["-m", "duckstream", "status", "--config", str(good_config)])
+    assert result.returncode == 0, result.stderr
+    assert "MODEL" in result.stdout and "hourly_counts" in result.stdout
+    assert "idle" in result.stdout
+
+
+def test_status_reports_lag_after_a_run(good_config):
+    drained = spawn(["-m", "duckstream", "run", "--config", str(good_config)])
+    assert drained.returncode == 0, drained.stderr
+
+    result = spawn(["-m", "duckstream", "status", "--config", str(good_config)])
+    assert result.returncode == 0, result.stderr
+    header, row = result.stdout.strip().splitlines()[:2]
+    assert "EVENT LAG" in header and "SINCE RUN" in header and "BACKLOG" in header
+    assert "ok" in row
+    # Two drops of one row each were consumed, and the mart holds one folded row.
+    assert " 2 " in f" {row} " or "	2	" in row
+
+
+def test_status_json_is_machine_readable(good_config):
+    """A probe should not have to parse columns, and durations are seconds.
+
+    "3m12s" is not something a threshold can be compared against.
+    """
+    import json
+
+    spawn(["-m", "duckstream", "run", "--config", str(good_config)])
+    result = spawn(
+        ["-m", "duckstream", "status", "--json", "--config", str(good_config)]
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[0])
+    assert payload["model"] == "hourly_counts"
+    assert payload["state"] == "ok" and payload["healthy"] is True
+    assert isinstance(payload["processing_lag_seconds"], float)
+    assert payload["rows_out"] >= 1, "rows_out is still not being recorded"
+    assert payload["batches"] >= 1
+
+
+def test_status_can_be_narrowed_to_one_model(good_config):
+    result = spawn(
+        ["-m", "duckstream", "status", "--model", "hourly_counts",
+         "--config", str(good_config)]
+    )
+    assert result.returncode == 0, result.stderr
+    assert "hourly_counts" in result.stdout
+
+    missing = spawn(
+        ["-m", "duckstream", "status", "--model", "nope",
+         "--config", str(good_config)]
+    )
+    assert missing.returncode != 0
+
+
 def test_models_lists_the_resolved_tier_and_strategy(good_config):
     result = spawn([*MODULE, "models", "--config", str(good_config)])
     assert result.returncode == 0, result.stderr

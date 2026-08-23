@@ -4,13 +4,12 @@
 source, under interleaved batches, out-of-order arrival, re-runs, late arrival
 within the horizon, and NULL grouping keys."
 
-Four of those five are here. **Late arrival within a lateness horizon is out of
-scope for phase 1** and is not tested but is pinned instead -- see
-:func:`test_watermarks_are_not_implemented_in_phase_one` at the bottom. Phase 1
-has no watermarks, no lateness horizon and no window sealing; ``PLAN.md`` puts
-all three in phase 2. A test that pretended to cover late arrival would be
-asserting something the framework does not claim, and a scenario quietly missing
-from the list is exactly how a phase gets marked done that is not.
+Four of those five are here. The fifth -- **late arrival within the horizon**
+-- belongs to models that declare one, so it lives in
+``test_event_time.py`` alongside the rest of the watermark contract rather than
+here. What this module covers is the horizon-free model, which is still a
+supported and correct shape: no watermark, every window open forever, nothing
+ever dropped.
 
 The recompute is hand-written SQL carried on each :class:`~harness.Scenario`.
 Generating it from ``TableSink.aggregation_sql`` would compare duckstream
@@ -25,9 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-import pytest
-
-from harness import ADDITIVE, Scenario, same_rows
+from harness import ADDITIVE, Scenario
 
 T = dt.datetime
 
@@ -217,38 +214,41 @@ def test_chunked_equals_unchunked(make_parity, landing):
 # --------------------------------------------------------------------------
 
 
-APPEND_PER_BATCH = Scenario(
-    name="minute_append",
+UNWINDOWED_APPEND = Scenario(
+    name="raw_append",
     aggregates={"n": "count(*)", "total": "sum(value)"},
-    key=("window_ts", "sensor_id"),
+    key=("sensor_id",),
     recompute_sql=(
-        "SELECT date_trunc('minute', event_ts) AS window_ts, sensor_id,\n"
-        "       count(*) AS n, sum(value) AS total\n"
-        "  FROM {source} GROUP BY 1, 2"
+        "SELECT sensor_id, count(*) AS n, sum(value) AS total\n"
+        "  FROM {source} GROUP BY 1"
     ),
-    grain="minute",
+    time_column=None,
+    grain=None,
     mode="append",
-    table="marts.minute_append",
+    table="marts.raw_append",
 )
 
 
-def test_append_mode_matches_recompute_when_batches_do_not_overlap(
+def test_unwindowed_append_matches_recompute_when_batches_do_not_overlap(
     make_parity, landing
 ):
-    """Append mode: no merge key, no fold, so batches must not share a window.
+    """Append with no grain: one row per key per batch, no fold, no dedup.
 
-    Worth a conformance test because append is the tier-agnostic escape hatch
-    the sink offers, and its contract is narrower than update's in a way that is
-    easy to miss: it deduplicates nothing. With disjoint windows per batch the
-    concatenation of per-batch aggregates *is* the full recompute, and that is
-    the only condition under which append is equivalent. The engine's offset
-    transaction is what stops a replayed batch appending twice -- the sink
-    contributes nothing to that.
+    This is the tier-agnostic escape hatch the sink offers, and its contract is
+    narrower than update's in a way that is easy to miss. It deduplicates
+    nothing, so the concatenation of per-batch aggregates equals the full
+    recompute only when no two batches share a key -- which is what this
+    schedule arranges, one sensor per drop. The engine's offset transaction is
+    what stops a replayed batch appending twice; the sink contributes nothing
+    to that.
+
+    Append **with** a grain is a different mechanism and is refused without a
+    lateness horizon; see ``test_event_time.py``.
     """
-    parity = make_parity(APPEND_PER_BATCH, name="append")
+    parity = make_parity(UNWINDOWED_APPEND, name="append")
     parity.land("a1", [(T(2026, 8, 1, 0, 0, 5), "s1", 1.0), (T(2026, 8, 1, 0, 0, 30), "s1", 2.0)])
     parity.run()
-    parity.land("a2", [(T(2026, 8, 1, 0, 1, 5), "s1", 4.0)])
+    parity.land("a2", [(T(2026, 8, 1, 0, 1, 5), "s2", 4.0)])
     parity.run()
     parity.land("a3", [(T(2026, 8, 1, 0, 2, 5), None, 8.0)])
     parity.run()
@@ -256,44 +256,6 @@ def test_append_mode_matches_recompute_when_batches_do_not_overlap(
     parity.assert_matches_ground_truth()
     parity.assert_reached_matched_branch()
     parity.assert_snapshot_history_consistent()
-
-
-# --------------------------------------------------------------------------
-# What phase 1 does not do
-# --------------------------------------------------------------------------
-
-
-def test_watermarks_are_not_implemented_in_phase_one():
-    """Late-arrival semantics are phase 2. Pinned rather than quietly skipped.
-
-    ``PLAN.md`` lists "late arrival within the horizon" under the ground-truth
-    diff and "watermark semantics" under Verification, and it puts watermarks,
-    window sealing and the lateness horizon in **phase 2**. There is therefore
-    nothing to test yet, and the honest way to record that is an assertion that
-    the capability is genuinely absent -- so that the day someone adds a
-    lateness field, this test fails and the missing coverage is noticed at the
-    moment it becomes possible to write.
-    """
-    import importlib
-
-    from duckstream import Model
-
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("duckstream.watermark")
-
-    fields = set(Model.__dataclass_fields__)
-    for absent in ("lateness", "watermark", "horizon", "allowed_lateness"):
-        assert absent not in fields, (
-            f"Model has grown a {absent!r} field, so watermark semantics are no "
-            f"longer out of scope and this suite needs the late-arrival "
-            f"scenarios PLAN.md asks for"
-        )
-
-    # The state store carries a watermarks table and the engine commits an empty
-    # watermark dict every trigger: the seam exists, the semantics do not.
-    from duckstream.state import DuckLakeStateStore
-
-    assert hasattr(DuckLakeStateStore, "load_watermark")
 
 
 # --------------------------------------------------------------------------

@@ -24,6 +24,7 @@ Three assertions carry the phase-1 claim:
 
 from __future__ import annotations
 
+import datetime as dt
 import io
 import os
 import subprocess
@@ -36,7 +37,8 @@ import pytest
 
 from duckstream import cli
 from duckstream.engine import FAULT_POINTS, Engine
-from duckstream.errors import DuckstreamError
+from duckstream import state as state_module
+from duckstream.errors import BatchFailed, DuckstreamError
 from duckstream.lake import data_file_count, snapshot_count
 from duckstream.model import Model
 from duckstream.offsets import FileOffset
@@ -87,6 +89,19 @@ def drop_batch(landing: Path, name: str, rows: int, *, first: int = 0) -> Path:
     return directory
 
 
+@pytest.fixture
+def no_backoff(monkeypatch):
+    """Retry immediately, for tests that are about something other than backoff.
+
+    A recorded failure holds the model back for ``backoff_delay(attempt)`` --
+    one second on the first retry. That is the right behaviour and
+    :func:`test_a_failed_batch_is_held_back_before_it_is_retried` covers it, but
+    in a test about *recovery* it would mean either sleeping or asserting
+    nothing. Zeroing the base makes the delay zero at every attempt count.
+    """
+    monkeypatch.setattr(state_module, "BACKOFF_BASE", dt.timedelta(0))
+
+
 def counts_model(landing: Path, **overrides) -> Model:
     """The phase-1 model: a file source, an additive aggregate, an update sink."""
     settings = dict(
@@ -121,6 +136,17 @@ def recompute(con, landing: Path) -> list[tuple]:
         f"FROM read_parquet('{pattern}') "
         "GROUP BY 1, 2 ORDER BY 1, 2"
     ).fetchall()
+
+
+def table_exists(con, name: str) -> bool:
+    schema, _, table = name.rpartition(".")
+    return bool(
+        con.execute(
+            "SELECT count(*) FROM duckdb_tables() "
+            "WHERE schema_name = ? AND table_name = ?",
+            [schema, table],
+        ).fetchone()[0]
+    )
 
 
 def sink_rows(con) -> list[tuple]:
@@ -353,13 +379,20 @@ def test_an_unknown_fault_point_is_refused_at_install_time(tmp_path):
     engine.con.close()
 
 
-def test_a_crash_between_sink_write_and_commit_loses_nothing(tmp_path, landing):
+def test_a_crash_between_sink_write_and_commit_loses_nothing(tmp_path, landing, no_backoff):
     """The headline claim, in process. W4 repeats it with a real process kill.
 
     A hook that raises at ``after_sink_write`` is the same interception point
-    W4's ``os._exit`` uses; the difference is only whether the process survives
-    to be asked what it sees. Either way the transaction never commits, so the
-    offset must not move, the sink must not change, and no snapshot may appear.
+    the conformance suite's ``os._exit`` uses; the difference is only whether
+    the process survives to be asked what it sees. Either way the transaction
+    never commits, so the offset must not move and the sink must not change.
+
+    Where the two part company is the *record*. A hard kill writes nothing at
+    all -- it cannot. An exception the engine catches is recorded as a failed
+    attempt, which costs one snapshot and is what makes the retry budget
+    survive a restart. The consequence is worth stating: a process that dies
+    hard never spends an attempt, so a crash-looping deployment cannot
+    quarantine its own data. Only failures that fail *cleanly* count.
     """
     drop_batch(landing, "b1", 6)
     engine = open_engine(tmp_path)
@@ -376,22 +409,41 @@ def test_a_crash_between_sink_write_and_commit_loses_nothing(tmp_path, landing):
         raise RuntimeError("killed between sink write and commit")
 
     engine.faults.install("after_sink_write", boom)
-    with pytest.raises(RuntimeError, match="killed between"):
+    with pytest.raises(BatchFailed, match="killed between") as caught:
         engine.run()
 
+    # The batch is gone, and nothing it wrote survived it.
     assert sink_rows(engine.con) == committed_rows
     assert engine.state.load_offset(engine.con, "hourly_counts") == committed_offset
-    assert snapshot_count(engine.con) == snapshots
+
+    # What did survive is the knowledge that it was tried.
+    position = engine.state.load_position(engine.con, "hourly_counts")
+    assert position.attempt == 1
+    assert "killed between" in position.error
+    assert position.offset == committed_offset, (
+        "a failed attempt moved the position, so the batch would not replay"
+    )
+    assert snapshot_count(engine.con) == snapshots + 1, (
+        "recording the attempt should cost exactly one snapshot"
+    )
+
+    # The report is still available through the exception, so a caller can see
+    # what did succeed rather than only what did not.
+    assert caught.value.report is not None
+    assert caught.value.report.failures[0].attempt == 1
 
     # And the connection is usable: the rollback left no half-open transaction,
     # so the very next trigger replays the batch that never committed.
     engine.faults.clear()
     engine.run()
     assert sink_rows(engine.con) == recompute(engine.con, landing)
+    assert engine.state.load_position(engine.con, "hourly_counts").attempt == 0, (
+        "a success should clear the attempt counter"
+    )
     engine.con.close()
 
 
-def test_a_crash_before_commit_replays_in_a_new_process_view(tmp_path, landing):
+def test_a_crash_before_commit_replays_in_a_new_process_view(tmp_path, landing, no_backoff):
     """Recovery is from the catalog, not from anything held in memory."""
     drop_batch(landing, "b1", 5)
     engine = open_engine(tmp_path)
@@ -399,7 +451,7 @@ def test_a_crash_before_commit_replays_in_a_new_process_view(tmp_path, landing):
     engine.faults.install("before_commit", lambda event: (_ for _ in ()).throw(
         RuntimeError("gone")
     ))
-    with pytest.raises(RuntimeError):
+    with pytest.raises(BatchFailed):
         engine.run()
     engine.con.close()  # the crashed process's connection is gone
 
@@ -418,16 +470,220 @@ def test_a_crash_after_commit_is_durable(tmp_path, landing):
     engine.faults.install("after_commit", lambda event: (_ for _ in ()).throw(
         RuntimeError("gone after commit")
     ))
-    with pytest.raises(RuntimeError):
+    with pytest.raises(BatchFailed):
         engine.run()
     engine.con.close()
 
     restarted = open_engine(tmp_path)
     restarted.add(counts_model(landing))
     assert sink_rows(restarted.con) == recompute(restarted.con, landing)
-    # Nothing left to do: the batch was durable before the crash.
+    # Nothing left to do: the batch was durable before the crash. Note the
+    # attempt *was* recorded even though the batch succeeded -- the hook fires
+    # after COMMIT, so the data is safe and only the bookkeeping saw an error.
+    # The next run finds nothing to read, which is the correct outcome either
+    # way, and the counter clears on the next successful commit.
     assert restarted.run().batches == ()
     restarted.con.close()
+
+
+# ---------------------------------------------------------------------------
+# failure policy
+# ---------------------------------------------------------------------------
+
+
+def test_a_run_takes_the_catalog_lock_and_gives_it_back(tmp_path, landing):
+    """The engine must actually take the lock, not merely own one.
+
+    Worth its own test because nothing about the output would change if it
+    stopped: the catalog's own file lock would still prevent corruption, and the
+    only thing lost would be the message explaining what happened -- which is
+    the entire reason the advisory lock exists.
+    """
+    drop_batch(landing, "b1", 3)
+    engine = open_engine(tmp_path)
+    engine.add(counts_model(landing))
+
+    seen = {}
+
+    def observe(event):
+        seen["held"] = os.path.exists(event.engine.lock.path)
+
+    engine.faults.install("after_bind", observe)
+    engine.run()
+
+    assert seen.get("held"), "the run did not hold its lock while working"
+    assert not os.path.exists(engine.lock.path), (
+        "the lock outlived the run, so the next cron tick is refused"
+    )
+    engine.con.close()
+
+
+def test_a_second_engine_on_one_catalog_is_refused_by_name(tmp_path, landing):
+    """The failure an operator actually meets, with the message they need."""
+    from duckstream.lock import LockError
+
+    drop_batch(landing, "b1", 3)
+    first = open_engine(tmp_path)
+    first.add(counts_model(landing))
+    first.lock.acquire()
+    try:
+        second = open_engine(tmp_path, connection=first.con)
+        second.add(counts_model(landing))
+        with pytest.raises(LockError, match="already holds this catalog"):
+            second.run()
+    finally:
+        first.lock.release()
+        first.con.close()
+
+
+def test_a_failed_batch_is_held_back_before_it_is_retried(tmp_path, landing):
+    """Backoff, and why it exists at all.
+
+    Under cron it rarely bites -- consecutive attempts are already a tick apart.
+    It exists for the drain loop and for anyone calling ``run()`` in a tight
+    loop: without it a source that fails instantly would spend its entire
+    attempt budget in a few hundred milliseconds and quarantine data that a
+    two-second-old transient would have let through.
+    """
+    drop_batch(landing, "b1", 4)
+    engine = open_engine(tmp_path)
+    engine.add(counts_model(landing, max_attempts=10))
+    engine.faults.install("before_commit", _explode)
+
+    with pytest.raises(BatchFailed):
+        engine.run()
+    assert engine.state.load_position(engine.con, "hourly_counts").attempt == 1
+
+    # Immediately again: held back, so the attempt count does not move and the
+    # source is not even planned.
+    report = engine.run()
+    assert [r.outcome for r in report] == ["backoff"]
+    assert engine.state.load_position(engine.con, "hourly_counts").attempt == 1, (
+        "a backed-off pass should not spend an attempt"
+    )
+    engine.con.close()
+
+
+def test_attempts_run_out_and_the_batch_is_quarantined(tmp_path, landing, no_backoff):
+    """The default policy, end to end: skip past it, and record that you did.
+
+    The point of quarantine is that the *next* batch gets through. A stream
+    blocked on one bad batch stops collecting everything after it as well, so
+    skipping loses strictly less than halting -- but only if the loss is
+    recorded, which is what makes it a policy rather than a bug.
+    """
+    drop_batch(landing, "b1", 4)
+    engine = open_engine(tmp_path)
+    engine.add(counts_model(landing, max_attempts=3))
+    engine.faults.install("before_commit", _explode)
+
+    for expected in (1, 2):
+        with pytest.raises(BatchFailed):
+            engine.run()
+        assert engine.state.load_position(engine.con, "hourly_counts").attempt == expected
+
+    # The third attempt exhausts the budget: quarantined, and no longer an
+    # exception, because this is the outcome the model asked for.
+    report = engine.run()
+    assert [r.outcome for r in report] == ["quarantined"]
+    assert report.quarantined and not report.failures
+
+    records = engine.state.quarantined(engine.con, "hourly_counts")
+    assert len(records) == 1
+    record = records[0]
+    assert record["attempts"] == 3
+    assert "no commit for you" in record["error"]
+    assert record["skipped_from"] is None, "nothing had been committed before it"
+    assert "b1" in record["payload_json"], (
+        "the quarantine record must name what was skipped"
+    )
+
+    # The offset moved past the bad batch, the attempt counter cleared, and the
+    # mart is still empty -- nothing was written from the batch that failed.
+    position = engine.state.load_position(engine.con, "hourly_counts")
+    assert position.attempt == 0 and position.offset is not None
+    assert not table_exists(engine.con, "marts.hourly_counts"), (
+        "the quarantined batch left output behind, so its transaction did not "
+        "roll back cleanly"
+    )
+
+    # And the stream is live again: new data lands normally.
+    engine.faults.clear()
+    drop_batch(landing, "b2", 3, first=100)
+    engine.run()
+    assert sink_rows(engine.con), "the stream did not recover after quarantine"
+    engine.con.close()
+
+
+def test_halt_never_advances_past_data_it_could_not_process(tmp_path, landing, no_backoff):
+    """The other policy: a gap is worse than a stall, so never skip.
+
+    And once the attempts are spent it stops *re-recording* the same verdict.
+    A halted model is retried on every tick -- cheaply, so that fixing the
+    underlying problem is all it takes to recover -- but a model that appended a
+    row and a DuckLake snapshot every minute for as long as nobody looked at it
+    would be growing the catalog fastest exactly when that helps least.
+    """
+    drop_batch(landing, "b1", 4)
+    engine = open_engine(tmp_path)
+    engine.add(counts_model(landing, on_failure="halt", max_attempts=2))
+    engine.faults.install("before_commit", _explode)
+
+    for _ in range(2):
+        with pytest.raises(BatchFailed):
+            engine.run()
+
+    settled = engine.state.load_position(engine.con, "hourly_counts")
+    assert settled.attempt == 2
+    assert settled.offset is None, "halt must never advance past the bad batch"
+    snapshots = snapshot_count(engine.con)
+
+    for _ in range(3):
+        with pytest.raises(BatchFailed) as caught:
+            engine.run()
+        assert caught.value.report.results[-1].outcome == "halted"
+
+    assert engine.state.quarantined(engine.con) == [], "halt must not quarantine"
+    assert snapshot_count(engine.con) == snapshots, (
+        "a halted model kept writing, so a stuck pipeline grows the catalog"
+    )
+
+    # Fix the underlying problem and it recovers on its own.
+    engine.faults.clear()
+    engine.run()
+    assert sink_rows(engine.con) == recompute(engine.con, landing)
+    engine.con.close()
+
+
+def test_one_model_failing_does_not_stop_the_others(tmp_path, landing, no_backoff):
+    """Every model gets its turn before the run reports a failure.
+
+    Raising where the failure happened would mean a corrupt file in the first
+    model silently costing the second one its trigger -- and under cron, every
+    trigger after that too.
+    """
+    drop_batch(landing, "b1", 4)
+    engine = open_engine(tmp_path)
+    broken = counts_model(landing, name="broken", sink=TableSink("marts.broken"))
+    healthy = counts_model(landing, name="healthy", sink=TableSink("marts.healthy"))
+    engine.add(broken)
+    engine.add(healthy)
+
+    def only_broken(event):
+        if event.ctx.model_name == "broken":
+            raise RuntimeError("this model is broken")
+
+    engine.faults.install("before_commit", only_broken)
+    with pytest.raises(BatchFailed) as caught:
+        engine.run()
+
+    report = caught.value.report
+    assert {r.model for r in report.failures} == {"broken"}
+    assert any(r.model == "healthy" and r.committed for r in report), (
+        "the healthy model never ran, so one failure stopped an unrelated model"
+    )
+    assert engine.con.execute("SELECT count(*) FROM marts.healthy").fetchone()[0] > 0
+    engine.con.close()
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +1131,12 @@ def test_udfs_are_registered_before_planning(tmp_path, landing, monkeypatch):
             memory_profile="streaming",
             aggregates={"total": "sum(ds_double(value))"},
             sink=TableSink("marts.doubled", mode="append"),
+            # Unwindowed append: a per-batch row, no fold, any tier. Windowed
+            # append is a different mode of operation entirely -- it folds into
+            # an open-window accumulator and needs a lateness horizon and the
+            # additive tier, neither of which a UDF aggregate can offer.
+            grain=None,
+            key=["sensor_id"],
         )
     )
     engine.run()
@@ -898,6 +1160,12 @@ def test_a_udf_that_is_not_a_registrar_is_refused_with_the_contract(
             memory_profile="streaming",
             aggregates={"total": "sum(ds_double(value))"},
             sink=TableSink("marts.doubled", mode="append"),
+            # Unwindowed append: a per-batch row, no fold, any tier. Windowed
+            # append is a different mode of operation entirely -- it folds into
+            # an open-window accumulator and needs a lateness horizon and the
+            # additive tier, neither of which a UDF aggregate can offer.
+            grain=None,
+            key=["sensor_id"],
         )
     )
     with pytest.raises(DuckstreamError) as caught:
@@ -905,4 +1173,153 @@ def test_a_udf_that_is_not_a_registrar_is_refused_with_the_contract(
     message = str(caught.value)
     assert "register(con)" in message
     assert "doubled" in message
+    engine.con.close()
+
+
+# ==========================================================================
+# Event time in the batch lifecycle
+# ==========================================================================
+
+
+def horizon_model(landing, **overrides):
+    """The phase-1 model plus a lateness horizon, so the engine reads event time."""
+    settings = dict(lateness="10 minutes")
+    settings.update(overrides)
+    return counts_model(landing, **settings)
+
+
+def test_a_model_with_no_horizon_reads_and_writes_no_watermark(tmp_path, landing):
+    """The phase-1 path stays free: nothing about event time runs at all.
+
+    Asserted on the state store rather than on timings, because "costs nothing"
+    is only credible if the work genuinely does not happen. A model without a
+    horizon must leave the watermarks table empty -- an engine that wrote a NULL
+    row per trigger would look correct and quietly pay ~5 ms a trigger for it
+    (CONTEXT.md 1.10).
+    """
+    drop_batch(landing, "b1", 5)
+    engine = open_engine(tmp_path)
+    engine.add(counts_model(landing))
+    report = engine.run()
+
+    assert all(r.watermark is None for r in report)
+    assert all(r.rows_late is None and r.rows_undated is None for r in report)
+    assert engine.con.execute(
+        "SELECT count(*) FROM duckstream.watermarks"
+    ).fetchone() == (0,)
+    engine.con.close()
+
+
+def test_a_horizon_commits_a_watermark_with_every_batch(tmp_path, landing):
+    drop_batch(landing, "b1", 5)
+    engine = open_engine(tmp_path)
+    engine.add(horizon_model(landing))
+    report = engine.run()
+
+    committed = [r for r in report if r.committed]
+    assert len(committed) == 1
+    # drop_batch lays rows a minute apart from 10:00, so five rows top out at
+    # 10:04 and the horizon puts the watermark at 09:54.
+    assert committed[0].watermark == dt.datetime(2026, 8, 22, 9, 54)
+    assert committed[0].rows_late == 0
+    assert committed[0].rows_undated == 0
+    assert engine.con.execute(
+        "SELECT watermark FROM duckstream.watermarks ORDER BY batch_id DESC LIMIT 1"
+    ).fetchone() == (dt.datetime(2026, 8, 22, 9, 54),)
+    engine.con.close()
+
+
+def test_a_rolled_back_batch_does_not_advance_the_memoised_watermark(
+    tmp_path, landing, no_backoff
+):
+    """The in-process shadow of the fault-injection test, and it earns its place.
+
+    The engine keeps the committed watermark in memory rather than re-reading it
+    every trigger -- measured at 10.4 ms a trigger, a third of everything a
+    horizon costs, and the same optimisation CONTEXT.md 1.10 already made for
+    the batch id. The rule that makes it sound is that the cache is written only
+    *after* a successful commit.
+
+    A separate process cannot check that: a killed process starts with an empty
+    cache, so it would pass whether the rule held or not. This is the test that
+    actually pins it. If the cache were updated before the commit, the second
+    run would judge the replayed batch against a horizon it never durably had.
+    """
+    drop_batch(landing, "b1", 5)
+    engine = open_engine(tmp_path)
+    engine.add(horizon_model(landing))
+    engine.run()
+    settled = engine.con.execute(
+        "SELECT watermark FROM duckstream.watermarks ORDER BY batch_id DESC LIMIT 1"
+    ).fetchone()[0]
+
+    # A much later batch, whose watermark would be unmistakable if it leaked.
+    drop_batch(landing, "b2", 5, first=600)
+    engine.faults.install("before_commit", _explode)
+    with pytest.raises(BatchFailed, match="no commit for you"):
+        engine.run()
+    engine.faults.clear()
+
+    assert engine.con.execute(
+        "SELECT watermark FROM duckstream.watermarks ORDER BY batch_id DESC LIMIT 1"
+    ).fetchone()[0] == settled
+    assert engine._watermarks[engine.models[0].name] == settled, (
+        "the in-memory watermark advanced on a batch that never committed"
+    )
+
+    report = engine.run()
+    committed = [r for r in report if r.committed]
+    assert committed and committed[-1].rows_late == 0, (
+        "the replayed batch was judged against a horizon that was never "
+        "committed, so its rows were dropped as late"
+    )
+    engine.con.close()
+
+
+def _explode(event) -> None:
+    raise RuntimeError("no commit for you")
+
+
+def test_late_rows_are_dropped_counted_and_recorded(tmp_path, landing):
+    """One batch establishes the horizon, the next arrives behind it."""
+    drop_batch(landing, "b1", 5, first=600)  # 20:00 onwards
+    engine = open_engine(tmp_path)
+    engine.add(horizon_model(landing))
+    engine.run()
+
+    drop_batch(landing, "b2", 3)  # back at 10:00, long sealed
+    report = engine.run()
+    committed = [r for r in report if r.committed]
+    assert len(committed) == 1
+    assert committed[0].rows_late == 3
+    assert committed[0].rows_in == 3
+    assert committed[0].rows_dropped == 3
+
+    history = engine.con.execute(
+        "SELECT rows_in, rows_late, rows_undated FROM duckstream.batches "
+        "ORDER BY batch_id"
+    ).fetchall()
+    assert history == [(5, 0, 0), (3, 3, 0)]
+    assert report.rows_late == 3
+    assert report.rows_dropped == 3
+    engine.con.close()
+
+
+def test_the_filter_view_is_dropped_with_the_batch_view(tmp_path, landing):
+    """Two temp views a batch, and neither may outlive it.
+
+    One view per batch accumulating for the life of the connection is a slow
+    leak that no assertion about output would ever notice.
+    """
+    drop_batch(landing, "b1", 5, first=600)
+    engine = open_engine(tmp_path)
+    engine.add(horizon_model(landing))
+    engine.run()
+    drop_batch(landing, "b2", 3)
+    engine.run()
+
+    views = engine.con.execute(
+        "SELECT count(*) FROM duckdb_views() WHERE view_name LIKE 'duckstream%'"
+    ).fetchone()[0]
+    assert views == 0
     engine.con.close()

@@ -40,6 +40,7 @@ from duckstream.state import (
     DEFAULT_STATE_SCHEMA,
     DuckLakeStateStore,
     MemoryStateStore,
+    Position,
     decode_offset,
     encode_offset,
 )
@@ -130,6 +131,9 @@ def test_ensure_creates_the_three_state_tables(lake_con, store):
                 "offset_json": "VARCHAR",
                 "batch_id": "BIGINT",
                 "updated_at": "TIMESTAMP",
+                "attempt": "BIGINT",
+                "failed_at": "TIMESTAMP",
+                "error": "VARCHAR",
             },
         ),
         (
@@ -150,6 +154,8 @@ def test_ensure_creates_the_three_state_tables(lake_con, store):
                 "committed_at": "TIMESTAMP",
                 "rows_in": "BIGINT",
                 "rows_out": "BIGINT",
+                "rows_late": "BIGINT",
+                "rows_undated": "BIGINT",
             },
         ),
     ],
@@ -585,6 +591,8 @@ def test_batch_history_records_times_and_counts(lake_con, store):
         1,
         rows_in=10,
         rows_out=4,
+        rows_late=2,
+        rows_undated=1,
         committed_at=datetime(2026, 8, 22, 12, 0, 1),
     )
     store.commit(lake_con, {"m": OFFSET_A}, {"m": None})
@@ -598,8 +606,161 @@ def test_batch_history_records_times_and_counts(lake_con, store):
             "committed_at": datetime(2026, 8, 22, 12, 0, 1),
             "rows_in": 10,
             "rows_out": 4,
+            "rows_late": 2,
+            "rows_undated": 1,
         }
     ]
+
+
+def test_prune_never_touches_the_quarantine_table(lake_con, store):
+    """Quarantine is evidence, not per-trigger state.
+
+    Everything else here grows with time and is bounded by pruning. The
+    quarantine table grows with *incidents*, one row each, and each row is the
+    only record that a gap exists in the output. Pruning it would leave a mart
+    quietly short of rows with nothing to say why -- which is the exact failure
+    the whole quarantine mechanism exists to avoid.
+    """
+    for batch_id in range(1, 6):
+        commit_once(store, lake_con, "m", {"n": batch_id})
+    store.quarantine(
+        lake_con, "m", 99, Position(offset={"n": 1}), {"n": 2},
+        attempts=3, error="unreadable",
+    )
+
+    deleted = store.prune(lake_con, "m", keep_last=1)
+    assert "quarantine" not in deleted, (
+        "prune reported on the quarantine table, so it is pruning it"
+    )
+    assert len(store.quarantined(lake_con, "m")) == 1, (
+        "pruning destroyed the record that data was lost"
+    )
+
+
+def test_a_batch_id_is_never_reused_after_a_recorded_failure(lake_con, store):
+    """The ordering invariant, from the side that nearly broke it.
+
+    ``ORDER BY batch_id DESC LIMIT 1`` is the whole rule for reading state back,
+    so two rows sharing an id in the offsets table make "the newest row"
+    arbitrary. A recorded failure appends such a row, and a *fresh process*
+    asking for the next id used to consult only ``batches`` -- which records
+    committed batches and knows nothing about failures. It would hand back an id
+    the failure had already used, and the model would then replay correctly and
+    read back a stale offset.
+
+    The `store` here is deliberately a second instance with an empty memo, which
+    is what a new cron tick actually is.
+    """
+    failed = Position(offset=None, attempt=0)
+    store.record_failure(lake_con, "m", store.next_batch_id(lake_con, "m"), failed, "boom")
+
+    fresh = DuckLakeStateStore(catalog=DEFAULT_ALIAS)
+    ids = [
+        row[0]
+        for row in lake_con.execute(
+            "SELECT batch_id FROM duckstream.offsets WHERE model_name = 'm'"
+        ).fetchall()
+    ]
+    assert fresh.next_batch_id(lake_con, "m") > max(ids), (
+        "a fresh process would reuse a batch id already spent by a failure"
+    )
+
+    # Commit through the fresh store and the newest row must be the commit.
+    commit_id = fresh.next_batch_id(lake_con, "m")
+    fresh.record_batch_start(lake_con, "m", commit_id)
+    fresh.begin(lake_con)
+    fresh.record_batch_end(lake_con, "m", commit_id)
+    fresh.commit(lake_con, {"m": OFFSET_A}, {})
+
+    position = fresh.load_position(lake_con, "m")
+    assert position.offset == OFFSET_A, "a stale failure row won the ordering"
+    assert position.attempt == 0
+
+
+def test_ensure_adds_the_event_time_counters_to_a_pre_phase_two_catalog(lake_con):
+    """A catalog written before phase 2 is migrated, not broken.
+
+    ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already exists,
+    so without a migration the first insert into an older ``batches`` table
+    would fail on the column count -- and it would fail *inside the trigger's
+    transaction*, taking the batch with it. Schema evolution is one of the
+    reasons ``PLAN.md`` picked DuckLake, so this uses it.
+
+    The old shape is built by hand rather than by checking out an old revision:
+    what matters is that ``ensure`` reaches the same end state from either
+    starting point.
+    """
+    store = DuckLakeStateStore(catalog=DEFAULT_ALIAS)
+    lake_con.execute(f"CREATE SCHEMA IF NOT EXISTS {DEFAULT_ALIAS}.duckstream")
+    lake_con.execute(
+        f"CREATE TABLE {DEFAULT_ALIAS}.duckstream.batches ("
+        f"model_name VARCHAR, batch_id BIGINT, started_at TIMESTAMP, "
+        f"committed_at TIMESTAMP, rows_in BIGINT, rows_out BIGINT)"
+    )
+    lake_con.execute(
+        f"INSERT INTO {DEFAULT_ALIAS}.duckstream.batches VALUES "
+        f"('old', 1, NULL, NULL, 7, NULL)"
+    )
+
+    store.ensure(lake_con)
+
+    columns = [
+        row[0]
+        for row in lake_con.execute(
+            "SELECT column_name FROM duckdb_columns() "
+            "WHERE table_name = 'batches' ORDER BY column_index"
+        ).fetchall()
+    ]
+    assert columns[-2:] == ["rows_late", "rows_undated"]
+
+    # The pre-existing row survives, NULL in the new columns -- which is the
+    # right value for a batch that ran before the counters existed.
+    assert store.batch_history(lake_con, "old") == [
+        {
+            "model_name": "old",
+            "batch_id": 1,
+            "started_at": None,
+            "committed_at": None,
+            "rows_in": 7,
+            "rows_out": None,
+            "rows_late": None,
+            "rows_undated": None,
+        }
+    ]
+
+    # And the migrated table takes a full-width insert.
+    store.begin(lake_con)
+    store.record_batch_end(lake_con, "new", 2, rows_in=3, rows_late=1, rows_undated=0)
+    store.commit(lake_con, {"new": OFFSET_A}, {})
+    assert store.batch_history(lake_con, "new")[0]["rows_late"] == 1
+
+
+def test_ensure_is_still_idempotent_after_migrating(lake_con):
+    """The migration must not fire twice, or cost a snapshot when there is nothing to do."""
+    store = DuckLakeStateStore(catalog=DEFAULT_ALIAS)
+    store.ensure(lake_con)
+    settled = snapshot_count(lake_con, DEFAULT_ALIAS)
+    store.ensure(lake_con)
+    store.ensure(lake_con)
+    assert snapshot_count(lake_con, DEFAULT_ALIAS) == settled
+
+
+def test_the_event_time_counters_stay_null_when_they_are_not_given(lake_con, store):
+    """NULL and 0 mean different things, and the distinction is kept.
+
+    A model with no lateness horizon drops nothing because it has no horizon,
+    not because nothing was late. Storing 0 for it would claim the engine
+    checked and found none, which is a different -- and false -- statement.
+    """
+    store.begin(lake_con)
+    store.record_batch_start(lake_con, "m", 1)
+    store.record_batch_end(lake_con, "m", 1, rows_in=3)
+    store.commit(lake_con, {"m": OFFSET_A}, {})
+
+    row = store.batch_history(lake_con, "m")[0]
+    assert row["rows_in"] == 3
+    assert row["rows_late"] is None
+    assert row["rows_undated"] is None
 
 
 def test_record_batch_start_writes_nothing_to_the_database(lake_con, store):
@@ -635,7 +796,12 @@ def test_record_batch_end_without_a_start_still_records_the_batch(lake_con, stor
     assert len(history) == 1
     assert history[0]["batch_id"] == 7
     assert history[0]["started_at"] is None
-    assert store.next_batch_id(lake_con, "m") == 8
+    # 9, not 8. With no matching record_batch_start the commit had to allocate
+    # an id of its own, and it took 8 -- so the offsets table already holds 8
+    # and handing it out again would put two rows on one id. next_batch_id
+    # spans both tables precisely so it cannot do that; see
+    # test_a_batch_id_is_never_reused_after_a_recorded_failure.
+    assert store.next_batch_id(lake_con, "m") == 9
 
 
 def test_the_committed_offset_records_the_batch_that_produced_it(lake_con, store):
