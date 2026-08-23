@@ -295,7 +295,7 @@ engine.add(Model(
     source=FileSource("landing/", marker="_READY", max_files_per_trigger=10),
     time_column="event_ts",
     grain="hour",
-    key=["hour_ts", "sensor_id"],
+    key=["window_ts", "sensor_id"],             # the window column is always `window_ts`
     aggregates={"n": "count(*)", "total": "sum(value)"},   # additive tier
     sink=TableSink("marts.hourly_counts", mode="update"),
 ))
@@ -312,7 +312,7 @@ DuckDB client — duckstream is not in it:
 
 ```sql
 ATTACH 'ducklake:catalog.ducklake' AS lake;
-SELECT * FROM lake.marts.hourly_counts ORDER BY hour_ts DESC LIMIT 5;
+SELECT * FROM lake.marts.hourly_counts ORDER BY window_ts DESC LIMIT 5;
 ```
 
 ### Two front doors, one canonical model
@@ -354,7 +354,7 @@ models:
       max_files_per_trigger: 10
     time_column: event_ts
     grain: hour
-    key: [hour_ts, sensor_id]
+    key: [window_ts, sensor_id]        # the window column is always `window_ts`
     aggregates:
       n: "count(*)"
       total: "sum(value)"

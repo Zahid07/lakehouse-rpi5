@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duckstream"
+version = "0.1.0"
+description = "A micro-batch streaming framework for DuckDB and DuckLake."
+requires-python = ">=3.11"
+authors = [{ name = "duckstream contributors" }]
+keywords = ["duckdb", "ducklake", "streaming", "micro-batch", "lakehouse"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# duckdb is pinned exactly on purpose: CONTEXT.md constraints 1.5 (DuckLake SQL
+# is not DuckDB SQL) and 1.7 (inlining silently captures small batches) were
+# measured against this exact build, and the aggregate classifier depends on the
+# shape of `json_serialize_sql` output.
+dependencies = [
+    "duckdb==1.5.5",
+    "pyarrow",
+    "numpy",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+# duckstream.cli arrives with W3; declaring the entry point now is intentional.
+duckstream = "duckstream.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["duckstream*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"
