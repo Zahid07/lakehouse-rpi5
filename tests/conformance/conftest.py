@@ -143,8 +143,17 @@ def _covers_both_doors(item: pytest.Item) -> str | None:
     ``@pytest.mark.parametrize("door", DOORS)`` and a fixture declared
     ``params=DOORS``. Checking the values rather than the parameter *name* means
     a test does not have to spell the parameter ``door`` to be recognised.
+
+    The parity check reads the test's own **source**, not ``fixturenames``.
+    Merely *requesting* ``make_parity`` and never calling it used to satisfy this
+    guard -- and it did satisfy it, for a real test that drove a single-door
+    ``World`` directly and had picked the fixture up on the way to something
+    else. The guard exists precisely to catch that shape and was blind to it.
+    ``fixturenames`` also carries transitive dependencies, so a test needing only
+    ``landing`` would otherwise inherit a parity claim it never made.
     """
-    if set(getattr(item, "fixturenames", ())) & _PARITY_FIXTURES:
+    source = _source_of(item)
+    if any(f"{name}(" in source or f"{name}." in source for name in _PARITY_FIXTURES):
         return "Parity"
     callspec = getattr(item, "callspec", None)
     if callspec is not None and any(

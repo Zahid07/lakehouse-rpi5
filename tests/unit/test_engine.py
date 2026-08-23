@@ -600,8 +600,24 @@ def test_attempts_run_out_and_the_batch_is_quarantined(tmp_path, landing, no_bac
 
     # The offset moved past the bad batch, the attempt counter cleared, and the
     # mart is still empty -- nothing was written from the batch that failed.
+    #
+    # "Past the batch" is the load-bearing half and is asserted against the
+    # *files*, not merely against non-None: a quarantine that recorded the loss
+    # and left the position where it was would log a permanent "data was lost"
+    # row and then retry the same batch for ever -- the worst of both policies.
     position = engine.state.load_position(engine.con, "hourly_counts")
     assert position.attempt == 0 and position.offset is not None
+    consumed = sorted(position.offset.get("consumed", {}))
+    assert consumed == ["b1/part.parquet"], (
+        f"the quarantined batch was not skipped past: {consumed}"
+    )
+    quarantined = [r for r in report if r.quarantined][0]
+    assert quarantined.end_offset == position.offset, (
+        "the result reports an offset the state store did not commit"
+    )
+    assert quarantined.end_offset != quarantined.start_offset, (
+        "a quarantined batch reported a position that never moved"
+    )
     assert not table_exists(engine.con, "marts.hourly_counts"), (
         "the quarantined batch left output behind, so its transaction did not "
         "roll back cleanly"

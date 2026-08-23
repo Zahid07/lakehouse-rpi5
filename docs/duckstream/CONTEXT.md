@@ -367,6 +367,32 @@ here: it fires per *window sealed*, not per trigger, and it is what bounds the
 accumulator by the lateness horizon instead of by the age of the stream. §1.3's
 own caveat asks for exactly this.
 
+### 1.12 Reduce state where it lives; do not read it back to reduce it
+
+**Method.** ``status`` summed the batch history in Python: it called
+``batch_history``, which returns every recorded batch, and added the columns up.
+Timed against a DuckLake ``batches`` table at three sizes, five repetitions,
+median, `threads=2`.
+
+| Batch history | Python sum | SQL aggregate |
+|---|---|---|
+| 1,000 | 61.0 ms | 46.8 ms |
+| 10,000 | 71.7 ms | 45.4 ms |
+| 100,000 | **213.5 ms** | **48.1 ms** |
+
+**Conclusion.** O(n) against O(1), and *faster in absolute terms at every size*
+— the aggregate never materialises a row. One trigger a minute is 525,000
+batches a year and nothing prunes them until phase-4 maintenance schedules it,
+so the Python version had no ceiling.
+
+**Consequence, and it is §1.10 for the third time.** That constraint has now
+been paid in three different disguises: `max(batch_id)` per trigger, then
+`load_watermark` per trigger (§1.11), then this. Each looked like a different
+problem and each had the same answer — do not move state to the arithmetic when
+the arithmetic can go to the state. The general rule is worth stating on its own
+because it will appear again: **anything that reads a state table and then loops
+over the result in Python is a defect waiting for the table to grow.**
+
 ---
 
 ## 2. Researched constraints

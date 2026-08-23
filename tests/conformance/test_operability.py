@@ -30,7 +30,7 @@ import datetime as dt
 
 import pytest
 
-from harness import DOORS, Landing, Scenario, same_rows
+from harness import DOORS, Landing, Scenario
 
 from duckstream import state as state_module
 

@@ -554,6 +554,17 @@ deleted has perfect event-time lag until you look at the processing lag.
 4. **Two `Parity` objects still need a landing tree each** (phase-2 note 6), and
    `World.run(expect_failure=True)` is how a scenario asserts a non-zero exit
    through the CLI door.
+5. **Never commit while a mutation audit is running.** It rewrites files in the
+   working tree. A commit taken mid-audit pushed a deliberately mutated
+   `engine.py`; only the hash check caught it, because the mutation is restored
+   before the next one starts and `git status` would look clean by then. The
+   restore must also preserve each file's line endings, or the same check
+   reports a difference that is real and is not a mutation.
+6. **Read a surviving mutation twice.** The first question is whether the suite
+   has a hole. The second is whether the mutation tested what its name claimed —
+   phase 2b's one survivor changed only the value a `BatchResult` *reported*,
+   not the value handed to the state store, so the behaviour it was named for
+   was never exercised at all.
 
 ---
 

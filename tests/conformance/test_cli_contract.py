@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from harness import ADDITIVE, Landing, World, document_for, spawn
+from harness import ADDITIVE, World, document_for, spawn
 
 T = dt.datetime
 
