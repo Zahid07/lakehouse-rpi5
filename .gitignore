@@ -39,3 +39,8 @@ metadata.ducklake.files/
 # Keep env templates/versioned config if needed
 # (ignore local overrides only)
 config/*.local.env
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
