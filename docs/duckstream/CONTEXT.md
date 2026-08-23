@@ -200,6 +200,115 @@ still needs the extension present or downloadable, so run `INSTALL ducklake` onc
 on a target device while it has network. Being explicit costs nothing and avoids a
 first-run failure on a disconnected deployment.
 
+### 1.8 The micro-batch latency floor is the DuckLake commit, ~17 ms
+
+**Method.** Measured during implementation, on the same box, `threads=2`, 30
+repetitions each, reporting the median. A "trigger" is one `BEGIN` … `COMMIT`
+containing a scan plus a state write, which is the shape the engine actually uses.
+
+| Trigger shape | Median | Snapshot? |
+|---|---|---|
+| plain DuckDB file, empty batch | **1.10 ms** | n/a |
+| DuckLake, read-only, nothing written | **1.28 ms** | no |
+| DuckLake, empty batch, one state write | **16.76 ms** | yes |
+| DuckLake, 100-row batch plus state write | **36.53 ms** | yes |
+
+**Conclusion.** The floor is the snapshot, not the query. A DuckLake transaction
+that writes nothing costs the same as plain DuckDB; the moment it writes, it pays
+roughly **15 ms of commit**. This is consistent with 1.3 — state merge at ~3.2 ms
+was never going to be the latency floor — and it confirms the commit was the thing
+to measure.
+
+**Cold start**, which every cron tick pays before doing any work:
+
+| Stage | Median |
+|---|---|
+| `LOAD` + `ATTACH` + settings, in-process | 77.9 ms |
+| first query after attach | 5.6 ms |
+| whole process, wall clock | **234.9 ms** |
+
+**Consequence for the design.** Per model per trigger, budget ~20 ms of unavoidable
+overhead on an idle pass and ~40 ms on a small one. Under cron the real floor is
+about **0.3 s** including interpreter start, so a sub-second cron trigger is
+meaningless and seconds is the sensible unit. A future `ProcessingTime` daemon
+skips the 235 ms and lands near the ~17 ms commit floor. Note also that an idle
+trigger which writes no state stays at ~1.3 ms — so the engine should **not**
+write a checkpoint when a batch is empty, and that is worth an explicit test.
+
+Also observed: 30 small batches produced **30 parquet files**. Inlining is off by
+design (1.7), so compaction is a framework concern, not an operator chore — this
+is the measured justification for phase 4.
+
+### 1.9 One transaction can write to only one attached database
+
+**Method.** Inside a single transaction, wrote to `memory.main.sink` and then to
+`lake.duckstream.offsets`.
+
+| | Result |
+|---|---|
+| write two attached databases in one transaction | **`TransactionContext Error`** |
+| write one attached database in one transaction | OK |
+
+**Conclusion.** DuckDB will not span a transaction across attached databases.
+
+**Consequence — this is load-bearing for the whole exactly-once claim.** The sink
+and the state store must live in **the same** catalog, which means both inside
+DuckLake. Sinking to DuckLake while checkpointing offsets to a local DuckDB file
+is not merely inadvisable, it is impossible: the one-transaction/one-snapshot
+guarantee in 1.4 cannot be formed across two databases. This is an independent
+confirmation of the "DuckLake from phase 1, not an optional backend" decision in
+§4, and it fixes the status of the plain-DuckDB `StateStore` for good — it is
+usable only when the sink is also plain DuckDB, i.e. in unit tests, exactly as
+`PLAN.md` says.
+
+### 1.10 A DuckLake DELETE that matches a row costs ~26 ms
+
+**Method.** Isolated timings of single-row statements against a DuckLake table,
+20 repetitions, median.
+
+| Statement | Cost |
+|---|---|
+| `INSERT` one row | ~8 ms |
+| `DELETE` matching nothing | free |
+| `DELETE` matching one row | **~26 ms** |
+| `UPDATE` one row | ~30 ms |
+
+A matching `DELETE` writes a tombstone file, and that file write is the cost.
+
+**Consequence.** Any per-trigger state kept as *one mutable row per model* pays
+~26 ms per state table per trigger — with offsets, watermarks and a batch record
+that reached **106 ms per trigger**, six times the 1.8 floor. Guarding the delete
+behind an existence probe was measured and is a **net regression** (114 ms vs
+102 ms): in steady state the row always exists, so the probe is pure added cost.
+
+The fix is structural, not a tuning knob: keep per-trigger state **append-only**
+and read the newest row back with `ORDER BY batch_id DESC LIMIT 1`. Appends cost
+~8 ms and write no tombstone. This is also strictly safer for crash recovery,
+since an uncommitted append is simply invisible. The cost is unbounded growth,
+which a `prune` helper bounds and phase 4 maintenance schedules.
+
+**Implemented and re-measured**, 40 reps, median, no drift between the first ten
+triggers and the last ten:
+
+| Trigger shape | Mutable-row | Append-only |
+|---|---|---|
+| idle: begin + empty commit | 0.09 ms | 0.11 ms |
+| sink insert only, no state | 8.58 ms | 9.41 ms |
+| sink + offset | 48.57 ms | **14.91 ms** |
+| sink + offset + watermark | 75.19 ms | 20.29 ms |
+| full, incl. batch record | **106.01 ms** | **25.73 ms** |
+
+**4.1x.** Each state append now costs ~5.4 ms flat.
+
+One trap worth knowing, because it inverts the obvious reading: once the writes
+were cheap, `SELECT max(batch_id)` became the dominant term, and the path doing
+*strictly more work* measured **faster** (27 ms) than the cheaper one (39 ms),
+because recording a batch happened to populate the id in memory and skip that
+read. Memoising the last committed batch id per model — populated only on
+successful commit, so a rollback leaves it untouched — is what took `sink +
+offset` from 39 ms to 14.9 ms. Sound only because v1 is single-writer under
+`AvailableNow` (§2.5); revisit it the moment a second writer exists.
+
 ---
 
 ## 2. Researched constraints
@@ -470,11 +579,9 @@ mart correctness fixes in more detail.
 
 Do not treat these as known.
 
-- **Micro-batch latency floor.** Trigger overhead (plan, execute, commit) with an
-  empty batch, per backend. Needs writing a catalog, so it was deferred out of
-  planning. State merge is ~3.2 ms, so this number is dominated by commit cost and
-  determines the minimum usable trigger interval. **Measure early — it bounds the
-  product.**
+- ~~**Micro-batch latency floor.**~~ **Measured — see 1.8.** ~17 ms per committing
+  trigger, ~1.3 ms if the trigger writes nothing, ~235 ms of process cold start
+  under cron.
 - **Change-feed cost** on a large table. No published guidance.
 - **Whether the change feed survives `expire_snapshots`** in practice, beyond the
   documented statement that expired history is unavailable.
