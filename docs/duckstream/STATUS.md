@@ -15,7 +15,15 @@ Read in this order:
 4. `BUILD_GRAPH.md` — the decision record: frozen interfaces, every ratified
    decision with its reasoning, and the notes each task left for the next
 
-**Phases 1, 2 and 2b are complete.** Phases 3–6 are not started.
+**Phases 1, 2 and 2b are complete. Phase 3 is half done.** Phases 4–6 are not
+started.
+
+Phase 3 is foldability. **Tier two executes** — `avg`, `stddev`, `var`,
+population and sample — maintained through sufficient statistics and proved
+against the production bug in `CONTEXT.md` §4. **`udf.py` is written**, so tier
+three has its tooling. **Tier three itself does not execute yet**: a
+`recompute_window` model is still refused, loudly, with a message that says it
+is not built rather than that it cannot be done.
 
 Phase **2b** was not in `PLAN.md` when phases 1 and 2 were built. It was added
 afterwards, because the gap it closes was a gap in the plan: the framework had a
@@ -26,14 +34,45 @@ what happens when the *data* will not process.
 
 ## Where to start
 
-Phase 3 is **foldability**: all three tiers with load-time validation and the
-rejection path, Arrow-mode UDF helpers for tier three, and window-range chunking
-sized from estimated rows. `PLAN.md` has the scope; the traps are at the bottom
-of this file.
+**There are two candidates and they are a genuine trade. Pick deliberately.**
 
-The rejection path already exists and is proved — a tier-two or tier-three model
-is refused rather than folded — so phase 3 is about making those tiers *execute*,
-not about adding the refusal.
+**A — finish phase 3: tier three (`recompute_window`).** The last of the
+differentiator, and the reason to build this rather than adopt Arroyo. Its
+design is already settled by measurement, so this is implementation rather than
+research:
+
+- Re-derive a window from source. The rows are in files consumed long ago —
+  still on disk and still identifiable, because the offset keeps a consumed-file
+  *map* rather than a high-water mark.
+- **Do not hand DuckDB the whole file list with a time predicate.** §1.13
+  measured ~0.1 ms per file listed *whether or not it is skipped*: statistics
+  pruning skips data pages, never the file open. 1.7 ms against 217 ms at 2,160
+  files, and on a Pi that constant multiplies.
+- So build a **file → time-range index, as a hint and never as truth**: it only
+  narrows, never removes entries, and falls back to the whole list when unsure.
+  Over-selecting reads extra files and is still right; under-selecting is
+  silently wrong. Close to free — the watermark scan already reads each batch
+  once, so grouping it by `read_parquet`'s `filename` yields per-file bounds.
+- `udf.py` is done and is what tier three's aggregates call.
+- Window-range chunking sized from estimated rows comes with it (§1.1: memory is
+  bounded by rows in flight, never by making the UDF faster).
+
+**B — phase 4's first item: the consumed-file map (§1.15).** The largest
+obstacle to running duckstream unattended on a Pi. The offset is rewritten *in
+full* every trigger: **45.7 MB after a year at one file a minute, ~65 GB of
+writes a day.** Two shortcuts are already measured and rejected in §1.15 —
+the reserved high-water mark (silently skips a file with an older mtime) and
+compression (7.4x, and *adds* 185 ms a trigger). The fix is storing consumed
+files as **rows** rather than one JSON cell, which is §1.12's rule in its most
+extreme form.
+
+  This is phase-4-sized: `plan()` and `latest_offset()` are both built around
+  the map, `plan()` takes no connection, and nine test files touch it.
+
+**My reading:** A is the product thesis; B is what decides whether it survives a
+month on real hardware. If the Pi deployment is near, do B first. `status` now
+reports offset size and warns past 1 MB, so the cliff is at least visible either
+way.
 
 Everything deferred out of the phase-2b sweep was written **explicitly into the
 phase that owns it** rather than left as a note here: `PLAN.md` phase 4 now names
@@ -45,11 +84,17 @@ two unmeasured numbers, and release discipline.
 
 ```bash
 cd d:\lakehouse-rpi5
-.venv\Scripts\python.exe -m pytest -q                        # 1025 passed, 1 skipped, ~4m20s
-.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 912, the fast ones
-.venv\Scripts\python.exe -m pytest -q -m conformance         # 113, the expensive ones
+.venv\Scripts\python.exe -m pytest -q                        # 1112 passed, 1 skipped, ~5m
+.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 985, the fast ones, ~65s
+.venv\Scripts\python.exe -m pytest -q -m conformance         # 127, the expensive ones, ~4m
 .venv\Scripts\duckstream.exe --help                          # the console script is installed
 ```
+
+**Never commit while a mutation audit is running**, and never edit a package
+file while the suite is running. Both rewrite files under you. A commit taken
+mid-audit once pushed a deliberately mutated `engine.py`; only the audit's hash
+check caught it, because the mutation is restored before the next one starts and
+`git status` looks clean by then.
 
 `.venv/` at the repo root, Python 3.14.3, `duckdb==1.5.5` **pinned exactly** —
 constraints §1.5 and §1.7 are version-sensitive and the aggregate classifier reads
@@ -59,8 +104,85 @@ is what makes the console script exist; without it one conformance test skips.
 The one expected skip is correct: Windows cannot hold two filenames differing only
 by case, so the POSIX half of a case-sensitivity pair cannot run here.
 
-**Phase 1 is committed** at `693e691` on `feat/duckstream`. Phase 2 is not
-committed yet.
+### Git state — read this before you touch anything
+
+Committed: phase 1 at `693e691`, and `143e43b` "feat: add pushes for phas 2".
+
+**`143e43b` contains a deliberate defect.** It was taken while a mutation audit
+had `engine.py` mutated, and captured this:
+
+```python
+previous = policy.advance(previous, observation.max_event_ts)   # not real code
+```
+
+which makes each batch judge its own rows against its own new watermark instead
+of the committed one — the silent under-counting failure. **The working tree is
+already correct**; the fix is uncommitted and the diff against that commit is
+exactly those two lines coming back out. It goes away with the next commit.
+
+Everything since — phases 2, 2b, step 0, tier two, `udf.py` — is **uncommitted**.
+Suggest two commits, because a line-ending normalisation is mixed in:
+
+```bash
+git diff --shortstat                    # large
+git diff --shortstat --ignore-cr-at-eol # the real change
+```
+
+Commit `.gitattributes` plus the files whose *only* change is line endings
+first, then the rest. `.gitattributes` is new and scopes LF to duckstream's own
+directories, so this does not recur.
+
+## Phase 3 so far: tier two, and the tooling for tier three
+
+### What executes now
+
+`avg`, `mean`, `stddev`, `stddev_samp`, `stddev_pop`, `var_samp`, `var_pop` and
+`variance` are maintained incrementally and exactly, through a mergeable state
+rather than by folding a finished number.
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| Tier two executes | met | five conformance scenarios, both doors, diffed against a full recompute after *every* drain |
+| **`CONTEXT.md` §4's bug is impossible** | **met** | 300x1.0 then 100x5.0 across four batches gives **2.0** and **1.7342**; that mart held 3.0 and 0.0 |
+| Numerically safe at real magnitudes | met | see §1.14 — the textbook state returns 0.0 where this returns the right answer |
+| Additive columns keep folding additively | met | a model's tier is its worst column; its columns keep their own |
+| Tier three tooling | met | `udf.py`, 20 tests, including the undocumented list-return re-verified on every run |
+| Tier three execution | **not started** | refused with a message saying it is not built |
+| Window-range chunking | **not started** | phase 3 |
+
+### The three decisions, each forced by a measurement
+
+**State is `(n, mean, M2)`, not `(sum, sum_sq, count)`** — this contradicts
+`PLAN.md`, and §1.14 is why. The textbook triple returns **524** for a true
+variance of 0.25 at Unix-timestamp magnitudes, and exactly **0.0** at 1e8 with a
+small spread. That second number is the same symptom §4's mart produced, from a
+different cause, and it would have been the framework producing it.
+
+**State is keyed by the statistic's *argument*, not its output column**, so
+`avg(value)` and `stddev(value)` share one triple instead of keeping two copies
+that can drift apart under a partial write.
+
+**Derived values are computed from the merged state inside the same `UPDATE`.**
+Every `UPDATE SET` right-hand side reads the pre-update row — verified, not
+assumed — so a plain column reference would silently use the old state. The
+obvious alternative, a second `UPDATE`, would rewrite every row in the table on
+every batch rather than the ones the merge touched.
+
+### Two things the build surfaced that were on no list
+
+**Mixed-tier models.** One `avg` makes a whole model `sufficient_statistics`,
+but a `count(*)` beside it is still additive and must keep folding by addition.
+The code caught this by refusing to build a "statistic" for `count(*)`.
+
+**The ground-truth diff was comparing different shapes.** State columns are real
+columns, so `SELECT *` included them while the recompute did not. `harness`
+now projects the model's *declared* columns, which is what the diff is about.
+
+### Still refused, and the message says which kind of refusal it is
+
+`corr`, `covar_pop` and `covar_samp` need cross terms between both arguments.
+Refused with "is not built" rather than "cannot be done" — those read very
+differently and only one of them is true here.
 
 ## Phase 2b definition of done, item by item
 
@@ -292,6 +414,24 @@ model" remains asserted on the additive tier only.
 | Two memoised values ride on single-writer | `engine.py` | The batch id (§1.10) and the committed watermark (§1.11). They expire together. |
 | The run lock is advisory | `lock.py` | Safety still comes from DuckDB's catalog file lock. The advisory lock exists to say *what happened* in words. Never promote it to the guarantee without a filesystem story. |
 
+## Measured this session
+
+Constraints §1.11 through §1.15 were all measured during phases 2, 2b and 3, and
+three of them overturned something that was already written down:
+
+| | Finding | What it overturned |
+|---|---|---|
+| §1.11 | a watermark read costs 10.4 ms a trigger | — |
+| §1.12 | reduce state in SQL; `status` was O(n) at 213 ms, now flat at 48 ms | — |
+| §1.13 | statistics pruning does not save the file open: ~0.1 ms per file | my own assumption that it would make tier three cheap |
+| §1.14 | `sum_sq` returns 524 for a true variance of 0.25, and 0.0 at 1e8 | **`PLAN.md`'s specified state for tier two** |
+| §1.15 | the consumed-file map is rewritten in full every trigger: 45.7 MB, ~65 GB/day | — |
+| §2.5 | contention is *not* structurally impossible; the catalog file lock is what saves you | **`CONTEXT.md` §2.5's own claim** |
+| §1.2 | the enum is `duckdb.func`, not `duckdb.functional` | **§1.2's own code sample**, which had never been executed |
+
+§1.10, §1.11 and §1.12 are the same constraint met three times in three
+disguises. Read them together; assume there is a fourth.
+
 ## Still unmeasured
 
 From `CONTEXT.md` §6:
@@ -387,6 +527,17 @@ And two that phase 2b added:
     and therefore a DuckLake snapshot — every tick for as long as nobody fixed
     the cause, which grows the catalog fastest exactly when that helps least.
 
+And two from phase 3 so far:
+
+14. **A model's tier is its worst column; its columns keep their own.** One
+    `avg` makes a whole model `sufficient_statistics`, but the `count(*)` beside
+    it still folds additively and must not be given a statistic state.
+15. **Names collide with DuckDB built-ins.** `entropy` is an obvious name for a
+    windowed UDF and is already an aggregate; a scalar cannot shadow one, and
+    DuckDB's error describes the collision from the inside without mentioning
+    the name. `udf.py` refuses it up front. Expect the same class of surprise
+    from `median`, `mode`, `kurtosis`.
+
 One phase-1 invariant that phase 2 **deliberately breaks**, so do not restore it:
 **"chunked equals unchunked" no longer holds once a horizon exists.** The
 watermark is a function of what has been observed, so a batch boundary between
@@ -405,6 +556,7 @@ anything.
 | `aggregates.py` | foldability tiers, classification from DuckDB's AST, fold SQL |
 | `windows.py` | tumbling-window arithmetic: the boundary, in one place |
 | `watermark.py` | lateness parsing, the watermark, what falls outside the horizon |
+| `udf.py` | Arrow-mode UDF registrars — the shape §1.2 measured at 2x native |
 | `metrics.py` | the three lags, per-model status, the health verdict |
 | `lock.py` | one writer per catalog, and a sentence when there is not |
 | `protocols.py` | `Source`, `Sink`, `StateStore`, `BatchPlan`, `BatchLimits`, `BatchContext` |
@@ -420,8 +572,7 @@ anything.
 | `registry.py` | built-in names plus dotted-path resolution |
 | `cli.py` | `run`, `validate`, `models` |
 
-Not yet written, and named in `PLAN.md`: `udf.py` (phase 3), `sources/mqtt.py`
-(phase 5).
+Not yet written, and named in `PLAN.md`: `sources/mqtt.py` (phase 5).
 
 ## How the phase-2 build was run
 

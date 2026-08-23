@@ -104,6 +104,8 @@ _EXPORTS: dict[str, str] = {
     "available_sinks": "duckstream.registry",
     "available_udfs": "duckstream.registry",
     # errors
+    "ArrowUDF": "duckstream.udf",
+    "arrow_udf": "duckstream.udf",
     "RunLock": "duckstream.lock",
     "LockError": "duckstream.lock",
     "BatchFailed": "duckstream.errors",
