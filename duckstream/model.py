@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from duckstream.aggregates import (
@@ -36,12 +37,23 @@ from duckstream.aggregates import (
 )
 from duckstream.errors import ModelValidationError
 from duckstream.protocols import BatchLimits, Sink, Source
+from duckstream.watermark import format_lateness, parse_lateness
+from duckstream.windows import GRAIN_INTERVALS, WINDOW_COLUMN
 
-__all__ = ["Model", "GRAINS", "MEMORY_PROFILES", "WINDOW_COLUMN"]
+__all__ = [
+    "Model",
+    "GRAINS",
+    "MEMORY_PROFILES",
+    "WINDOW_COLUMN",
+    "FAILURE_POLICIES",
+    "DEFAULT_MAX_ATTEMPTS",
+]
 
 
 #: Tumbling-window grains. Sliding and session windows are explicitly post-v1.
-GRAINS: tuple[str, ...] = ("minute", "hour", "day")
+#: Taken from :mod:`duckstream.windows`, which owns the arithmetic, so a grain
+#: cannot be accepted here that the window code cannot actually compute.
+GRAINS: tuple[str, ...] = tuple(GRAIN_INTERVALS)
 
 #: How a ``non_foldable`` model is allowed to use memory. ``streaming`` means the
 #: recompute can be chunked by window range; ``materialising`` means a whole
@@ -50,10 +62,27 @@ GRAINS: tuple[str, ...] = ("minute", "hour", "day")
 #: needed 64 MB.
 MEMORY_PROFILES: tuple[str, ...] = ("streaming", "materialising")
 
-#: The window column duckstream emits, whatever the grain. Fixed on purpose:
-#: the sink merge key must equal the window grain key, and a single fixed name
-#: is what makes that invariant checkable rather than conventional.
-WINDOW_COLUMN = "window_ts"
+#: What to do with a batch that will not process, once its attempts run out.
+#:
+#: ``quarantine`` skips past it and records the loss permanently in
+#: ``duckstream.quarantine``; ``halt`` never advances past data it could not
+#: process and leaves the model stuck until a human intervenes.
+#:
+#: The default is ``quarantine``, and the argument for it is that halting does
+#: not actually preserve anything: a stream blocked on one malformed file stops
+#: collecting everything that arrives after it too, so it loses strictly more
+#: than skipping does. ``halt`` is the right choice when a gap is worse than a
+#: stall -- billing, or anything reconciled downstream.
+FAILURE_POLICIES: tuple[str, ...] = ("quarantine", "halt")
+
+#: Attempts a batch gets before its policy applies. Under cron each attempt is
+#: a separate tick, so five is roughly five minutes of a one-minute schedule.
+DEFAULT_MAX_ATTEMPTS = 5
+
+#: The window column duckstream emits, whatever the grain, re-exported from
+#: :mod:`duckstream.windows`. Fixed on purpose: the sink merge key must equal
+#: the window grain key, and a single fixed name is what makes that invariant
+#: checkable rather than conventional.
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _QUALIFIED_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
@@ -86,10 +115,31 @@ class Model:
     key: list[str]
     time_column: str | None = None
     grain: str | None = None
+    lateness: str | None = None
     strategy: str | None = None
     memory_profile: str | None = None
     udfs: list[str] = field(default_factory=list)
     limits: BatchLimits = BatchLimits()
+    on_failure: str = "quarantine"
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
+
+    def __post_init__(self) -> None:
+        """Canonicalise ``lateness``. Normalisation only -- nothing is validated.
+
+        A Python user may reasonably write ``lateness=timedelta(minutes=10)``
+        and a config file can only carry ``"10 minutes"``. Storing whichever
+        arrived would make those two models unequal, and the config round-trip
+        test compares whole ``Model`` objects, so the canonical stored form is
+        always the string. Anything this does not recognise is passed through
+        untouched for :meth:`validate` to reject with a proper message -- a
+        constructor that raised would break the promise above it that nothing
+        here validates.
+        """
+        if isinstance(self.lateness, timedelta):
+            try:
+                self.lateness = format_lateness(self.lateness)
+            except Exception:
+                pass
 
     # -- classification ---------------------------------------------------
 
@@ -132,13 +182,16 @@ class Model:
         self._check_key()
         self._check_aggregates()
         self._check_grain()
+        self._check_lateness()
         self._check_memory_profile()
         self._check_window_key()
+        self._check_output_mode()
         self._check_strategy()
         self._check_non_foldable_requirements()
         self._check_udfs()
         self._check_udf_coverage()
         self._check_limits()
+        self._check_failure_policy()
 
     # -- individual rules -------------------------------------------------
 
@@ -268,6 +321,84 @@ class Model:
                 field="time_column",
                 remedy="Declare time_column, e.g. time_column='event_ts'.",
             )
+
+    def _check_lateness(self) -> None:
+        """The lateness horizon has to be a real duration, and needs windows.
+
+        ``lateness`` is what turns a model on to event time: it is how far
+        behind the newest observed event the engine keeps windows open, and
+        therefore when a window is provably complete. Both halves of that
+        sentence are about windows, so a horizon without a ``grain`` is
+        meaningless rather than merely useless -- there is nothing for it to
+        seal -- and it is refused here instead of being quietly ignored.
+        """
+        if self.lateness is None:
+            return
+        if self.grain is None:
+            raise ModelValidationError(
+                f"lateness {self.lateness!r} is declared but no grain is, so "
+                f"there are no windows for the horizon to seal. A watermark "
+                f"only means anything against windows",
+                model=self.name,
+                field="grain",
+                remedy="Declare a grain ('minute', 'hour' or 'day') as well, or "
+                "drop lateness -- a model without a horizon keeps every window "
+                "open forever, which is what phase 1 did.",
+            )
+        try:
+            parse_lateness(self.lateness)
+        except Exception as exc:
+            raise ModelValidationError(
+                str(exc),
+                model=self.name,
+                field="lateness",
+                remedy="Write a whole number and a unit, for example "
+                "lateness='10 minutes'.",
+            ) from None
+
+    def _check_output_mode(self) -> None:
+        """``append`` over a windowed aggregation needs a horizon. The reversal.
+
+        Phase 1 let ``mode='append'`` be combined with a ``grain`` and wrote one
+        partial row per window **per batch**. That is only equal to the true
+        aggregate when no two batches ever touch the same window -- a condition
+        the user cannot enforce, the engine never checked, and nothing in the
+        output reveals. It is precisely the silent-wrong-answer class in
+        ``CONTEXT.md`` section 4, in the one place the framework had left it.
+
+        With a lateness horizon there is a right answer: a window is folded
+        while it is open and written to the sink **once**, when the watermark
+        passes its end. So the horizon is required rather than recommended, and
+        the message names all three ways out -- declare a horizon, drop the
+        grain, or switch to ``update`` -- because each is a different thing the
+        user might actually have meant, and a user who genuinely wants
+        per-batch rows is asking for a model with no grain and should say so.
+
+        The mode is read off the sink with ``getattr`` rather than through the
+        ``Sink`` protocol, which does not carry one. A sink with no notion of
+        modes is unaffected, which is right: this rule is about what ``append``
+        means, and a sink that has never heard of it cannot be getting it wrong.
+        """
+        if self.grain is None or self.lateness is not None:
+            return
+        if getattr(self.sink, "mode", None) != "append":
+            return
+        raise ModelValidationError(
+            f"sink mode 'append' is declared together with grain "
+            f"{self.grain!r}, but no lateness horizon is. Append means every "
+            f"output row is final the moment it is written, and without a "
+            f"watermark no window is ever knowably complete -- so each batch "
+            f"would append its own partial row for every window it touched. "
+            f"Two batches landing in one window would then both appear, and "
+            f"the mart would over-count without failing",
+            model=self.name,
+            field="lateness",
+            remedy="Either declare how late data may be, e.g. "
+            "lateness='10 minutes', and each window is written once when it "
+            "seals; or drop `grain` if per-batch rows are genuinely what you "
+            "want; or use mode='update', which folds each batch into the "
+            "stored row and needs no horizon.",
+        )
 
     def _check_memory_profile(self) -> None:
         if self.memory_profile is None:
@@ -459,6 +590,34 @@ class Model:
                     "works; zero or negative would bound it to nothing.",
                 )
 
+    def _check_failure_policy(self) -> None:
+        """What happens when a batch will not process, and how many tries it gets.
+
+        Both are checked here rather than at the moment of failure, because the
+        moment of failure is exactly when a configuration error is least welcome
+        -- the engine would be deciding whether to skip data while also
+        discovering it does not understand the instruction.
+        """
+        if self.on_failure not in FAILURE_POLICIES:
+            raise ModelValidationError(
+                f"on_failure {self.on_failure!r} is not supported; expected one "
+                f"of {', '.join(repr(p) for p in FAILURE_POLICIES)}",
+                model=self.name,
+                field="on_failure",
+                remedy="'quarantine' skips a batch that will not process after "
+                "max_attempts tries and records the loss permanently; 'halt' "
+                "never advances past it and leaves the model stuck for a human.",
+            )
+        value = self.max_attempts
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ModelValidationError(
+                f"max_attempts must be a positive integer, got {value!r}",
+                model=self.name,
+                field="max_attempts",
+                remedy="Every batch gets at least one attempt; zero would "
+                "quarantine data without ever trying to process it.",
+            )
+
     # -- serialisation ----------------------------------------------------
 
     def to_config(self) -> dict[str, Any]:
@@ -483,12 +642,18 @@ class Model:
             config["time_column"] = self.time_column
         if self.grain is not None:
             config["grain"] = self.grain
+        if self.lateness is not None:
+            config["lateness"] = self.lateness
         if self.strategy is not None:
             config["strategy"] = self.strategy
         if self.memory_profile is not None:
             config["memory_profile"] = self.memory_profile
         if self.udfs:
             config["udfs"] = list(self.udfs)
+        if self.on_failure != "quarantine":
+            config["on_failure"] = self.on_failure
+        if self.max_attempts != DEFAULT_MAX_ATTEMPTS:
+            config["max_attempts"] = self.max_attempts
 
         limits: dict[str, Any] = {}
         if self.limits.max_rows_per_trigger is not None:
@@ -504,5 +669,5 @@ class Model:
         return (
             f"Model(name={self.name!r}, aggregates={list(self.aggregates)!r}, "
             f"key={list(self.key)!r}, grain={self.grain!r}, "
-            f"strategy={self.strategy!r})"
+            f"lateness={self.lateness!r}, strategy={self.strategy!r})"
         )

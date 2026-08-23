@@ -152,6 +152,9 @@ def corpus() -> list[Model]:
             key=["window_ts", "sensor_id"],
             time_column="event_ts",
             grain="hour",
+            # Append over windows requires a horizon, so this entry covers
+            # `lateness` as well -- see Model._check_output_mode.
+            lateness="10 minutes",
         ),
         # Tier two, with strategy and memory_profile declared explicitly.
         build(
@@ -179,6 +182,10 @@ def corpus() -> list[Model]:
             "bounded_counts",
             limits=BatchLimits(max_rows_per_trigger=50_000, max_files_per_trigger=4),
         ),
+        # The failure policy: 'halt' rather than the default, so both it and
+        # max_attempts are exercised off their defaults and therefore covered
+        # by the round trip.
+        build("strict_counts", on_failure="halt", max_attempts=2),
     ]
 
 

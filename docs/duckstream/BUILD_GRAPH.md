@@ -8,20 +8,26 @@ The manager (main session) owns this file. Subagents read it and never edit it.
 
 ## Where the build stands (2026-08-23)
 
-**787 unit tests passing**, one skip that is correct on Windows (it cannot hold two
-files differing only by case, so the POSIX half of the case-sensitivity pair
-skips). ~17,600 lines across 19 package modules and the suites.
+**Phase 1 is committed** at `693e691` on `feat/duckstream`. **Phase 2 — event
+time — is complete**: watermarks, tumbling windows, sealing past the lateness
+horizon, and both output modes. See the phase-2 section below for what was
+decided and why.
 
-W1 through W3 are **done and reviewed**. W4 — the conformance suite — is the only
-task still running, and it is the one that decides whether phase 1 is finished:
-`PLAN.md`'s definition of done is a fault-injection test, not a feature list.
-Until it is green, exactly-once is a well-evidenced design intent rather than a
-demonstrated property.
+Phase 1 finished at 873 tests. Phase 2 adds `duckstream/windows.py` and
+`duckstream/watermark.py`, a new conformance module, and unit suites for both
+new modules.
 
-**Nothing is committed yet.**
+**Phase 2b — operability and failure handling — is also complete.** It was not
+in `PLAN.md` when phases 1 and 2 were built; it was added after, because the gap
+it closes was a gap in the plan rather than in the code. See "Phase 2b" below.
 
-What the review process actually caught, since its value is the reason it costs
-what it does:
+One shipped phase-1 behaviour was **deliberately reversed** in phase 2 —
+`mode="append"` together with a `grain` — and the reasoning is recorded under
+"Resolved, phase 2" below. Read it before reversing the reversal.
+
+### What phase 1's review process caught
+
+Kept because its value is the reason it cost what it did:
 
 - **W1** shipped green and was **failed on two blockers**: an aggregate expression
   could smuggle `sum((SELECT max(v) FROM other_table))` past validation and then
@@ -99,6 +105,7 @@ class BatchContext:
     model_name: str
     batch_id: int
     plan: BatchPlan
+    watermark: datetime | None = None   # phase 2; keyword, defaulted
 
 class Source(Protocol):
     type_name: ClassVar[str]                       # registry name, e.g. "file"
@@ -135,10 +142,13 @@ class Model:
     key: list[str]                    # sink merge key
     time_column: str | None = None
     grain: str | None = None          # "minute" | "hour" | "day" | None
+    lateness: str | None = None       # phase 2; "10 minutes", or a timedelta
     strategy: str | None = None       # None = infer from tier
     memory_profile: str | None = None # "streaming" | "materialising"
     udfs: list[str] = field(default_factory=list)   # dotted paths
     limits: BatchLimits = BatchLimits()
+    on_failure: str = "quarantine"    # phase 2b; "quarantine" | "halt"
+    max_attempts: int = 5             # phase 2b
     def validate(self) -> None        # raises ModelValidationError
     @property
     def tier(self) -> Tier
@@ -152,10 +162,14 @@ Vocabulary, fixed:
 | Concept | Values |
 |---|---|
 | `Tier` | `additive`, `sufficient_statistics`, `non_foldable` |
+| failure policy | `quarantine` (default), `halt` |
+| batch outcome | `committed`, `empty`, `failed`, `halted`, `quarantined`, `backoff` |
 | strategy | `delta_merge`, `sufficient_statistics`, `recompute_window` |
 | grain | `minute`, `hour`, `day` |
 | window column | `window_ts` — always, whatever the grain |
 | sink modes | `append`, `update` |
+| lateness units | `second`, `minute`, `hour`, `day` (plural or singular) |
+| open-window table | `<target>__open_windows`, in the target's own schema |
 
 **Resolved, W1:** `PLAN.md`'s worked examples write `key: [hour_ts, sensor_id]`.
 That is stale. The window column is `window_ts` at every grain, so the
@@ -216,7 +230,9 @@ cleared that review, including any fix round the review forced.
 | W2d | registry + YAML config loader | W1 | `duckstream/registry.py`, `duckstream/config.py`, `tests/unit/test_config.py`, `tests/unit/test_registry.py` | **done** — 112 tests; review PASS, no defects |
 | W3 | engine (trigger loop, one txn per trigger) + CLI + package exports | W2a–d | `duckstream/engine.py`, `duckstream/trigger.py`, `duckstream/cli.py`, `duckstream/__main__.py`, `duckstream/__init__.py`, `tests/unit/test_engine.py` | **done** — 38 tests |
 | W4 | conformance suite: fault injection, exactly-once, snapshot accounting, front-door parity | W3 | `tests/conformance/**`, `tests/conftest.py` | **running** |
-| W5 | package README + status doc, final sweep | W4 | `duckstream/README.md`, `docs/duckstream/STATUS.md` | todo |
+| W5 | package README + status doc, final sweep | W4 | `duckstream/README.md`, `docs/duckstream/STATUS.md` | **done** |
+| P2 | event time: watermarks, windows, sealing, output modes | W5 | `duckstream/windows.py`, `duckstream/watermark.py`, and the phase-2 edits listed below | **done** |
+| P2b | operability: metrics/status/lag, retry + quarantine, run lock, `rows_out` | P2 | `duckstream/metrics.py`, `duckstream/lock.py`, and the phase-2b edits listed below | **done** |
 
 Each task is followed by a **feedback agent** that re-reads `PLAN.md`, `CONTEXT.md`
 and this file, then verifies the delivered work against that task's definition of
@@ -295,6 +311,251 @@ Measured by the W2a/W2c/W2d review, all confirmed by execution:
    this framework exists to remove: a file rewritten with identical size *and*
    mtime is missed (inherent to the identity, now pinned by a test), and D1/D2
    below were both silent until fixed.
+
+## Phase 2 — event time
+
+One work unit, built and verified in one session rather than fanned out: the
+pieces are too tightly coupled to parallelise usefully (the watermark decides
+what the sink sees, and the sink's output mode decides what the watermark is
+for), and phase 1's frozen interfaces meant there was no interface to negotiate.
+
+| File | Status |
+|---|---|
+| `duckstream/windows.py` | **new** — tumbling-window arithmetic, one owner for the boundary |
+| `duckstream/watermark.py` | **new** — horizon parsing, advancing, observing, filtering |
+| `duckstream/model.py` | `lateness` field, three new rules, `WINDOW_COLUMN` now re-exported from `windows.py` |
+| `duckstream/engine.py` | event-time step in the batch lifecycle; memoised watermark |
+| `duckstream/sinks/table.py` | sealed-append path; `merge_sql(into=)`; `seal_sql`/`evict_sql` |
+| `duckstream/state.py` | `rows_late`/`rows_undated` on `batches`, plus a migration |
+| `duckstream/protocols.py` | `BatchContext.watermark` |
+| `duckstream/cli.py` | `WINDOW` column in `models`; drops reported by `run` |
+| `tests/conformance/test_event_time.py` | **new** — phase 2's definition of done |
+| `tests/unit/test_windows.py`, `tests/unit/test_watermark.py` | **new** |
+
+### Resolved, phase 2 — ratified
+
+**Lateness is opt-in, and it is the switch.** A model with no `lateness` reads
+no watermark, writes none, filters nothing and behaves exactly as it did in
+phase 1 — verified by asserting the `watermarks` table stays empty, not by
+timing. Measured cost of the horizon once declared: **~5 ms a trigger**
+(`CONTEXT.md` §1.11), which is one state append and is irreducible.
+
+**A row is late when its *window* has sealed, never when its timestamp is older
+than the watermark.** This is the single most reversible-looking decision here
+and the one that matters most: with `grain='hour'` and `lateness='10 minutes'`,
+a watermark of 12:50 leaves `[12:00, 13:00)` open, so a row arriving at 12:05
+must still be folded. `PLAN.md` calls that "late arrival within the horizon" and
+requires it to update its window. Testing the timestamp instead passes every
+casual test and silently under-counts.
+
+**The batch is filtered against the *committed* watermark, then the watermark
+advances.** Using the batch's own maximum to judge its own rows would drop the
+older half of any batch spanning a wide time range.
+
+**The watermark is memoised in the engine, written only after a successful
+commit.** `CONTEXT.md` §1.11: the read costs 10.4 ms, a third of everything a
+horizon adds. Identical in shape and in soundness argument to §1.10's memoised
+batch id — single-writer only, and the two expire together.
+
+**Sealing is `window_ts <= watermark - grain`, computed in Python.** The
+rearrangement of `ws + G <= W` puts the whole comparison on one side, so one
+literal is inlined rather than per-row interval arithmetic — which is what keeps
+§1.5 satisfied and lets DuckLake prune on `window_ts` statistics. `month` is
+absent from the grains for this reason: its length varies, so the cutoff could
+not be a single literal.
+
+**Windowed `append` requires a horizon — a deliberate reversal.** Phase 1
+accepted `mode="append"` with a `grain` and wrote one *partial* row per window
+per batch. Its own conformance test documented the catch: that equals the truth
+only "when batches do not overlap" a window. That is a condition the user cannot
+enforce, the engine never checked, and the output never reveals — the
+`CONTEXT.md` §4 bug class, in the one place the framework had left it. Phase 2
+refuses the shape at load and provides the correct mechanism instead: fold into
+an open-window accumulator, emit each window **once** when the watermark passes
+its end. The refusal names all three ways forward (declare a horizon, drop the
+grain, or use `update`) because each is a different thing the user might have
+meant. `append` **without** a grain is untouched and still accepts any tier.
+
+**The accumulator lives beside the target**, as `<target>__open_windows` in the
+target's own schema. It must share the catalog (§1.9 — sealing moves rows
+between the two inside one transaction), and putting it next to the target
+rather than hiding it in the state schema makes "why is this hour missing from
+my mart" answerable with a `SELECT`.
+
+**Sealing deletes, and that is not a violation of §1.10.** The tombstone rule
+there is about *per-trigger* state. This delete fires per window sealed, and it
+is what bounds the accumulator by the lateness horizon instead of by the age of
+the stream — which is exactly the eviction §1.3's caveat asks for. Measured
+whole-trigger cost of the sealed-append path: **+20 ms** over phase 1.
+
+**Windowed append is additive-only in phase 2**, because it folds across
+batches. Unwindowed append still accepts any tier, because it never folds.
+
+**Rows with no event time are dropped and counted separately** (`rows_undated`),
+for models that declared a horizon. Under event-time semantics such a row
+belongs to no window, so in `append` mode it could never seal and would be
+permanently invisible. Models with no horizon keep phase-1 behaviour: a NULL
+`window_ts`.
+
+**Both counters are durable**, on `duckstream.batches`. A pre-phase-2 catalog is
+migrated with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` — verified working on
+DuckLake 1.5.5, leaving existing rows NULL, and NULL is the right value for a
+batch that ran before the counters existed. NULL and 0 stay distinguishable
+throughout: NULL means "no horizon", 0 means "a horizon, and nothing was late".
+
+### Notes phase 3 must not rediscover
+
+1. **`observe()` is one scan and it is free.** Counting rows, both drop classes
+   and `max(event_ts)` in a single pass costs 0.26 ms more than the `count(*)`
+   it replaced (§1.11). Do not split it back into separate queries.
+2. **The filter view is created only when something is dropped.** A healthy
+   stream builds no second view and reads no row twice; a conformance test
+   asserts the negative structurally, because nothing in the output would show
+   a regression.
+3. **The sink does not filter late rows and must not start.** The engine removes
+   them before `write` is called. Duplicating the check would put the decision
+   in two places and the sink's copy would be the one without the committed
+   watermark to check against. Pinned by a unit test that asserts the sink
+   *does* re-emit a window if handed a row for it.
+4. **`harness.replay` is a second implementation, not a helper.** It reproduces
+   the event-time contract in plain Python — flooring by epoch arithmetic where
+   duckstream floors by replacing fields — because the SQL recompute cannot be
+   ground truth once rows are dropped or windows withheld. Do not "simplify" it
+   by importing from `duckstream.windows`; that would make it agree by
+   construction.
+5. **Every event-time scenario drives one drop per trigger.** The reference
+   needs the engine's actual batch boundaries; a scenario that let two drops
+   share a trigger would make the two disagree about batching rather than about
+   event time.
+6. **Two `Parity` objects in one test must not share a landing tree.** The two
+   *doors* of one parity share one on purpose — if they read different trees a
+   parity failure could be a fixture difference rather than a duckstream one.
+   But a file source scans the whole tree, so a *second* parity over the same
+   tree consumes the first's drops as well as its own. This was found the hard
+   way while writing the batch-boundary test, and it presented as the engine
+   folding a row twice — the same class of trap as note 3 in the phase-1 list,
+   where a fixture that appended to a planned file produced a genuine
+   double-count that looked like an engine bug. `make_parity` now takes
+   `landing=` and its docstring says when to pass it.
+7. **Chunking is not neutral once a horizon exists.** Phase 1 asserts "chunked
+   equals unchunked" because a fold gives the same answer whatever order the
+   rows arrive in. Event time breaks that deliberately: the watermark depends on
+   what has been observed, so a batch boundary between two rows can make the
+   second late when reading both at once would not have. `max_files_per_trigger`
+   therefore stops being purely a memory knob. Pinned by
+   `test_batch_boundaries_change_which_rows_are_late`, which also asserts the
+   two results *differ* — so the test cannot quietly stop testing anything.
+
+---
+
+## Phase 2b — operability and failure handling
+
+Added to `PLAN.md` after the fact. The framework had a complete, demonstrated
+answer for what happens when the *process* dies and no answer at all for what
+happens when the *data* will not process: the offset stopped advancing and every
+later trigger retried the same corrupt file, silently, forever.
+
+| File | Status |
+|---|---|
+| `duckstream/metrics.py` | **new** — three lags, per-model status, health verdict |
+| `duckstream/lock.py` | **new** — advisory single-writer lock, portable, self-healing |
+| `duckstream/state.py` | retry state on `offsets`, a `quarantine` table, `record_failure`, `quarantine`, `Position` |
+| `duckstream/engine.py` | retry budget, backoff, the failure decision, `rows_out`, the lock |
+| `duckstream/model.py` | `on_failure`, `max_attempts` |
+| `duckstream/sinks/table.py` | `write` returns the affected-row count |
+| `duckstream/protocols.py` | `Sink.write -> int | None` |
+| `duckstream/cli.py` | `status`; `run` reports outcomes and exits non-zero |
+| `tests/unit/test_metrics.py`, `tests/unit/test_lock.py` | **new** |
+| `tests/conformance/test_operability.py` | **new** — the whole path, both doors |
+
+### Resolved, phase 2b — ratified
+
+**Quarantine is the default, `halt` is the option.** The argument is not that
+losing a batch is acceptable; it is that halting does not preserve the batch
+either. A stream blocked on one bad file stops collecting everything behind it
+too, so continuing loses strictly less. `halt` is right when a *gap* is worse
+than a *stall*, which is a real case and why it exists.
+
+**Quarantine is never silent, and that is what makes it a policy.** The skip and
+the record of the skip are one transaction, so the offset cannot move past data
+without the row saying why (`CONTEXT.md` 1.4 makes them one snapshot, and a
+conformance test reads both sides `AT (VERSION => n)` to prove it). The
+`quarantine` table is excluded from `prune` for the same reason.
+
+**Retry state lives in the `offsets` row, not a second table.** `CONTEXT.md`
+1.11 measured a scalar read of a DuckLake state table at ~10 ms, and the engine
+already pays one per trigger to learn its offset. A second table would have
+doubled that on **every** trigger to carry information that only matters when
+something is broken. A failure appends a row with the *same* offset, so "newest
+row wins" is unchanged.
+
+**A failure spends a batch id.** Two rows sharing an id would make
+`ORDER BY batch_id DESC LIMIT 1` arbitrary. This turned up a latent bug while
+being implemented: `next_batch_id` consulted only `batches`, which records
+*committed* batches, so a fresh process would hand back an id a failure row had
+already used. Fixed to span both tables; pinned by
+`test_a_batch_id_is_never_reused_after_a_recorded_failure`.
+
+**Only clean failures spend an attempt.** A hard kill records nothing, so a
+crash-looping deployment cannot quarantine its own data. Deliberate:
+infrastructure trouble must not be mistaken for bad data.
+
+**A halted model stops re-recording its verdict.** Otherwise a stuck pipeline
+appends a row and a DuckLake snapshot every tick for as long as nobody looks —
+growing the catalog fastest exactly when that helps least. It still *retries*
+each tick, cheaply, so fixing the cause is all it takes to recover.
+
+**One quarantine per model per run.** A source where every batch is
+unprocessable would otherwise skip the whole backlog in one run, before anyone
+saw the first record.
+
+**`run()` raises `BatchFailed` after every model has had its turn**, never where
+the failure happened. Raising in place meant one corrupt file in one model cost
+every later model its trigger. The exception carries the `RunReport`, so a
+caller can still see what succeeded. Quarantine does **not** raise — it is the
+outcome the model asked for — but the CLI exits non-zero for it, because losing
+data should page somebody exactly once.
+
+**`rows_out` was free all along.** Phase 1 recorded it as NULL believing it
+meant "running the aggregation twice or coupling to a sink internal". Measured
+on 1.5.5: `con.execute` on the `INSERT`, `MERGE` or `DELETE` the sink already
+issues returns a one-row result carrying the affected count, and the sink was
+discarding it. For sealed `append` the number reported is rows that reached the
+*target* — an open window has not been output yet — which makes a `0` on a
+sealing model informative rather than alarming.
+
+**The run lock is advisory and the catalog lock is authoritative.**
+`CONTEXT.md` 2.5's claim that contention is "structurally impossible" is very
+nearly true and not quite: `AvailableNow` drains until empty, so a backlog can
+make a tick outlast its own interval. What actually prevented corruption was
+DuckDB's file lock on the catalog (1.6), reporting `Unique file handle
+conflict`. The advisory lock exists to say what happened in words; it is never
+trusted for safety, because a lock trusted for safety is one that fails open on
+a filesystem it does not understand. A lock whose owner is provably dead **on
+this host** is broken automatically; one from another host never is.
+
+**`status` reads and never writes.** It can be pointed at a live deployment from
+another process, which is the DuckLake property from 1.6 paying off. Lag is
+three numbers because they fail independently — a pipeline whose cron entry was
+deleted has perfect event-time lag until you look at the processing lag.
+
+### Notes phase 3 must not rediscover
+
+1. **`Sink.write` now returns `int | None`.** A sink that returns nothing still
+   works and simply reports no count; phase 3's tier-two and tier-three write
+   paths should return theirs.
+2. **A failed batch is not an exception at the call site.** `_run_batch` catches
+   and records; `_drain` breaks on any non-committed outcome. Anything phase 3
+   adds inside the batch lifecycle inherits that, so it must leave the
+   transaction rolled back before it propagates.
+3. **`no_backoff` is a fixture, not a hack.** Any test about recovery has to
+   neutralise the retry delay or sleep a real second. It lives in
+   `tests/unit/test_engine.py` and `tests/conformance/test_operability.py`.
+4. **Two `Parity` objects still need a landing tree each** (phase-2 note 6), and
+   `World.run(expect_failure=True)` is how a scenario asserts a non-zero exit
+   through the CLI door.
+
+---
 
 ## Phase 1 definition of done (from PLAN.md, not negotiable)
 
