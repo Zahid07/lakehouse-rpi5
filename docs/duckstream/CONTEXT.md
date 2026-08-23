@@ -82,12 +82,20 @@ def fft_arrow(arr):
         type=pa.list_(pa.float64()),
     )
 
+from duckdb.func import PythonUDFType          # NOT duckdb.functional
+
 con.create_function("fft_arrow", fft_arrow, [LIST_DOUBLE], LIST_DOUBLE,
-                    type=duckdb.functional.PythonUDFType.ARROW)
+                    type=PythonUDFType.ARROW)
 ```
 
+**Correction, found when `duckstream/udf.py` first executed this.** The enum
+lives in **`duckdb.func`**, not `duckdb.functional` — the latter does not exist
+on 1.5.5. The timing above is sound; the import line beside it was written from
+the docs and never run until phase 3. `null_handling` likewise takes
+`FunctionNullHandling.SPECIAL`, not the string `'special'`.
+
 Gotchas to design around: inputs may arrive as `ChunkedArray`, not `Array`; use
-`null_handling='special'` if the function must see or return NULLs; STRUCT returns
+`FunctionNullHandling.SPECIAL` if the function must see or return NULLs; STRUCT returns
 historically required alphabetically ordered fields (duckdb#10808, closed) so
 verify before relying on them.
 
@@ -552,6 +560,16 @@ this been consumed?" becomes an anti-join the database answers, rather than a
 That is also 1.12's rule arriving in its most extreme form — *anything that
 reads a state table and then loops over the result in Python is a defect waiting
 for the table to grow* — and here the table is a single cell.
+
+**Also tempting, also measured, also rejected: compressing the stored form.**
+File paths repeat, so they compress well — zlib level 6 gives a flat **7.4x**
+at every size, taking 45.7 MB to 6.2 MB. It is a two-function change, contained
+entirely to ``encode_offset``/``decode_offset``. And it is still not worth doing:
+it *adds* **185 ms per trigger** to compress, and 65 GB a day becomes 8.8 GB a
+day, which is a card that dies in a year instead of two months. Paying CPU on
+the trigger path to make a number that is three orders of magnitude too large
+one order smaller is a mitigation dressed as a fix, and shipping it would make
+the real fix easier to keep postponing.
 
 **Tempting and wrong:** dropping entries for files that no longer exist. It
 sounds exact, and it bounds the map by the retention window rather than by all
