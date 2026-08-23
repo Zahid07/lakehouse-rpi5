@@ -755,24 +755,74 @@ def test_a_source_whose_offset_does_not_advance_fails_loudly(tmp_path, landing):
 # ---------------------------------------------------------------------------
 
 
-def test_a_non_additive_update_model_is_refused_naming_the_model(tmp_path, landing):
-    """Phase 1 folds the additive tier only, and says so before running anything."""
+def test_an_unmergeable_update_model_is_refused_naming_the_model(tmp_path, landing):
+    """A median cannot be merged at all, and the engine says so before running.
+
+    ``avg`` used to be refused here too. It is now maintained through its
+    sufficient statistics, so the test that proves the refusal still fires had
+    to move to an aggregate that genuinely has no decomposition -- otherwise it
+    would have gone on passing while testing nothing.
+    """
     drop_batch(landing, "b1", 4)
     engine = open_engine(tmp_path)
     engine.add(
         counts_model(
             landing,
-            name="mean_value",
-            aggregates={"mean_value": "avg(value)"},
+            name="mid_value",
+            aggregates={"mid_value": "median(value)"},
+            strategy="recompute_window",
+            memory_profile="materialising",
         )
     )
     with pytest.raises(DuckstreamError) as caught:
         engine.run()
     message = str(caught.value)
-    assert "mean_value" in message
-    assert "phase 3" in message
+    assert "mid_value" in message
+    assert "non_foldable" in message
     # Refused before any work: no sink table, no offset.
-    assert engine.state.load_offset(engine.con, "mean_value") is None
+    assert engine.state.load_offset(engine.con, "mid_value") is None
+    engine.con.close()
+
+
+def test_a_sufficient_statistics_model_runs_end_to_end(tmp_path, landing):
+    """The tier the engine used to refuse, through the whole batch lifecycle.
+
+    ``drop_batch`` lays values 0..n-1, so the expected answers come from the
+    data rather than from a constant -- and they are checked against DuckDB's
+    own aggregate over the same files, which is the only comparison that means
+    anything here.
+    """
+    drop_batch(landing, "b1", 40)
+    drop_batch(landing, "b2", 40, first=40)
+    engine = open_engine(tmp_path)
+    engine.add(
+        counts_model(
+            landing,
+            name="stats",
+            sink=TableSink("marts.stats"),
+            aggregates={
+                "n": "count(*)",
+                "mean_value": "avg(value)",
+                "sd_value": "stddev_samp(value)",
+            },
+        )
+    )
+    engine.run()
+
+    got = engine.con.execute(
+        "SELECT n, mean_value, sd_value FROM marts.stats ORDER BY window_ts, sensor_id"
+    ).fetchall()
+    truth = engine.con.execute(
+        f"SELECT count(*), avg(value), stddev_samp(value) "
+        f"FROM read_parquet({[p.as_posix() for p in landing.rglob('*.parquet')]!r}) "
+        f"GROUP BY date_trunc('hour', event_ts), sensor_id "
+        f"ORDER BY date_trunc('hour', event_ts), sensor_id"
+    ).fetchall()
+    assert len(got) == len(truth) and got, (got, truth)
+    for (gn, gm, gs), (tn, tm, ts) in zip(got, truth):
+        assert gn == tn
+        assert gm == pytest.approx(tm, rel=1e-12)
+        assert (gs is None and ts is None) or gs == pytest.approx(ts, rel=1e-12)
     engine.con.close()
 
 

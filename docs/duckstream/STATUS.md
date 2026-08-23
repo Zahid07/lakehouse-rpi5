@@ -6,7 +6,7 @@ is proven, what is not, and what to do next. It is current as of **2026-08-23**.
 Read in this order:
 
 1. **this file** — where things are
-2. `CONTEXT.md` — measured constraints and settled decisions. **Twelve** measured
+2. `CONTEXT.md` — measured constraints and settled decisions. **Fifteen** measured
    constraints; §1.8, §1.9 and §1.10 were measured during the phase-1 build,
    §1.11 during phase 2 and §1.12 during the phase-2b cleanup, and none of them
    is derivable from anything else. §1.10, §1.11 and §1.12 are the *same*

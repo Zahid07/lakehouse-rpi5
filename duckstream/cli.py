@@ -293,6 +293,17 @@ def _cmd_status(args: argparse.Namespace, out: TextIO) -> int:
                 f"WHERE model_name = '{m.name}' for what and why.",
                 file=out,
             )
+        if m.offset_is_large:
+            print(
+                f"\n{m.name}: the committed offset is "
+                f"{m.offset_bytes / 1e6:.1f} MB and is rewritten in full on "
+                f"every trigger — roughly "
+                f"{m.offset_bytes * 1440 / 1e9:.1f} GB a day at a one-minute "
+                f"cadence. On SD or USB storage that is a wear problem before "
+                f"it is a latency one. Reduce it by pruning consumed files out "
+                f"of the landing tree, or by batching more per trigger.",
+                file=out,
+            )
         if m.behind_horizon:
             print(
                 f"\n{m.name}: event-time lag ({_duration(m.event_lag)}) exceeds "
@@ -331,6 +342,7 @@ def _status_json(m: Any) -> dict:
         "attempt": m.attempt,
         "error": m.error,
         "quarantined": m.quarantined,
+        "offset_bytes": m.offset_bytes,
         "watermark": m.watermark,
         "last_committed_at": m.last_committed_at,
     }

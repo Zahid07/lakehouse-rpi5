@@ -393,6 +393,173 @@ the arithmetic can go to the state. The general rule is worth stating on its own
 because it will appear again: **anything that reads a state table and then loops
 over the result in Python is a defect waiting for the table to grow.**
 
+### 1.13 Statistics pruning does not save the file *open*: ~0.1 ms per file
+
+**Method.** One parquet file per hour, 2,000 rows each, footer statistics
+intact. Recomputed a single one-hour window three ways at four corpus sizes,
+five repetitions, median, `threads=2`: no filter at all, the whole file list
+plus a `WHERE` on the window, and only the files that actually match.
+
+| Files | all, no filter | all + `WHERE` | only matching |
+|---|---|---|---|
+| 24 | 6.6 ms | 4.0 ms | 1.7 ms |
+| 168 | 34.0 ms | 19.8 ms | 1.7 ms |
+| 720 | 138.5 ms | 77.8 ms | 1.6 ms |
+| 2,160 | 410.9 ms | **216.7 ms** | **1.7 ms** |
+
+**Conclusion.** The `WHERE` does prune — 411 ms drops to 217 ms, so data pages
+really are skipped. What it cannot skip is **opening the file to read the footer
+and decide**, and that costs a flat **~0.1 ms per file listed** whether the file
+is read or not. Reading only the matching files is flat at 1.7 ms at every
+corpus size; filtering the full list is linear in the *total*.
+
+**Consequence for phase 3.** A `recompute_window` cannot simply hand DuckDB the
+consumed-file list and a time predicate. At one file per trigger and a
+one-minute schedule that list is 525,000 files a year, which is ~52 seconds per
+recompute **on this box** — and a Raspberry Pi on USB SSD or SD multiplies that
+constant rather than dividing it, because the cost is small random I/O rather
+than CPU. duckstream therefore needs a file → time-range index.
+
+**Design it as a hint, not as truth.** Over-selecting is harmless: extra files
+are read and the answer is still right. Under-selecting is silently wrong, which
+is the failure class this framework exists to refuse. So the index only ever
+narrows, it never removes entries, and anything it cannot answer confidently
+falls back to the whole list — which makes correctness independent of it and
+leaves only cost depending on it. Building it is close to free: the engine
+already scans each bound batch once for the watermark (§1.11), so grouping that
+same pass by `read_parquet`'s `filename` pseudo-column yields per-file bounds
+without extra I/O.
+
+**Consequence beyond phase 3.** The same per-file constant applies to ordinary
+planning, and the consumed-file map already grows without bound and is decoded
+on every trigger. Bounding the *number of files* — compaction and retention,
+phase 4 — is the lever that matters, and this measurement makes it more urgent
+rather than less.
+
+### 1.14 `sum_sq` is not a safe sufficient statistic — carry `mean` and `M2`
+
+**Method.** Folded the same values batch by batch two ways and compared both
+against DuckDB's own `var_samp` over the whole set: the textbook triple
+`(n, sum, sum_sq)` with `var = (sum_sq - sum^2/n)/(n-1)`, and Chan's parallel
+merge carrying `(n, mean, M2)`. Batches of 100.
+
+| Data | DuckDB `var_samp` | naive `sum_sq` | Chan `mean`/`M2` |
+|---|---|---|---|
+| 300x1.0 then 100x5.0 | 3.00751879699248 | 3.00751879699248 | 3.00751879699248 |
+| epoch-like, 1.7e9 + noise | 0.250093631269326 | **524.419** (2,096x wrong) | 0.250093633 |
+| large mean, tiny variance (1e8 +/- 0.5) | 0.250062515628907 | **0.0** | 0.250062515628907 |
+
+**Conclusion.** `sum_sq - sum^2/n` subtracts two nearly-equal large numbers, so
+its error grows with the *mean* rather than with the variance. At Unix-timestamp
+magnitudes it is wrong by three orders of magnitude; at 1e8 with a small spread
+it returns exactly **0.0**. Chan's merge is equally associative — it folds
+partial states in any order, which is the only property the tier needs — and is
+correct to ~1e-9 relative on the same data.
+
+**This overrides `PLAN.md`.** That document says "persist `sum`, `sum_sq`,
+`count`; derive the result on read", and the intent is right while the triple is
+not. Tier two stores `(n, mean, M2)` per statistic argument:
+
+```
+n    = n_a + n_b
+mean = mean_a + (mean_b - mean_a) * n_b / n
+M2   = M2_a + M2_b + (mean_b - mean_a)^2 * n_a * n_b / n
+```
+
+**Why this matters more here than in most codebases.** Section 4 records a
+production mart in this repository that stored a standard deviation of **0.0**
+where the truth was 1.7342, because a batch overwrote it instead of folding it.
+The naive triple reproduces that exact symptom — 0.0 for a real variance — from
+a completely different cause, and it would do so *inside the framework built to
+prevent it*. A number that is merely wrong gets noticed; 0.0 looks like a
+constant sensor.
+
+**Confirmed end to end, in SQL, against DuckLake.** The table above is Python
+arithmetic; the same states were then folded through the real ``MERGE`` batch by
+batch and the derived columns diffed against DuckDB's own aggregate over every
+row at once:
+
+| Data | batches | `avg` | `stddev_samp` | worst rel. error |
+|---|---|---|---|---|
+| 300x1.0 then 100x5.0 | 4 | **2.0** | **1.73421993904824** | 1.5e-16 |
+| large mean, tiny variance | 16 | exact | exact | **0.0** |
+| one row per batch | 20 | exact | exact | 0.0 |
+| epoch-like magnitudes | 16 | 1.4e-16 | 1.9e-09 | 3.7e-09 |
+
+The first row is `CONTEXT.md` section 4's mart, computed correctly: **2.0 and
+1.7342**, where the hand-written incremental merge held 3.0 and 0.0.
+
+It also settles an assumption that would have been quietly fatal: **every
+``UPDATE SET`` right-hand side reads the pre-update row**, so ``n``, ``mean`` and
+``M2`` can be assigned in one statement even though ``mean`` needs the old ``n``
+and ``M2`` needs the old ``mean``. Had DuckDB applied them in order, every
+answer would have been subtly wrong.
+
+**On that 3.7e-09.** It is not an error in the fold, and calling DuckDB's
+single-pass result "the truth" overstates it — both are float64 approximations,
+and they agree to about nine significant figures on a variance of 0.25 derived
+from values of 1.7e9. Set against the naive form's factor of 2,096 on the same
+data, the difference is not close. But it does mean a tier-two ground-truth diff
+at those magnitudes cannot use the suite's usual ``rel_tol=1e-12``. The answer is
+to keep the ordinary diff on ordinary values, where agreement is 1e-16, and give
+numerical stability its own test with pathological data and a stated tolerance —
+rather than loosening the tolerance everywhere and weakening every other check.
+
+**Also measured, since it decides where the statistics live: a DuckLake view can
+be time-travelled.** `CREATE VIEW` succeeds, and `view AT (VERSION => n)` returns
+the state as of that snapshot, so deriving a mart from a private statistics
+table would not break the snapshot-walk verification the conformance suite is
+built on. Recorded because it is not obvious and would otherwise be re-derived;
+v1 still stores statistics and result in one table (see `BUILD_GRAPH.md`).
+
+### 1.15 The consumed-file map is rewritten every trigger: 45 MB at one year
+
+**Method.** Built the file source's offset at four sizes and timed the three
+things every trigger does with it -- decode it to plan, encode it to checkpoint,
+and commit it as a new append-only row against a real DuckLake catalog. 20
+repetitions, median, `threads=2`.
+
+| Files consumed | Offset size | encode | decode | commit |
+|---|---|---|---|---|
+| 1,000 | 0.09 MB | 0.5 ms | 0.4 ms | 50.0 ms |
+| 10,000 | 0.87 MB | 6.4 ms | 4.4 ms | 59.3 ms |
+| 100,000 | 8.70 MB | 74.4 ms | 77.3 ms | 153.0 ms |
+| **525,600** (one file/minute for a year) | **45.73 MB** | 438 ms | 545 ms | **651 ms** |
+
+**Conclusion.** ``duckstream/offsets.py`` already names this as a known v1
+limit, and the wording is exact: "the whole map is rewritten on every
+checkpoint". The trigger cost is bad enough — 651 ms against the ~26 ms floor of
+1.10 — but the number that matters on a Raspberry Pi is the one that does not
+appear in the table: **45.7 MB written per trigger is ~65 GB per day at a
+one-minute cadence.** That is not a latency problem, it is an SD card with a
+finite write budget being spent on re-recording the same file names.
+
+Even a week's worth (10,000 files) is ~1.25 GB a day of pure re-serialisation.
+
+**Consequence.** This is the largest single obstacle to running duckstream
+unattended on a Pi, larger than 1.13's per-file open cost and larger than
+anything in 1.10–1.12. It is a phase-4 item and it is the *first* one.
+
+**The fix is not the reserved high-water mark.** ``offsets.py`` reserves
+``high_water_mtime_ns`` for collapsing old entries, and that would bound the
+map — but it also changes the guarantee: a file arriving with an mtime older
+than the mark would be skipped, silently, which is the failure class this
+project refuses. The exact fix is to stop storing the set as one JSON value and
+store it as **rows**: consuming a file becomes an insert of one row, and "has
+this been consumed?" becomes an anti-join the database answers, rather than a
+45 MB blob decoded into Python and re-encoded on every tick.
+
+That is also 1.12's rule arriving in its most extreme form — *anything that
+reads a state table and then loops over the result in Python is a defect waiting
+for the table to grow* — and here the table is a single cell.
+
+**Tempting and wrong:** dropping entries for files that no longer exist. It
+sounds exact, and it bounds the map by the retention window rather than by all
+time. But the source learns which files exist by scanning the tree, so a network
+mount that blinks returns an empty scan, every entry looks deleted, and the next
+successful scan re-reads the entire landing directory. The failure is silent,
+total, and arrives on the day the NAS reboots.
+
 ---
 
 ## 2. Researched constraints

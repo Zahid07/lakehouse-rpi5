@@ -1337,19 +1337,49 @@ def test_the_accumulator_is_type_checked_because_it_is_merged_into(lake):
     assert "open_windows" in message and "'n'" in message
 
 
-def test_a_non_additive_windowed_append_is_refused(lake):
-    """Sealing folds across batches, so it needs a foldable aggregate.
+def test_an_unmergeable_windowed_append_is_refused(lake):
+    """Sealing folds across batches, so it needs an aggregate that decomposes.
 
     Unwindowed append accepts any tier because it never folds. Windowed append
-    does fold -- that is the whole mechanism -- so the phase-3 refusal applies
-    to it exactly as it does to update mode.
+    does fold -- that is the whole mechanism -- so a median is refused here for
+    exactly the reason it is refused in update mode.
     """
     sink = TableSink("marts.sealed", mode="append")
-    model = make_sealing_model(sink, aggregates={"mean_val": "avg(val)"})
-    with pytest.raises(DuckstreamError, match="sufficient_statistics"):
+    model = make_sealing_model(
+        sink,
+        aggregates={"mid": "median(val)"},
+        strategy="recompute_window",
+        memory_profile="materialising",
+    )
+    with pytest.raises(DuckstreamError, match="non_foldable"):
         sink.ensure(lake, model)
-    with pytest.raises(DuckstreamError, match="sufficient_statistics"):
+    with pytest.raises(DuckstreamError, match="non_foldable"):
         write_batches(lake, sink, model, [BATCHES[0]], watermarks=[None])
+
+
+def test_a_windowed_append_of_statistics_seals_correct_numbers(lake):
+    """And the tier that *does* decompose works through the sealing path too.
+
+    The accumulator holds the state while the window is open; the sealed row
+    carries the derived answer. Nothing about that is special-cased -- it falls
+    out of the state being just another set of foldable columns.
+    """
+    sink = TableSink("marts.sealed_stats", mode="append")
+    model = make_sealing_model(
+        sink, aggregates={"mean_val": "avg(val)", "n": "count(*)"}
+    )
+    high = BASE + dt.timedelta(hours=1)
+    write_batches(
+        lake, sink, model,
+        [[row(0, "a", 1)] * 3, [row(5, "a", 5)] * 1],
+        watermarks=[None, high],
+    )
+    rows = lake.execute(
+        f'SELECT "n", "mean_val" FROM {sink.qualified_name}'
+    ).fetchall()
+    assert rows == [(4, 2.0)], (
+        f"the sealed window should carry the fold of both batches: {rows}"
+    )
 
 
 # ==========================================================================
@@ -1409,8 +1439,14 @@ def test_column_types_come_from_duckdb_not_from_a_guess(lake):
 
 
 # ==========================================================================
-# The phase-3 refusal
+# What update mode can and cannot maintain
 # ==========================================================================
+#
+# Two of the three tiers merge. `delta_merge` folds each aggregate into the
+# stored value; `sufficient_statistics` folds a mergeable (n, mean, M2) state
+# and derives the answer from it. `recompute_window` is neither -- there is no
+# decomposition at all -- and is refused rather than approximated, which is the
+# whole reason the classification exists.
 
 
 def _sufficient_statistics_model(sink):
@@ -1429,18 +1465,16 @@ def _non_foldable_model(sink):
     )
 
 
-@pytest.mark.parametrize(
-    ("build", "tier"),
-    [
-        (_sufficient_statistics_model, "sufficient_statistics"),
-        (_non_foldable_model, "non_foldable"),
-    ],
-)
-def test_update_mode_refuses_a_non_additive_model(lake, build, tier):
+def test_update_mode_refuses_a_model_that_cannot_be_merged_at_all(lake):
+    """A median has no decomposition, so no merge can stand in for a recompute.
+
+    Refused at three separate doors, because a refusal that only fires on one
+    of them is a refusal something can get past.
+    """
     sink = TableSink("marts.refused")
-    model = build(sink)
+    model = _non_foldable_model(sink)
     model.validate()  # a perfectly valid model; the sink simply cannot fold it
-    assert model.tier == tier
+    assert model.tier == "non_foldable"
 
     for call in (
         lambda: sink.ensure(lake, model),
@@ -1452,8 +1486,8 @@ def test_update_mode_refuses_a_non_additive_model(lake, build, tier):
         with pytest.raises(DuckstreamError) as excinfo:
             call()
         message = str(excinfo.value)
-        assert tier in message
-        assert "phase 3" in message
+        assert "non_foldable" in message
+        assert "recomputed from source" in message
 
     # Nothing was written. Refusing loudly and writing wrong numbers anyway
     # would be worse than not refusing at all.
@@ -1462,18 +1496,16 @@ def test_update_mode_refuses_a_non_additive_model(lake, build, tier):
 
 def test_the_refusal_explains_why_rather_than_just_failing(lake):
     # A refusal is only useful if the operator can act on it, so the message has
-    # to name the model, the tier, the strategy that would be needed, and what
-    # to do instead.
+    # to name the model, the tier, the strategy, and what to do instead.
     sink = TableSink("marts.refused")
-    model = _sufficient_statistics_model(sink)
+    model = _non_foldable_model(sink)
     with pytest.raises(DuckstreamError) as excinfo:
         sink.write(lake, make_view(lake, BATCHES[0]), model, make_ctx(model, 1))
     message = str(excinfo.value)
     for fragment in (
-        "hourly_avg",
-        "sufficient_statistics",
-        "delta_merge",
-        "phase 3",
+        "hourly_median",
+        "non_foldable",
+        "recompute_window",
         "append",
     ):
         assert fragment in message, f"{fragment!r} missing from: {message}"
@@ -1485,8 +1517,110 @@ def test_a_declared_stronger_strategy_over_additive_aggregates_is_also_refused(l
     sink = TableSink("marts.refused")
     model = make_model(sink, strategy="recompute_window")
     model.validate()
-    with pytest.raises(DuckstreamError, match="phase 3"):
+    with pytest.raises(DuckstreamError, match="cannot be expressed as a merge"):
         sink.write(lake, make_view(lake, BATCHES[0]), model, make_ctx(model, 1))
+
+
+def test_update_mode_now_accepts_the_sufficient_statistics_tier(lake):
+    """The tier this sink used to refuse, and the numbers it used to get wrong.
+
+    ``CONTEXT.md`` section 4 records a mart in this repository that folded
+    averages as ``(target.avg + source.avg) / 2``: with 300 samples of 1.0 then
+    100 of 5.0 the truth is **2.0** and it held **3.0**, and the standard
+    deviation should have been **1.7342** and was overwritten to **0.0**. Those
+    are the acceptance numbers, and the batches below are split so the two
+    populations never share one -- which is exactly the shape that made the
+    original wrong.
+    """
+    sink = TableSink("marts.stats")
+    model = make_model(
+        sink,
+        name="hourly_stats",
+        aggregates={
+            "n": "count(*)",
+            "mean_val": "avg(val)",
+            "sd_val": "stddev_samp(val)",
+        },
+    )
+    model.validate()
+    assert model.resolved_strategy == "sufficient_statistics"
+
+    batches = [
+        [row(0, "a", 1) for _ in range(150)],
+        [row(0, "a", 1) for _ in range(150)],
+        [row(0, "a", 5) for _ in range(50)],
+        [row(0, "a", 5) for _ in range(50)],
+    ]
+    sink.ensure(lake, model)
+    write_batches(lake, sink, model, batches)
+
+    n, mean_val, sd_val = lake.execute(
+        f'SELECT "n", "mean_val", "sd_val" FROM {sink.qualified_name}'
+    ).fetchone()
+    assert n == 400
+    assert mean_val == pytest.approx(2.0, abs=1e-12), (
+        "the average folded wrong -- CONTEXT.md section 4's mart held 3.0 here"
+    )
+    assert sd_val == pytest.approx(1.7342199390482398, abs=1e-12), (
+        "the standard deviation folded wrong -- section 4's mart held 0.0 here"
+    )
+
+
+def test_the_statistic_state_is_shared_between_aggregates_of_one_argument(lake):
+    """``avg(val)`` and ``stddev(val)`` need the same state, so they share it.
+
+    Keying the state by output column instead would store the same three
+    numbers twice and let the copies drift apart under a partial write.
+    """
+    sink = TableSink("marts.shared")
+    model = make_model(
+        sink,
+        name="shared",
+        aggregates={"a": "avg(val)", "s": "stddev_samp(val)", "v": "var_pop(val)"},
+    )
+    assert len(sink.statistic_states(model)) == 1
+    assert len(sink.state_columns(model)) == 3
+
+    two = make_model(
+        sink, name="two", aggregates={"a": "avg(val)", "b": "avg(val * 2)"}
+    )
+    assert len(two.sink.statistic_states(two)) == 2
+
+
+def test_an_additive_column_beside_a_statistic_still_folds_additively(lake):
+    """A model's tier is its worst column, but its columns keep their own.
+
+    One ``avg`` makes the whole model ``sufficient_statistics``; the
+    ``count(*)`` next to it is still additive and must still fold by addition
+    rather than acquire a state it has no use for.
+    """
+    sink = TableSink("marts.mixed")
+    model = make_model(
+        sink, name="mixed", aggregates={"n": "count(*)", "mean_val": "avg(val)"}
+    )
+    assert sink.statistic_columns(model) == ["mean_val"]
+    # Exactly one state, for `val` -- nothing was created on count(*)'s behalf.
+    assert len(sink.state_columns(model)) == 3
+    assert all("val" in column for column in sink.state_columns(model))
+
+    write_batches(lake, sink, model, BATCHES[:2])
+    total = lake.execute(f'SELECT sum("n") FROM {sink.qualified_name}').fetchone()[0]
+    assert total == sum(len(b) for b in BATCHES[:2])
+
+
+def test_a_two_argument_statistic_is_refused_for_now(lake):
+    """corr and covar need cross terms, which is a strictly larger problem.
+
+    Refused with a message that says so, rather than folded approximately --
+    the tier exists precisely to not do that.
+    """
+    sink = TableSink("marts.corr")
+    model = make_model(sink, name="bivariate", aggregates={"c": "corr(val, val)"})
+    with pytest.raises(DuckstreamError) as excinfo:
+        sink.write(lake, make_view(lake, BATCHES[0]), model, make_ctx(model, 1))
+    message = str(excinfo.value)
+    assert "corr()" in message and "cross terms" in message
+    assert "recompute_window" in message
 
 
 # ==========================================================================

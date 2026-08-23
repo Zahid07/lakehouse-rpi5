@@ -314,6 +314,37 @@ def test_status_reads_nothing_but_the_catalog(con, store):
     assert snapshot_count(con, DEFAULT_ALIAS) == before
 
 
+def test_a_large_offset_is_reported_because_it_is_rewritten_every_trigger(con, store):
+    """The Pi cliff, made visible before somebody drives off it.
+
+    The file source's offset is written **in full** on every trigger, so its
+    size is a write-amplification figure rather than a storage one.
+    ``CONTEXT.md`` 1.15 measured it at 45.7 MB after a year at one file a
+    minute — about 65 GB of writes a day, which is an SD card's budget being
+    spent re-recording file names it already knows. Nothing surfaced it, so
+    nothing would have surfaced it until the card died.
+    """
+    big = {"kind": "file", "v": 1, "consumed": {
+        f"2026/05/part-{i:06d}.parquet": {"size": i, "mtime_ns": i}
+        for i in range(20_000)
+    }}
+    commit_batch(store, con, "m", batch_id=1, offset=big)
+
+    status = status_for(con, store, make_model(), now=NOW, include_backlog=False)
+    assert status.offset_bytes > 1_000_000
+    assert status.offset_is_large
+    assert status.state == "bloated"
+
+
+def test_a_small_offset_says_nothing(con, store):
+    """The warning has to stay quiet in the ordinary case to mean anything."""
+    commit_batch(store, con, "m", batch_id=1, offset={"consumed": {"a": 1}})
+    status = status_for(con, store, make_model(), now=NOW, include_backlog=False)
+    assert status.offset_bytes < 1_000
+    assert not status.offset_is_large
+    assert status.state == "ok"
+
+
 def test_model_status_defaults_are_a_coherent_empty_state():
     status = ModelStatus(name="x")
     assert status.healthy and status.state == "idle"

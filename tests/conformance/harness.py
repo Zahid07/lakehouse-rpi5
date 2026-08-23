@@ -615,7 +615,14 @@ class World:
         """
         with self.connect() as con:
             try:
-                return normalise(_fetch_mart(con, self.scenario.table, at=at))
+                return normalise(
+                    _fetch_mart(
+                        con,
+                        self.scenario.table,
+                        at=at,
+                        columns=self.scenario.columns,
+                    )
+                )
             except duckdb.Error:
                 return None
 
@@ -709,7 +716,14 @@ class World:
             for snapshot in lakemod.snapshots(con, ALIAS):
                 sid = snapshot["snapshot_id"]
                 try:
-                    mart = normalise(_fetch_mart(con, self.scenario.table, at=sid))
+                    mart = normalise(
+                        _fetch_mart(
+                            con,
+                            self.scenario.table,
+                            at=sid,
+                            columns=self.scenario.columns,
+                        )
+                    )
                 except duckdb.Error:
                     # The mart does not exist yet at this snapshot: catalog
                     # creation, the state schema, the marts schema. Not a gap in
@@ -735,9 +749,27 @@ class World:
         return walk
 
 
-def _fetch_mart(con: Any, table: str, *, at: int | None = None) -> list[tuple]:
+def _fetch_mart(
+    con: Any,
+    table: str,
+    *,
+    at: int | None = None,
+    columns: Sequence[str] | None = None,
+) -> list[tuple]:
+    """The mart's **declared** columns, not ``SELECT *``.
+
+    A ``sufficient_statistics`` model carries its ``(n, mean, M2)`` state in
+    real columns of the same table, so ``SELECT *`` returns those too and a
+    ground-truth diff against a recompute would be comparing different shapes.
+    The declared columns are what the model promises and what the recompute
+    produces, so they are what the diff is about. That the state columns exist
+    and fold correctly is asserted separately, where it is the actual subject.
+    """
     reference = table if at is None else f"{table} AT (VERSION => {int(at)})"
-    return con.execute(f"SELECT * FROM {reference}").fetchall()
+    projection = (
+        "*" if not columns else ", ".join(f'"{c}"' for c in columns)
+    )
+    return con.execute(f"SELECT {projection} FROM {reference}").fetchall()
 
 
 def _offset_at(con: Any, store: DuckLakeStateStore, model: str, sid: int) -> list[str]:

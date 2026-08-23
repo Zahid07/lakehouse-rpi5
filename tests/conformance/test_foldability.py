@@ -135,7 +135,8 @@ def test_an_additive_model_asking_for_recompute_window_is_also_refused():
     with pytest.raises(Exception) as excinfo:
         sink.ensure(_FailingConnection(), model)
     message = str(excinfo.value)
-    assert "recompute_window" in message and "phase 1" in message
+    assert "recompute_window" in message
+    assert "cannot be expressed as a merge" in message
 
 
 class _FailingConnection:
