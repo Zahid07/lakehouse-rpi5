@@ -73,12 +73,7 @@ from duckstream.lock import RunLock
 from duckstream.model import Model
 from duckstream.protocols import BatchContext, BatchPlan, Offset
 from duckstream.sql import quote_ident
-from duckstream.state import (
-    DEFAULT_STATE_SCHEMA,
-    DuckLakeStateStore,
-    Position,
-    backoff_delay,
-)
+from duckstream.state import DEFAULT_STATE_SCHEMA, DuckLakeStateStore, Position
 from duckstream.trigger import AvailableNow, Trigger
 from duckstream.watermark import WatermarkPolicy, policy_for
 
@@ -1205,8 +1200,6 @@ class Engine:
             return _EventTime(view=view, rows_in=self._count_rows(view))
 
         previous = self._committed_watermark(model)
-        observation = policy.observe(self.con, view, previous)
-        previous = policy.advance(previous, observation.max_event_ts)
         observation = policy.observe(self.con, view, previous)
         written = (
             policy.on_time_view(self.con, view, previous)

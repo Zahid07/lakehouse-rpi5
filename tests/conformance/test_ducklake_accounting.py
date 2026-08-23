@@ -38,7 +38,7 @@ from harness import (
     build_model,
 )
 
-from duckstream import AvailableNow, Engine, Once
+from duckstream import AvailableNow, Engine
 from duckstream import lake as lakemod
 from duckstream.state import DuckLakeStateStore
 

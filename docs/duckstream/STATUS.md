@@ -6,9 +6,11 @@ is proven, what is not, and what to do next. It is current as of **2026-08-23**.
 Read in this order:
 
 1. **this file** — where things are
-2. `CONTEXT.md` — measured constraints and settled decisions. **Eleven** measured
-   constraints; §1.8, §1.9 and §1.10 were measured during the phase-1 build and
-   §1.11 during phase 2, and none of them is derivable from anything else
+2. `CONTEXT.md` — measured constraints and settled decisions. **Twelve** measured
+   constraints; §1.8, §1.9 and §1.10 were measured during the phase-1 build,
+   §1.11 during phase 2 and §1.12 during the phase-2b cleanup, and none of them
+   is derivable from anything else. §1.10, §1.11 and §1.12 are the *same*
+   constraint met three times in three disguises — read them together
 3. `PLAN.md` — the specification: what to build, phase by phase
 4. `BUILD_GRAPH.md` — the decision record: frozen interfaces, every ratified
    decision with its reasoning, and the notes each task left for the next
@@ -202,6 +204,48 @@ an interrupted mutation run once left a file mutated and only the hash check
 would have said so unprompted.
 
 
+### The phase-2b suite was audited the same way, and it found something
+
+Thirty-two deliberate defects across both phases — the fifteen from phase 2
+re-run against the changed suite, plus seventeen aimed at quarantine, the
+failure policy, the lock and the metrics. **All thirty-two turn the suite red.**
+Getting there took two rounds, and both rounds are worth recording because
+neither failure mode was the mutation being wrong about the code.
+
+**One genuine hole.** *"quarantine records the loss but never skips past it"*
+survived the whole suite. The conformance scenario asserted that the record
+existed and that a *later* drop got through — but the later drop is a separate
+file the source plans independently, so it flowed regardless of whether the
+offset had moved. Nothing asserted the thing that actually matters: that the
+position advanced past the batch that was skipped. A quarantine that recorded
+the loss and stayed put would write a permanent "data was lost" row and then
+retry the same batch for ever, which is the worst of both policies. Now asserted
+against the consumed-file set, and against `BatchResult.end_offset` agreeing
+with what the state store committed.
+
+**And the mutation that found it was weaker than it looked.** It changed only
+the `end_offset` a `BatchResult` reports, not the `plan.end` handed to
+`state.quarantine` — so the offset really did advance and only the report lied.
+The behavioural version, which passes `position.offset` to the state store, was
+written afterwards and is now in the set as its own mutation. **A mutation that
+survives is worth reading twice: the first question is whether the suite has a
+hole, the second is whether the mutation tested what its name claims.**
+
+**Two stale anchors.** The `rows_out` change rewrote the line the phase-2 seal
+mutations anchored on, so they matched nothing and were reported as *skipped*
+rather than red. Skipped is the audit being honest — but a count that folded
+them in with the reds would have claimed coverage that did not exist. Both are
+re-anchored and both are now red.
+
+**A process lesson worth more than any of them.** The audit rewrites files in
+the working tree, so nothing may be committed while it runs. A commit taken
+mid-audit captured a mutated `engine.py` and pushed a deliberate defect. The
+hash check caught it, which is the reason the hash check exists — `git status`
+would not have, because the mutation is restored before the next one starts.
+The restore itself also needs care: writing the file back without preserving its
+line endings shows up as "not restored" and is indistinguishable, at a glance,
+from a mutation that leaked.
+
 ## Demonstrated versus merely implemented
 
 Be careful with this distinction when reporting on the project.
@@ -238,6 +282,7 @@ model" remains asserted on the additive tier only.
 | Item | Where | Notes |
 |---|---|---|
 | Quarantine is whole-batch | `engine.py` | The unit skipped is the batch, so `max_files_per_trigger: 1` is what makes it precise. Narrowing a failing batch to isolate the offending file is not implemented; it would want the source's cooperation. |
+| `status` walks the landing tree for its backlog | `metrics.py` | Deliberately unbounded — a backlog reported through `max_files_per_trigger` would read `10` whether ten files or ten thousand were waiting, which is exactly the difference worth knowing. It is I/O against a tree that may be a network mount, so it is skippable (`include_backlog=False`) and a source that raises costs a number rather than the whole status. Phase 3 gives the source time-range planning, which this should then reuse. |
 | A halted model re-reads and re-plans every tick | `engine.py` | It writes nothing after the first verdict, which is the expensive half, but it does redo the planning. Cheap, and it is what lets it recover unattended. |
 | First tick costs 2 setup snapshots | `Engine._prepare_model` | Unchanged. Pinned by `test_setup_costs_two_snapshots_even_when_there_is_nothing_to_do`. |
 | `prune` exists but nothing calls it | `state.py` | Unchanged. Phase 4 maintenance should schedule it. |
