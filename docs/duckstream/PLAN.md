@@ -83,7 +83,7 @@ result. The framework classifies every aggregate and picks its strategy:
 | Tier | Aggregates | Strategy |
 |---|---|---|
 | `additive` | `COUNT`, `SUM`, `MIN`, `MAX` | Fold the delta into the stored value. No rescan. The only tier a naive `WHERE ts > last_seen` delta merge is safe for. |
-| `sufficient_statistics` | `AVG`, `STDDEV`, `VAR`, `CORR`, `COVAR` | Persist `sum`, `sum_sq`, `count`; derive the result on read. Exact, still no rescan. |
+| `sufficient_statistics` | `AVG`, `STDDEV`, `VAR`, `CORR`, `COVAR` | Persist a mergeable state per statistic argument and derive the result from it. Exact, still no rescan. **The state is `(n, mean, M2)`, not `(sum, sum_sq, count)`** — constraint 14 measured the latter returning 524 for a true variance of 0.25 at Unix-timestamp magnitudes, and exactly 0.0 at 1e8 with a small spread, which is the same symptom section 4's production bug produced. |
 | `non_foldable` | median / exact quantiles, exact `COUNT DISTINCT`, order-dependent aggregates, any UDF over a whole window (FFT, DTW, entropy) | Recompute the affected window from source. No shortcut exists. |
 
 The framework **rejects at model-load time** a declaration of an additive strategy
@@ -288,6 +288,26 @@ From constraint 1: bound rows, not UDF cost.
 3. **Foldability.** All three tiers with load-time validation and the rejection
    path. Arrow-mode UDF helpers for tier three. Window-range chunking sized from
    estimated rows.
+
+   **Where a tier-three recompute reads from is settled by measurement, not
+   preference.** It re-derives a whole window from source, and those rows are in
+   files consumed long ago — still on disk and still identifiable, because the
+   offset keeps a consumed-file *map* rather than a high-water mark. But
+   constraint 13 measured that handing DuckDB the whole list with a time
+   predicate costs **~0.1 ms per file listed whether it is read or not**: the
+   footer still has to be opened to decide. At one file per trigger on a
+   one-minute schedule that is 525,000 files a year, and on a Pi the cost is
+   small random I/O, which SD and USB storage are worst at.
+
+   So tier three needs a **file → time-range index**, built as a *hint* rather
+   than as truth: it only ever narrows, it never removes entries, and anything
+   it cannot answer confidently falls back to the whole list. Correctness then
+   never depends on it and only cost does — over-selecting reads extra files and
+   still gets the right answer, while under-selecting would be silently wrong,
+   which is the one outcome this framework refuses. It is close to free to
+   build: the engine already scans each bound batch once for the watermark, so
+   grouping that pass by `read_parquet`'s `filename` pseudo-column yields
+   per-file bounds with no extra I/O.
 4. **Maintenance and small files.** Because inlining is off, every trigger writes
    a parquet file — so compaction is part of the framework, not an operator
    chore. A maintenance model running `ducklake_merge_adjacent_files`,
@@ -296,6 +316,28 @@ From constraint 1: bound rows, not UDF cost.
    rely on `CHECKPOINT` to flush inlined data (ducklake#1368) — moot here, but do
    not reintroduce the dependency. Also add partitioning of sink tables by time
    grain, which is what makes window-range scans prune to a few files.
+
+   **The first item is not compaction.** Constraint 15 measured the file
+   source's consumed-file map at **45.7 MB after a year at one file a minute**,
+   rewritten in full on every trigger — roughly **65 GB of writes a day**. On a
+   Raspberry Pi that is an SD card's write budget being spent re-recording file
+   names it already knows, and it is the single largest obstacle to running
+   duckstream unattended on one. It outranks everything else in this phase.
+
+   The fix is to stop storing the consumed set as one JSON value and store it
+   as **rows**: consuming a file becomes an insert of one row, and "has this
+   been consumed?" becomes an anti-join the database answers. That is exact and
+   it is constraint 12's rule applied to the most extreme case of it — a state
+   table read back and looped over in Python, where the whole table is a single
+   cell.
+
+   Two shortcuts are tempting and both are wrong. `offsets.py` reserves
+   `high_water_mtime_ns` for collapsing old entries, which bounds the map but
+   silently skips a file that arrives with an older mtime. And dropping entries
+   for files that no longer exist sounds exact, but the source learns what
+   exists by scanning the tree — so a network mount that blinks returns an empty
+   scan, every entry looks deleted, and the next good scan re-reads the whole
+   landing directory.
 
    Three further items belong here, deferred from the phase-2b sweep because
    they are data-lifecycle concerns rather than failure-handling ones:

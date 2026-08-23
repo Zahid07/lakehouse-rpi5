@@ -43,7 +43,15 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from duckstream.aggregates import fold_expression
+from duckstream.aggregates import (
+    Tier,
+    classify_expression,
+    fold_expression,
+    statistic_derive_sql,
+    statistic_merge_sql,
+    statistic_seed_sql,
+    statistic_state,
+)
 from duckstream.errors import DuckstreamError
 from duckstream.model import GRAINS, WINDOW_COLUMN
 from duckstream.sql import (
@@ -82,6 +90,10 @@ _SHAPE_ALIAS = "ds_shape"
 #: Suffix of the open-window accumulator that ``append`` mode folds into while
 #: a window is still open. Beside the target, in the target's own schema.
 _OPEN_SUFFIX = "__open_windows"
+
+#: Alias for the state subquery a tier-two aggregation nests its derived columns
+#: over. Never queried by name from outside the generated statement.
+_STATE_ALIAS = "ds_state"
 
 #: What a type string may contain before duckstream will interpolate it into a
 #: castability probe. A type name is not a value and cannot be passed as a
@@ -306,7 +318,14 @@ class TableSink:
         return key
 
     def output_columns(self, model: "Model") -> list[str]:
-        """Every column the sink writes: key columns first, then aggregates."""
+        """Every column the sink writes: keys, then aggregates, then any state.
+
+        A ``sufficient_statistics`` model carries three more columns per
+        distinct statistic *argument* -- ``n``, ``mean`` and ``M2``. They are
+        ordinary columns of the ordinary table, which is what keeps the mart
+        time-travellable and readable with plain SQL; the ``_ds_`` prefix is
+        what stops them colliding with anything a model declares.
+        """
         key = self._key_columns(model)
         overlap = [column for column in model.aggregates if column in set(key)]
         if overlap:
@@ -315,7 +334,53 @@ class TableSink:
                 f"key and an aggregate; it cannot be a grouping column and a "
                 f"computed one at the same time"
             )
-        return key + list(model.aggregates)
+        return key + list(model.aggregates) + self.state_columns(model)
+
+    def statistic_states(self, model: "Model") -> dict[str, Any]:
+        """The distinct statistic states this model needs, keyed by slug.
+
+        Keyed by the *argument*, so ``avg(value)`` and ``stddev(value)`` share
+        one state. Keying by output column would store the same numbers twice
+        and let the copies drift apart under a partial write.
+        """
+        if model.resolved_strategy != "sufficient_statistics":
+            return {}
+        states: dict[str, Any] = {}
+        for column in self.statistic_columns(model):
+            state = statistic_state(model.aggregates[column])
+            states.setdefault(state.slug, state)
+        return states
+
+    def statistic_columns(self, model: "Model") -> list[str]:
+        """Output columns needing a statistic state rather than a fold.
+
+        A model's tier is the worst of its columns, so a single ``avg`` makes
+        the whole model ``sufficient_statistics`` -- but a ``count(*)`` sitting
+        beside it is still additive and still folds by addition. Giving it a
+        state would store three numbers to reconstruct one it already has, and
+        the merge formula has no meaning for it.
+        """
+        if model.resolved_strategy != "sufficient_statistics":
+            return []
+        return [
+            column
+            for column, expression in model.aggregates.items()
+            if classify_expression(expression) is Tier.SUFFICIENT_STATISTICS
+        ]
+
+    def state_for(self, model: "Model", column: str) -> Any:
+        """The state backing one output column."""
+        return self.statistic_states(model)[
+            statistic_state(model.aggregates[column]).slug
+        ]
+
+    def state_columns(self, model: "Model") -> list[str]:
+        """Every statistic-state column, in a stable order."""
+        return [
+            column
+            for state in self.statistic_states(model).values()
+            for column in state.columns
+        ]
 
     # -- SQL ---------------------------------------------------------------
 
@@ -334,20 +399,63 @@ class TableSink:
         :mod:`duckstream.aggregates`, which rejects smuggled statements.
         """
         keys = self.key_expressions(model)
-        projections = [
-            f"{expression} AS {quote_ident(column)}" for column, expression in keys
-        ]
-        projections += [
-            f"{expression} AS {quote_ident(column)}"
-            for column, expression in model.aggregates.items()
-        ]
         self.output_columns(model)  # raises on a key/aggregate collision
         grouping = ", ".join(expression for _, expression in keys)
-        select_list = ",\n       ".join(projections)
+        key_projections = [
+            f"{expression} AS {quote_ident(column)}" for column, expression in keys
+        ]
+
+        states = self.statistic_states(model)
+        if not states:
+            projections = key_projections + [
+                f"{expression} AS {quote_ident(column)}"
+                for column, expression in model.aggregates.items()
+            ]
+            select_list = ",\n       ".join(projections)
+            return (
+                f"SELECT {select_list}\n"
+                f"  FROM {qualified(batch_view)}\n"
+                f" GROUP BY {grouping}"
+            )
+
+        # Tier two never aggregates the declared expression. It computes this
+        # batch's mergeable *state* and derives the answer from it, so what
+        # lands in the table can be folded with the next batch -- which a
+        # finished average cannot be (CONTEXT.md 1.14, and section 4 for what
+        # happens when someone tries).
+        #
+        # Nested rather than flat: the derived columns read the state columns,
+        # and a flat SELECT would be relying on being able to reference an alias
+        # declared beside them. The subquery makes the dependency explicit and
+        # costs nothing.
+        statistic = set(self.statistic_columns(model))
+        seeds: dict[str, str] = {}
+        for state in states.values():
+            seeds.update(statistic_seed_sql(state))
+        # Additive columns in a tier-two model fold exactly as they always
+        # did, so they are aggregated in the inner query beside the seeds.
+        inner = ",\n           ".join(
+            key_projections
+            + [
+                f"{expression} AS {quote_ident(column)}"
+                for column, expression in model.aggregates.items()
+                if column not in statistic
+            ]
+            + [f"{sql} AS {quote_ident(column)}" for column, sql in seeds.items()]
+        )
+        derived = ",\n       ".join(
+            f"{statistic_derive_sql(model.aggregates[column], self.state_for(model, column), _STATE_ALIAS)}"
+            f" AS {quote_ident(column)}"
+            for column in model.aggregates
+            if column in statistic
+        )
         return (
-            f"SELECT {select_list}\n"
-            f"  FROM {qualified(batch_view)}\n"
-            f" GROUP BY {grouping}"
+            f"SELECT {quote_ident(_STATE_ALIAS)}.*,\n       {derived}\n"
+            f"  FROM (\n"
+            f"       SELECT {inner}\n"
+            f"         FROM {qualified(batch_view)}\n"
+            f"        GROUP BY {grouping}\n"
+            f"       ) AS {quote_ident(_STATE_ALIAS)}"
         )
 
     def create_table_sql(
@@ -419,11 +527,39 @@ class TableSink:
             f"{source}.{quote_ident(column)}"
             for column in self._key_columns(model)
         )
-        updates = ",\n         ".join(
+        states = self.statistic_states(model)
+        statistic = set(self.statistic_columns(model))
+        assignments: list[str] = []
+
+        # Additive columns fold as they always did, in a tier-two model as much
+        # as in a tier-one one.
+        assignments += [
             f"{quote_ident(column)} = "
             f"{fold_expression(column, expression, target, source)}"
             for column, expression in model.aggregates.items()
-        )
+            if column not in statistic
+        ]
+
+        # The state merges by Chan's formula, and each derived column is
+        # computed from the *merged* state rather than read back from it. Every
+        # right-hand side of an UPDATE SET sees the pre-update row, so a plain
+        # column reference here would silently use the old state; substituting
+        # the merge expressions keeps it to one statement. The alternative --
+        # a second UPDATE afterwards -- would rewrite every row in the table on
+        # every batch instead of the ones this merge touched.
+        merged: dict[str, str] = {}
+        for state in states.values():
+            merged.update(statistic_merge_sql(state, target, source))
+        assignments += [
+            f"{quote_ident(column)} = "
+            f"{statistic_derive_sql(model.aggregates[column], self.state_for(model, column), sources=merged)}"
+            for column in model.aggregates
+            if column in statistic
+        ]
+        assignments += [
+            f"{quote_ident(column)} = {sql}" for column, sql in merged.items()
+        ]
+        updates = ",\n         ".join(assignments)
         columns = self.output_columns(model)
         insert_columns = ", ".join(quote_ident(c) for c in columns)
         insert_values = ", ".join(f"{source}.{quote_ident(c)}" for c in columns)
@@ -484,28 +620,36 @@ class TableSink:
     # -- foldability guard --------------------------------------------------
 
     def _require_additive(self, model: "Model") -> None:
-        """Refuse to merge anything but the additive tier, in phase 1.
+        """Refuse a strategy this sink cannot maintain by merging.
 
-        ``CONTEXT.md`` section 4 is the reason this is an exception and not a
+        ``CONTEXT.md`` section 4 is why this is an exception and not a
         best-effort fold. A mart that folds an average as if it were additive
         does not fail; it returns a plausible wrong number, and nobody notices
         until it is compared against a full recompute. Silence is the failure
         mode being designed out.
+
+        Two strategies merge. ``delta_merge`` folds each aggregate into the
+        stored value. ``sufficient_statistics`` folds a mergeable *state* --
+        ``(n, mean, M2)`` per statistic argument -- and derives the answer from
+        it, which is exact and still needs no rescan. ``recompute_window`` is
+        neither: there is no decomposition, the window has to be read again from
+        source, and no merge can stand in for that.
         """
         strategy = model.resolved_strategy
-        if strategy == "delta_merge":
+        if strategy in ("delta_merge", "sufficient_statistics"):
             return
         tier = model.tier
         raise DuckstreamError(
             f"TableSink(mode='update') cannot maintain model {model.name!r}: it "
             f"classifies as tier {str(tier)!r} and resolves to strategy "
-            f"{strategy!r}, but phase 1 implements the additive tier "
-            f"('delta_merge') only. Folding a {str(tier)!r} aggregate with an "
-            f"additive merge does not fail — it stores a plausible wrong number "
+            f"{strategy!r}, which cannot be expressed as a merge at all. An "
+            f"aggregate at tier {str(tier)!r} has no decomposition to fold — the "
+            f"affected windows must be recomputed from source — and folding one "
+            f"anyway does not fail, it stores a plausible wrong number "
             f"(CONTEXT.md section 4 records a mart that held 3.0 where the truth "
-            f"was 2.0), so duckstream refuses instead. The {strategy!r} strategy "
-            f"arrives in phase 3; until then use mode='append', or reduce the "
-            f"model to count/sum/min/max."
+            f"was 2.0). The {strategy!r} strategy is not built yet; until it is, "
+            f"drop `grain` and use mode='append', which never folds, or reduce "
+            f"the model to aggregates that decompose."
         )
 
     # -- catalog introspection ---------------------------------------------

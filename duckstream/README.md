@@ -544,6 +544,44 @@ it. Memory is governed by DuckDB's buffer manager materialising the batch, so
 bounding rows in flight is the control that works — a faster UDF buys no
 headroom.
 
+## Running it on a Raspberry Pi
+
+The target duckstream was built for, and the constraint that shapes every number
+below: **on a Pi the bottleneck is storage, not CPU.** SD and USB are poor at
+small random reads and have a finite write budget, so the costs that matter are
+files opened and bytes written, not cycles.
+
+**Batch fewer, larger files.** Inlining is disabled (it routes small writes into
+DuckLake's buggiest path), so every trigger writes one parquet file per table. A
+one-minute cron is 1,440 files a day per table, and reading a window out of them
+later costs **~0.1 ms per file listed whether or not it is skipped** — statistics
+pruning skips data pages, never the file open. Prefer minutes to seconds, and
+size `max_rows_per_trigger` so a batch fills a file worth writing.
+
+**Watch the offset.** The file source's committed offset carries every file it
+has ever consumed, and it is rewritten **in full on every trigger**. Measured:
+45.7 MB after a year at one file a minute, which is ~65 GB of writes a day for
+nothing but re-recording file names. `duckstream status` reports its size and
+says so once it passes 1 MB. Until this is fixed properly, keep the landing tree
+pruned — a directory that is drained and cleaned bounds the offset to the
+retention window.
+
+**Set `memory_limit` and `threads` yourself.** DuckDB defaults to most of the
+machine, which on a 4 GB Pi sharing space with everything else is not what you
+want. Memory is governed by the buffer manager materialising a batch, so bounding
+rows in flight is the control that works:
+
+```yaml
+settings:
+  memory_limit: "1GB"
+  threads: 2
+```
+
+**Expect seconds, not sub-second.** Process start alone is ~235 ms on a dev box
+before any work happens, and a committing trigger costs ~15 ms more. A
+sub-second cron interval is meaningless; a `AvailableNow(max_batches=N)` bound
+keeps one tick from outrunning the next when catching up.
+
 ## Limits, and what is not in v1
 
 - **Tumbling windows only.** `minute`, `hour` and `day`. Sliding and session

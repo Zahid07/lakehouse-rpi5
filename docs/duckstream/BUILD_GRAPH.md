@@ -568,6 +568,34 @@ deleted has perfect event-time lag until you look at the processing lag.
 
 ---
 
+## Phase 3 — decisions taken before building
+
+**Tier two stores `(n, mean, M2)` per statistic *argument*, not per output
+column, and not `(sum, sum_sq, count)`.**
+
+Three separate decisions, so three reasons:
+
+*Not `sum_sq`* — `CONTEXT.md` 1.14. The naive triple's error grows with the
+mean rather than the variance: 524 against a true 0.25 at Unix-timestamp
+magnitudes, and exactly 0.0 at 1e8 with a small spread. That last value is the
+same symptom section 4's production mart produced, from a different cause, and
+it would be the framework producing it. Chan's merge is equally associative and
+correct to ~1e-9 on the same data.
+
+*Per argument* — `avg(value)` and `stddev(value)` need the same state, so they
+share one triple. Keying on the output column would store it twice and let the
+two drift apart under a partial write.
+
+*Materialised beside the result, in one table* — the derived value is computed
+in the same `MERGE` that folds the state, so `SELECT avg_v FROM marts.hourly` is
+a plain read of a real column. Measured that a DuckLake **view** can be
+time-travelled (`view AT (VERSION => n)` works), so deriving the mart from a
+private statistics table would *not* have broken the snapshot-walk verification
+— that was the objection and it does not hold. It stays one table anyway,
+because the sink's existence check, type check, `ensure` and `MERGE` paths all
+operate on tables, and splitting every one of them to handle a view is cost
+without a benefit the user can see. Recorded so the option is not re-researched.
+
 ## Phase 1 definition of done (from PLAN.md, not negotiable)
 
 - one file source, one `additive` model, `AvailableNow` trigger
