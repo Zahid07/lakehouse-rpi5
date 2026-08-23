@@ -189,25 +189,24 @@ def status_for(
         except Exception:  # pragma: no cover - validate() refuses these first
             status.lateness = None
 
-    history = store.batch_history(con, model.name)
-    status.batches = len(history)
-    for row in history:
-        status.rows_in += row.get("rows_in") or 0
-        status.rows_out += row.get("rows_out") or 0
-        status.rows_late += row.get("rows_late") or 0
-        status.rows_undated += row.get("rows_undated") or 0
-    if history:
-        last = history[-1]
-        status.last_batch_id = last.get("batch_id")
-        status.last_committed_at = last.get("committed_at")
-        status.processing_lag = _age(status.last_committed_at, now)
+    # Aggregated in SQL, not read back and summed here: the history grows by a
+    # row per committed trigger and nothing prunes it until phase 4, so this is
+    # the one part of `status` whose cost would otherwise climb for ever. See
+    # DuckLakeStateStore.batch_totals for the measurement.
+    totals = store.batch_totals(con, model.name)
+    status.batches = totals["batches"]
+    status.rows_in = totals["rows_in"]
+    status.rows_out = totals["rows_out"]
+    status.rows_late = totals["rows_late"]
+    status.rows_undated = totals["rows_undated"]
+    status.last_batch_id = totals["last_batch_id"]
+    status.last_committed_at = totals["last_committed_at"]
+    status.processing_lag = _age(status.last_committed_at, now)
 
-    records = store.quarantined(con, model.name)
-    status.quarantined = len(records)
-    if records:
-        status.last_quarantine = records[-1].get("quarantined_at")
-        counted = [r.get("rows_in") for r in records if r.get("rows_in") is not None]
-        status.quarantined_rows = sum(counted) if counted else None
+    quarantine = store.quarantine_totals(con, model.name)
+    status.quarantined = quarantine["count"]
+    status.quarantined_rows = quarantine["rows_in"]
+    status.last_quarantine = quarantine["last"]
 
     if include_backlog:
         status.backlog = _backlog(model, position)

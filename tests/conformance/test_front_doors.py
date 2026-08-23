@@ -440,6 +440,29 @@ def test_the_door_choice_guard_rejects_a_forgetful_scenario(tmp_path):
     assert "SINGLE_DOOR_EXEMPTIONS" in combined
 
 
+def test_the_door_choice_guard_is_not_fooled_by_an_unused_parity_fixture(tmp_path):
+    """The hole the guard actually had, found by falling into it.
+
+    Requesting ``make_parity`` and never calling it used to satisfy the guard,
+    because it checked ``fixturenames`` -- which lists what a test *asked for*,
+    including transitive dependencies, not what it used. A real test hit this:
+    it drove a single-door ``World`` directly and had picked the fixture up on
+    the way to something else, so the guard passed it while it covered exactly
+    one door. That is the precise shape the guard exists to catch.
+    """
+    result = _nested(
+        tmp_path,
+        """
+        def test_asks_for_parity_but_uses_a_single_door(make_parity, make_world):
+            world = make_world("python")
+            assert world.door == "python"
+        """,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert "covers only one front door" in combined, combined
+
+
 def test_the_door_choice_guard_accepts_both_ways_of_covering_both_doors(tmp_path):
     """And it does not fire on a test that made either legitimate choice.
 
