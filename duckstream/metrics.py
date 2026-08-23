@@ -44,6 +44,11 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+#: Offset size at which `status` starts saying something. See
+#: `ModelStatus.offset_is_large` for why it is this low.
+_LARGE_OFFSET = 1_000_000
+
+
 def _age(moment: datetime | None, now: datetime) -> timedelta | None:
     if moment is None:
         return None
@@ -90,6 +95,17 @@ class ModelStatus:
     backlog: Any = None
     """Source-defined, and ``None`` when the source cannot say."""
 
+    offset_bytes: int = 0
+    """How large the committed offset is, encoded.
+
+    Reported because it is written **in full on every trigger**, so it is a
+    write-amplification figure rather than a storage one. `CONTEXT.md` 1.15
+    measured the file source's offset at 45.7 MB after a year at one file a
+    minute, which is ~65 GB a day of re-serialising the same file names -- the
+    largest single obstacle to running duckstream unattended on a Pi, and
+    invisible until somebody thought to look. Now it is not invisible.
+    """
+
     # -- verdicts ---------------------------------------------------------
 
     @property
@@ -101,6 +117,18 @@ class ModelStatus:
         stream recovered would be quietly retiring the only evidence.
         """
         return self.attempt == 0 and self.quarantined == 0
+
+    @property
+    def offset_is_large(self) -> bool:
+        """Is the offset big enough that rewriting it every trigger is the cost?
+
+        The threshold is deliberately low. At 1 MB and a one-minute cadence this
+        is already ~1.4 GB a day of writes, which matters on SD storage long
+        before it shows up as latency -- so the warning arrives while there is
+        still time to change the cadence or the retention, rather than at the
+        point where the trigger is visibly slow.
+        """
+        return self.offset_bytes >= _LARGE_OFFSET
 
     @property
     def behind_horizon(self) -> bool:
@@ -129,6 +157,8 @@ class ModelStatus:
             return "quarantined"
         if self.behind_horizon:
             return "behind"
+        if self.offset_is_large:
+            return "bloated"
         if self.last_committed_at is None:
             return "idle"
         return "ok"
@@ -173,6 +203,13 @@ def status_for(
 
     position = store.load_position(con, model.name)
     status.offset = position.offset
+    if position.offset is not None:
+        from duckstream.state import encode_offset
+
+        try:
+            status.offset_bytes = len(encode_offset(position.offset).encode("utf-8"))
+        except Exception:  # pragma: no cover - a committed offset always encodes
+            status.offset_bytes = 0
     status.attempt = position.attempt
     status.error = position.error
     status.failed_at = position.failed_at

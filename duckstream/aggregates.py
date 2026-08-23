@@ -43,6 +43,13 @@ __all__ = [
     "STRATEGIES",
     "ADDITIVE_FUNCTIONS",
     "SUFFICIENT_STATISTIC_FUNCTIONS",
+    "BIVARIATE_STATISTICS",
+    "StatisticState",
+    "statistic_argument",
+    "statistic_state",
+    "statistic_seed_sql",
+    "statistic_merge_sql",
+    "statistic_derive_sql",
     "aggregate_functions",
     "unknown_functions",
     "classify_expression",
@@ -136,6 +143,15 @@ SUFFICIENT_STATISTIC_FUNCTIONS: frozenset[str] = frozenset(
         "covar_pop",
         "covar_samp",
     }
+)
+
+
+#: The two-argument members of the tier. They need cross terms (``sum_xy`` and
+#: both univariate states), so they are a strictly larger problem than the rest
+#: and are refused for now with a message that says so rather than folded
+#: approximately -- which is the whole point of the tier existing.
+BIVARIATE_STATISTICS: frozenset[str] = frozenset(
+    {"corr", "covar_pop", "covar_samp"}
 )
 
 
@@ -734,4 +750,260 @@ def fold_expression(column: str, expr: str, target: str, source: str) -> str:
         outermost.name,
         f"{target}.{_quote(column)}",
         f"{source}.{_quote(column)}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tier two: sufficient statistics
+#
+# The tier stores a mergeable *state* per statistic argument and derives the
+# answer from it. Which state is not a free choice: `CONTEXT.md` 1.14 measured
+# the textbook `(n, sum, sum_sq)` triple returning 524 for a true variance of
+# 0.25 at Unix-timestamp magnitudes, and exactly 0.0 at 1e8 with a small spread
+# -- the same number section 4's production bug produced, from a different
+# cause. The error of that form grows with the *mean*, not the variance.
+#
+# So the state is Chan's `(n, mean, M2)`. It is equally associative, which is
+# the only property the tier actually needs, and it is correct to ~1e-9 relative
+# on the data that breaks the other one.
+# ---------------------------------------------------------------------------
+
+
+class StatisticState(NamedTuple):
+    """The three columns holding one argument's mergeable state."""
+
+    slug: str
+    argument: str
+
+    @property
+    def n(self) -> str:
+        return f"{_STAT_PREFIX}{self.slug}__n"
+
+    @property
+    def mean(self) -> str:
+        return f"{_STAT_PREFIX}{self.slug}__mean"
+
+    @property
+    def m2(self) -> str:
+        return f"{_STAT_PREFIX}{self.slug}__m2"
+
+    @property
+    def columns(self) -> tuple[str, str, str]:
+        return (self.n, self.mean, self.m2)
+
+
+#: Prefix for the state columns. Visible in the user's mart on purpose: they are
+#: real columns of a real table, so the mart time-travels and reads with plain
+#: SQL like every other duckstream output. The prefix is what keeps them from
+#: colliding with anything a model declares.
+_STAT_PREFIX = "_ds_"
+
+
+def statistic_argument(expr: str) -> str:
+    """The argument text of a bare single-call statistic, e.g. ``avg(x)`` -> ``x``.
+
+    Textual, and safe to be textual: :func:`classify_expression` has already
+    established that the expression is a **bare** aggregate call, so the first
+    ``(`` and the matching final ``)`` delimit the argument list and nothing
+    else. Anything not bare never reaches here -- it classified as
+    ``non_foldable`` and takes the recompute path instead.
+
+    Raises:
+        ModelValidationError: for a bivariate statistic, which needs two
+            arguments and cross terms between them.
+    """
+    analysis = _analysis_for(expr)
+    if not analysis.refs or not analysis.is_bare_aggregate:
+        raise ModelValidationError(
+            f"expression {expr!r} is not a single aggregate call, so it has no "
+            f"statistic argument to decompose",
+            field="aggregates",
+        )
+    name = analysis.refs[0].name
+    if name in BIVARIATE_STATISTICS:
+        raise ModelValidationError(
+            f"{name}() is a two-argument statistic and duckstream cannot "
+            f"maintain it incrementally yet. It needs cross terms between both "
+            f"arguments as well as each one's own state, which is a strictly "
+            f"larger problem than avg/stddev/var and is not built",
+            field="aggregates",
+            remedy=f"Use strategy 'recompute_window' for this model, which is "
+            f"always correct and merely slower, or drop {name}() from it.",
+        )
+
+    opened = expr.find("(")
+    if opened < 0:  # pragma: no cover - a bare call always has parentheses
+        raise ModelValidationError(
+            f"expression {expr!r} names {name}() but carries no argument list",
+            field="aggregates",
+        )
+    depth = 0
+    for index in range(opened, len(expr)):
+        character = expr[index]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                argument = expr[opened + 1 : index].strip()
+                if not argument:
+                    raise ModelValidationError(
+                        f"{name}() needs an argument to keep statistics for; "
+                        f"{expr!r} has none",
+                        field="aggregates",
+                    )
+                return argument
+    raise ModelValidationError(  # pragma: no cover - DuckDB parsed it already
+        f"expression {expr!r} has unbalanced parentheses", field="aggregates"
+    )
+
+
+def statistic_state(expr: str) -> StatisticState:
+    """The state one statistic needs, keyed by its **argument**.
+
+    Keyed by the argument rather than by the output column so that ``avg(value)``
+    and ``stddev(value)`` in one model share a single ``(n, mean, M2)`` -- they
+    are the same state, and storing it twice would let two copies of it drift
+    apart under a partial write.
+
+    The slug is derived from the argument text and then hashed, because an
+    argument may be any expression -- ``value``, ``value * 2``,
+    ``coalesce(v, 0)`` -- and a column name has to be a plain identifier. The
+    readable prefix is kept so a human reading ``SELECT *`` can tell which
+    argument a column belongs to; the hash is what makes it unambiguous.
+    """
+    argument = statistic_argument(expr)
+    return StatisticState(slug=_slug(argument), argument=argument)
+
+
+def _slug(argument: str) -> str:
+    import hashlib
+
+    normalised = " ".join(argument.split())
+    readable = "".join(c if c.isalnum() else "_" for c in normalised).strip("_")
+    digest = hashlib.sha1(normalised.encode("utf-8")).hexdigest()[:8]
+    return f"{readable[:24].lower() or 'expr'}_{digest}" if readable else digest
+
+
+def statistic_seed_sql(state: StatisticState) -> dict[str, str]:
+    """This batch's own ``(n, mean, M2)`` for one argument, as SQL.
+
+    ``M2`` is obtained as ``var_pop(x) * count(x)`` rather than by summing
+    squared deviations by hand: DuckDB computes the batch's variance in one
+    stable pass, and scaling it back up is exact. Doing it by hand would need
+    two passes over the batch and would reintroduce, inside each batch, the
+    numerical problem the state exists to avoid across batches.
+
+    ``count(x)`` counts non-NULL values and ``var_pop(x)`` ignores NULLs, so the
+    two agree on which rows they describe. A batch with no non-NULL values gives
+    ``n = 0`` and a NULL ``mean``/``M2``, which the merge treats as the identity.
+    """
+    argument = state.argument
+    return {
+        state.n: f"count({argument})",
+        state.mean: f"avg({argument})",
+        state.m2: f"var_pop({argument}) * count({argument})",
+    }
+
+
+def statistic_merge_sql(
+    state: StatisticState, target: str, source: str
+) -> dict[str, str]:
+    """Chan's parallel merge, as three ``UPDATE SET`` right-hand sides.
+
+    ::
+
+        n    = n_a + n_b
+        mean = mean_a + (mean_b - mean_a) * n_b / n
+        M2   = M2_a + M2_b + (mean_b - mean_a)^2 * n_a * n_b / n
+
+    Every right-hand side reads the **pre-update** row, which is what makes it
+    safe to assign all three in one statement -- ``mean`` uses the old ``n`` and
+    the old ``mean``, and ``M2`` uses the old ``mean``, exactly as the formula
+    requires. A test asserts that rather than trusting it.
+
+    A batch that contributed nothing (``n_b = 0``) must leave the state exactly
+    as it was, so every branch is guarded: the division would otherwise be by
+    zero when both sides are empty, and NULL arithmetic would erase a stored
+    value the way ``CONTEXT.md`` section 4's mart erased a standard deviation.
+    """
+    a_n, a_mean, a_m2 = (f"{target}.{_quote(c)}" for c in state.columns)
+    b_n, b_mean, b_m2 = (f"{source}.{_quote(c)}" for c in state.columns)
+
+    # Treat a missing side as the empty state rather than as NULL: an unmatched
+    # row on either side is "no observations", not "unknown".
+    za, zb = f"coalesce({a_n}, 0)", f"coalesce({b_n}, 0)"
+    total = f"({za} + {zb})"
+
+    delta = f"(coalesce({b_mean}, 0) - coalesce({a_mean}, 0))"
+    return {
+        state.n: total,
+        state.mean: (
+            f"CASE WHEN {total} = 0 THEN NULL"
+            f" WHEN {za} = 0 THEN {b_mean}"
+            f" WHEN {zb} = 0 THEN {a_mean}"
+            f" ELSE {a_mean} + {delta} * {zb} / {total} END"
+        ),
+        state.m2: (
+            f"CASE WHEN {total} = 0 THEN NULL"
+            f" WHEN {za} = 0 THEN {b_m2}"
+            f" WHEN {zb} = 0 THEN {a_m2}"
+            f" ELSE coalesce({a_m2}, 0) + coalesce({b_m2}, 0)"
+            f" + {delta} * {delta} * {za} * {zb} / {total} END"
+        ),
+    }
+
+
+def statistic_derive_sql(
+    expr: str,
+    state: StatisticState,
+    alias: str = "",
+    *,
+    sources: dict[str, str] | None = None,
+) -> str:
+    """The answer, computed from the state.
+
+    ``alias`` qualifies the state columns when they belong to a particular side
+    of a ``MERGE``; it is empty when deriving over a table's own columns.
+
+    ``sources`` replaces the column references with arbitrary SQL, and exists
+    for one specific job: computing the derived value **from the merged state,
+    in the same ``UPDATE``**. Every right-hand side of an ``UPDATE SET`` reads
+    the pre-update row, so a derived column written as a plain reference would
+    silently use the *old* state. Substituting the merge expressions themselves
+    keeps it to one statement. The alternative -- a second ``UPDATE`` afterwards
+    -- would rewrite every row of the table on every batch rather than the ones
+    the merge touched, which is O(table) per trigger.
+
+    Sample statistics divide by ``n - 1`` and are NULL for a single observation,
+    matching DuckDB's own ``var_samp`` and ``stddev_samp``: the derived column
+    has to agree with a full recompute, or the ground-truth diff is comparing
+    two different definitions rather than two implementations.
+    """
+    name = _analysis_for(expr).refs[0].name
+    prefix = f"{alias}." if alias else ""
+    if sources:
+        n = f"({sources[state.n]})"
+        mean = f"({sources[state.mean]})"
+        m2 = f"({sources[state.m2]})"
+    else:
+        n = f"{prefix}{_quote(state.n)}"
+        mean = f"{prefix}{_quote(state.mean)}"
+        m2 = f"{prefix}{_quote(state.m2)}"
+
+    if name in ("avg", "mean"):
+        return f"CASE WHEN {n} = 0 THEN NULL ELSE {mean} END"
+    population = f"CASE WHEN {n} = 0 THEN NULL ELSE {m2} / {n} END"
+    sample = f"CASE WHEN {n} < 2 THEN NULL ELSE {m2} / ({n} - 1) END"
+    if name in ("var_pop",):
+        return population
+    if name in ("var_samp", "variance"):
+        return sample
+    if name in ("stddev_pop",):
+        return f"sqrt({population})"
+    if name in ("stddev", "stddev_samp"):
+        return f"sqrt({sample})"
+    raise ModelValidationError(  # pragma: no cover - guarded by the tier check
+        f"{name}() is not a statistic duckstream knows how to derive",
+        field="aggregates",
     )
