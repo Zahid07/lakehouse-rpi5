@@ -64,8 +64,9 @@ measurement, so this is implementation rather than research:
   `WHERE max_ts >= lo AND min_ts < hi` — a query against a table that already
   exists, with the same anti-join machinery and the same tests. This is why
   phase 4's first item was done first: measured, putting that index in the old
-  JSON offset took it from 45.1 MB to 71.2 MB per trigger, **1.58x worse on the
-  project's worst number**, and the alternative was building a separate table
+  JSON offset took the *encoded* offset from 45.1 MB to 71.2 MB — **1.58x worse
+  on the project's worst number**, and §1.16 is careful to keep encoded size and
+  bytes-on-disk apart — and the alternative was building a separate table
   that this change would then have had to fold back in.
 - `udf.py` is done and is what tier three's aggregates call.
 - Window-range chunking sized from estimated rows comes with it (§1.1: memory is
@@ -84,9 +85,9 @@ two unmeasured numbers, and release discipline.
 
 ```bash
 cd d:\lakehouse-rpi5
-.venv\Scripts\python.exe -m pytest -q                        # 1162 passed, 1 skipped, ~5m
-.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 1035, the fast ones, ~70s
-.venv\Scripts\python.exe -m pytest -q -m conformance         # 127, the expensive ones, ~4m
+.venv\Scripts\python.exe -m pytest -q                        # 1162 passed, 2 skipped, ~5m
+.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 1035 passed, 2 skipped, ~70s
+.venv\Scripts\python.exe -m pytest -q -m conformance         # 126 passed, 1 skipped, ~4m
 .venv\Scripts\duckstream.exe --help                          # the console script is installed
 ```
 
@@ -115,13 +116,17 @@ mean anything and says so.
 Committed on `feat/duckstream`, newest last:
 
 ```
-693e691  phase 1
+693e691  feat: add duckstream files                              phase 1
 143e43b  feat: add pushes for phas 2
 ee9e3c0  chore(duckstream): normalise line endings to LF
 f501eef  fix(duckstream): flat-cost status, guard hole, unused imports
 9351d13  feat(duckstream): tier-2 sufficient statistics, Pi measurements
 f8c6e1c  feat(duckstream): Arrow-mode UDF registrars for tier three
+7992f95  feat(duckstream): consumed files as rows — phase 4's first item
+23c53b4  fix(tools): keep the mutation audit's worktrees out of the repository
 ```
+
+**The working tree is clean at `23c53b4`.** Nothing is uncommitted.
 
 **The defect that was in `143e43b` is gone.** That commit was taken while a
 mutation audit had `engine.py` mutated and captured a batch judging its own rows
@@ -132,15 +137,15 @@ repeat, because it does not touch the working tree at all any more.
 
 ## Phase 4, item 1: the consumed-file set as rows
 
-`PLAN.md` phase 4 says its first item is not compaction — it is the file
-source's consumed-file map, and it "outranks everything else in this phase".
-Done.
+`PLAN.md` phase 4 opens by saying its first item is not compaction — it is the
+file source's consumed-file map. Done, and `PLAN.md` now says so in the past
+tense.
 
 | Requirement | Status | Evidence |
 |---|---|---|
 | The consumed set is rows, not a JSON cell | met | `duckstream.consumed_files`; `duckstream/consumed.py` |
 | **The per-trigger write collapses** | **met** | §1.16: 7.97 MB → **4.9 KB**, 1,665x; 11.2 GB/day → 6.8 MB/day |
-| …and stays flat as the stream ages | met | plan 3.6 ms and commit 13.8 ms at 1,000 files and at 525,600 alike |
+| …and stays flat as the stream ages | met | §1.16: planning ~3.4 ms and commit ~14 ms whether 1,000 files have been consumed or 525,600 |
 | A v1 catalog migrates instead of replaying | met | automatic, one transaction, carrying the retry state; three engine-level tests |
 | **A v2 offset is never mistaken for an empty one** | **met** | `FileOffset.consumed()` raises; the message names the table and the constraint |
 | The rows commit with the output they check point | met | one transaction, and the conformance snapshot walk now reads them `AT (VERSION => n)` |
@@ -269,8 +274,10 @@ rather than by folding a finished number.
 
 ### The three decisions, each forced by a measurement
 
-**State is `(n, mean, M2)`, not `(sum, sum_sq, count)`** — this contradicts
-`PLAN.md`, and §1.14 is why. The textbook triple returns **524** for a true
+**State is `(n, mean, M2)`, not `(sum, sum_sq, count)`** — this contradicted
+`PLAN.md` as written, and §1.14 is why. `PLAN.md` has since been corrected and
+now specifies the same state, so the two agree; the history is kept because the
+reasoning is the point. The textbook triple returns **524** for a true
 variance of 0.25 at Unix-timestamp magnitudes, and exactly **0.0** at 1e8 with a
 small spread. That second number is the same symptom §4's mart produced, from a
 different cause, and it would have been the framework producing it.
@@ -476,8 +483,10 @@ rather than red. Skipped is the audit being honest — but a count that folded
 them in with the reds would have claimed coverage that did not exist. Both are
 re-anchored and both are now red.
 
-**A process lesson worth more than any of them.** The audit rewrites files in
-the working tree, so nothing may be committed while it runs. A commit taken
+**A process lesson worth more than any of them** — and *since fixed*, so read
+this paragraph as history: phase 4 moved the audit into throwaway worktrees and
+it no longer touches the working tree at all. At the time, the audit rewrote
+files in the working tree, so nothing could be committed while it ran. A commit taken
 mid-audit captured a mutated `engine.py` and pushed a deliberate defect. The
 hash check caught it, which is the reason the hash check exists — `git status`
 would not have, because the mutation is restored before the next one starts.
@@ -549,8 +558,8 @@ still owed.
 ## Measured this session
 
 Constraints §1.11 through §1.16 were measured during phases 2, 2b, 3 and 4, and
-**five** of them overturned something that was already written down — including,
-now, one of `CONTEXT.md`'s own measurements:
+**six** of the rows below overturned something that was already written down —
+including, now, two of `CONTEXT.md`'s own numbers:
 
 | | Finding | What it overturned |
 |---|---|---|
@@ -578,15 +587,24 @@ the standing of intuition and this project's first rule applies to it.
 
 ## Still unmeasured
 
-From `CONTEXT.md` §6:
+Two are from `PLAN.md`'s performance list, one from its phase 6, and one from
+`CONTEXT.md` §6 — which is worth stating because an earlier version of this
+section attributed all four to §6, and a session that went looking for them
+there found something else entirely:
 
-- **memory ratio per tier** — bisect `memory_limit` against `max_rows_per_trigger`
+- **memory ratio per tier** (`PLAN.md`)  — bisect `memory_limit` against `max_rows_per_trigger`
   and publish the ratio so users can size the knob
-- **UDF parallelism penalty** — quantify the single-thread cost (§2.1) so the docs
-  can say when to split across processes
-- **accumulator size under a real workload** — sealing bounds it by the horizon,
-  but §1.3 only measured a state table to 6,000 rows
-- `PRAGMA platform;` on the actual Pi 5 (only matters for future extension work)
+- **UDF parallelism penalty** (`PLAN.md`) — quantify the single-thread cost
+  (§2.1) so the docs can say when to split across processes
+- **accumulator size under a real workload** (`PLAN.md` phase 6, and §1.3's own
+  caveat) — sealing bounds it by the horizon, but §1.3 only measured a state
+  table to 6,000 rows
+- `PRAGMA platform;` on the actual Pi 5 (**§6**; only matters for extension work)
+
+`CONTEXT.md` §6 additionally lists change-feed cost, whether the change feed
+survives `expire_snapshots`, whether community-extensions CI accepts a C-API
+extension, and DuckDB v2.0's final scope. None of those blocks anything in
+phases 3–6.
 
 ## Operating envelope, measured
 
@@ -750,7 +768,7 @@ anything.
 | `sql.py` | identifier and literal quoting |
 | `config.py` | YAML deserialiser, `${VAR}` substitution — parsing isolated here |
 | `registry.py` | built-in names plus dotted-path resolution |
-| `cli.py` | `run`, `validate`, `models` |
+| `cli.py` | `run`, `validate`, `status`, `models` |
 
 Not yet written, and named in `PLAN.md`: `sources/mqtt.py` (phase 5).
 
