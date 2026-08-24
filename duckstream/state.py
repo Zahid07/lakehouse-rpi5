@@ -45,10 +45,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from duckstream.consumed import CONSUMED_TABLE, ConsumedFiles
 from duckstream.errors import DuckstreamError
 from duckstream.lake import _quote_identifier
 
 __all__ = [
+    "CONSUMED_TABLE",
     "DEFAULT_STATE_SCHEMA",
     "DuckLakeStateStore",
     "MemoryStateStore",
@@ -331,6 +333,25 @@ class _StateStoreBase:
         """
         return self._qualified("quarantine")
 
+    @property
+    def consumed_files_table(self) -> str:
+        """Fully qualified name of the consumed-file table.
+
+        One row per file a replayable source has consumed, at the size and
+        mtime it was consumed at. It lives here rather than inside the offset
+        because ``CONTEXT.md`` 1.16 measured the offset shape it replaces at
+        7.97 MB of writes every trigger after a year, against 4.9 KB here -- see
+        :mod:`duckstream.consumed`. Like ``quarantine`` and unlike everything
+        else in this schema, **nothing prunes it**: these rows *are* the
+        position, so deleting one makes duckstream read that file again.
+        """
+        return self._qualified(CONSUMED_TABLE)
+
+    @property
+    def consumed_files(self) -> ConsumedFiles:
+        """The consumed-file table, and the indexes over it."""
+        return ConsumedFiles(self.consumed_files_table)
+
     def _schema_qualified(self) -> str:
         if self._catalog_sql is None:
             return self._schema_sql
@@ -377,6 +398,7 @@ class _StateStoreBase:
                     rows_late BIGINT,
                     rows_undated BIGINT
                 )""",
+            self.consumed_files.ddl(),
         ]
 
     def ensure(self, con) -> None:
@@ -710,6 +732,63 @@ class _StateStoreBase:
         finally:
             self._open_batches.clear()
 
+    def adopt_consumed(
+        self,
+        con,
+        model_name: str,
+        entries: Any,
+        offset: Any,
+        position: "Position | None" = None,
+    ) -> int:
+        """Move a consumed set out of the offset and into the table. One-time.
+
+        This is the migration for a catalog written before
+        :mod:`duckstream.consumed` existed. Its offset carries the whole map,
+        so the rows are inserted and a v2 checkpoint is appended **in one
+        transaction**: either the model's position is entirely in the table or
+        it is entirely still in the offset, and a crash halfway leaves the old
+        shape working exactly as it did.
+
+        Deliberately automatic rather than an operator step. The alternative
+        that suggests itself -- refuse, and make somebody run a command -- reads
+        as the more careful option and is not: the obvious manual fix for a
+        refused offset is to delete it, which replays the landing tree and folds
+        every row a second time. Nothing about the data changes here; only where
+        the same set is written down.
+
+        ``position`` carries the model's retry state forward onto the row this
+        appends. Without it a migration would append a clean row over a failing
+        model and hand a stuck deployment a fresh attempt budget on upgrade --
+        a *representation* change quietly resetting a *failure* decision, which
+        is the kind of coupling this codebase exists to refuse.
+
+        Returns the number of rows adopted.
+        """
+        index = self.consumed_files.index_for(con, model_name)
+        owns_transaction = self._begin_if_possible(con)
+        try:
+            adopted = index.append(self._resolve_batch_id(con, model_name), entries)
+            now = _utcnow()
+            batch_id = self._resolve_batch_id(con, model_name)
+            self._append_offset(
+                con,
+                model_name,
+                offset,
+                batch_id,
+                now,
+                attempt=0 if position is None else position.attempt,
+                failed_at=None if position is None else position.failed_at,
+                error=None if position is None else position.error,
+            )
+            if owns_transaction:
+                con.execute("COMMIT")
+            self._last_batch_id[model_name] = batch_id
+        except BaseException:
+            if owns_transaction:
+                self._rollback_quietly(con)
+            raise
+        return adopted
+
     # -- failure and quarantine -------------------------------------------
 
     def record_failure(
@@ -779,16 +858,26 @@ class _StateStoreBase:
         attempts: int = 0,
         error: Any = None,
         now: datetime | None = None,
+        consumed: Any = None,
     ) -> None:
         """Give up on a batch: skip past it, and record that it was skipped.
 
-        Two appends in **one** transaction, so the offset can never advance
-        without the record of why. The offset row carries ``skipped_to`` -- the
-        position beyond the data that could not be processed -- with the attempt
-        counters cleared, so the next trigger reads new data. The quarantine row
-        carries everything needed to understand and re-drive the loss by hand:
-        the offsets either side of the gap, the source's own description of the
+        Appends in **one** transaction, so the offset can never advance without
+        the record of why. The offset row carries ``skipped_to`` -- the position
+        beyond the data that could not be processed -- with the attempt counters
+        cleared, so the next trigger reads new data. The quarantine row carries
+        everything needed to understand and re-drive the loss by hand: the
+        offsets either side of the gap, the source's own description of the
         batch, how many rows it held, how many attempts it took and the error.
+
+        ``consumed`` is the model's consumed-file index, and passing it is what
+        makes "skip past it" true for a source that keeps its set as rows. The
+        offset alone used to carry the skipped files, so advancing it *was* the
+        skip; now the offset is a count and the files are rows, and a quarantine
+        that appended one without the other would record a permanent "data was
+        lost" row and then re-plan the same batch on the next trigger, for ever
+        -- the worst of both policies, and the exact hole a phase-2b mutation
+        already found once from the other direction.
 
         This is the one place duckstream advances past data it did not process.
         It exists because a stream blocked on one malformed file does not
@@ -817,6 +906,10 @@ class _StateStoreBase:
                     stamp,
                 ],
             )
+            if consumed is not None:
+                consumed.record(
+                    batch_id, payload, start=position.offset, end=skipped_to
+                )
             self._append_offset(con, model_name, skipped_to, batch_id, stamp)
             if owns:
                 con.execute("COMMIT")
@@ -1017,10 +1110,25 @@ class _StateStoreBase:
         maintenance is expected to schedule it alongside
         ``ducklake_expire_snapshots``; nothing calls it automatically yet.
 
-        **The quarantine table is never pruned.** It is not per-trigger state
-        that grows with time; it is the record that data was lost, one row per
-        incident, and discarding it would leave a mart quietly short of rows
-        with nothing to say why.
+        **Two tables are never pruned, for two different reasons.**
+
+        ``quarantine`` is not per-trigger state that grows with time; it is the
+        record that data was lost, one row per incident, and discarding it would
+        leave a mart quietly short of rows with nothing to say why.
+
+        ``consumed_files`` is worse than that: those rows **are** the position.
+        Every other table here keeps a *history* of positions and only the
+        newest row is read, which is what makes dropping the rest safe. Delete a
+        consumed-file row and duckstream stops knowing it read that file, reads
+        it again, and folds its rows into the mart a second time — the
+        ``CONTEXT.md`` section 4 bug class, caused by the maintenance meant to
+        prevent bloat. It grows with the number of files ever consumed, and the
+        lever for that is **retention at the source** — fewer files, landed and
+        cleared — not pruning here. If a retention story ever does allow it, the
+        rule is that a row may only go when its file can no longer be planned,
+        which the source has to assert; it can never be inferred from age, and
+        it can never be inferred from the file being absent (``CONTEXT.md`` 1.15:
+        a network mount that blinks makes every file look deleted).
 
         Pruning is the one place in this module that deletes, and a matching
         DuckLake ``DELETE`` costs ~26 ms (``CONTEXT.md`` 1.10) — which is fine

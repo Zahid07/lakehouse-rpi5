@@ -27,6 +27,7 @@ same defect wearing a different hat.
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 
@@ -140,11 +141,20 @@ def test_the_offset_and_the_quarantine_record_land_in_one_snapshot(
 ):
     """Skipping data and recording that you skipped it cannot come apart.
 
-    If they could, a crash between them would leave a catalog whose offset has
+    If they could, a crash between them would leave a catalog whose position has
     moved past data with nothing to say why -- silent loss, which is the exact
     failure this framework exists to make impossible. They are one transaction,
     so ``CONTEXT.md`` 1.4 makes them one snapshot, and that is checkable by
     reading both sides at the same version.
+
+    "Moved past" is read from ``duckstream.consumed_files``, not from the
+    offset. Since ``CONTEXT.md`` 1.15 the offset carries a count and the rows
+    carry the identity, and it is the *rows* that stop the next trigger
+    re-planning the bad batch -- so a quarantine that appended its record and
+    its count but not its row would pass an offset-only assertion while
+    retrying the same file for ever. That is the same hole a phase-2b mutation
+    found from the other direction, which is why it is asserted from the side
+    that decides behaviour rather than the side that reports it.
     """
     parity = make_parity(CORRUPTIBLE, name="atomic")
     parity.land("a1", good(1))
@@ -173,13 +183,31 @@ def test_the_offset_and_the_quarantine_record_land_in_one_snapshot(
                     f"AT (VERSION => {version}) WHERE model_name = 'counts' "
                     "ORDER BY batch_id DESC LIMIT 1"
                 ).fetchone()
+                skipped = [
+                    row[0]
+                    for row in con.execute(
+                        "SELECT relpath FROM duckstream.consumed_files "
+                        f"AT (VERSION => {version}) WHERE model_name = 'counts'"
+                    ).fetchall()
+                ]
             except Exception:
                 continue
             if rows:
                 seen += 1
-                assert offsets and offsets[0] and "a2" in offsets[0], (
-                    f"snapshot {version} records a quarantine but its offset has "
-                    f"not moved past the batch, so the two did not commit together"
+                assert any("a2" in rel for rel in skipped), (
+                    f"snapshot {version} records a quarantine but the batch it "
+                    f"skipped is not recorded as consumed, so the next trigger "
+                    f"will plan it again: {sorted(skipped)}"
+                )
+                assert offsets and offsets[0], (
+                    f"snapshot {version} records a quarantine but committed no "
+                    f"offset alongside it"
+                )
+                assert json.loads(offsets[0])["entries"] == len(skipped), (
+                    f"snapshot {version}: the offset counts "
+                    f"{json.loads(offsets[0])['entries']} consumed record(s) "
+                    f"against {len(skipped)} row(s) -- the quarantine advanced "
+                    f"one without the other"
                 )
         assert seen, "no snapshot carried the quarantine record"
 

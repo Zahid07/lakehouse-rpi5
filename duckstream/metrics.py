@@ -29,6 +29,7 @@ another process -- which is exactly what makes DuckLake the right substrate
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -99,11 +100,27 @@ class ModelStatus:
     """How large the committed offset is, encoded.
 
     Reported because it is written **in full on every trigger**, so it is a
-    write-amplification figure rather than a storage one. `CONTEXT.md` 1.15
-    measured the file source's offset at 45.7 MB after a year at one file a
-    minute, which is ~65 GB a day of re-serialising the same file names -- the
-    largest single obstacle to running duckstream unattended on a Pi, and
-    invisible until somebody thought to look. Now it is not invisible.
+    write-amplification figure rather than a storage one. `CONTEXT.md` 1.15 and
+    1.16 measured the file source's old offset at 45.7 MB encoded after a year
+    at one file a minute — 7.97 MB of parquet on the disk each trigger, ~11.2 GB
+    a day of re-recording the same file names. That was the largest single
+    obstacle to running duckstream unattended on a Pi, and it was invisible
+    until somebody thought to look.
+
+    It is kept now that :mod:`duckstream.consumed` has taken the set out of the
+    offset, and kept for two reasons rather than out of sentiment: it is how a
+    catalog that has not migrated yet still announces itself, and it is the
+    check that a future source does not quietly put a growing structure back.
+    """
+
+    consumed_files: int | None = None
+    """How many files this model has consumed, or ``None`` if it cannot say.
+
+    Counted from ``duckstream.consumed_files`` rather than from
+    :attr:`offset_bytes`, which is the point of the change that moved it there:
+    the number an operator wants is *how much has been read*, and it used to be
+    inseparable from *how much is rewritten every trigger*. Now the first is a
+    row count and the second is a constant.
     """
 
     # -- verdicts ---------------------------------------------------------
@@ -245,12 +262,69 @@ def status_for(
     status.quarantined_rows = quarantine["rows_in"]
     status.last_quarantine = quarantine["last"]
 
+    index = _consumed_index(con, store, model, position)
+    if index is not None:
+        try:
+            status.consumed_files = index.count()
+        except Exception:
+            # Same rule as the backlog below: one unavailable number costs the
+            # caller that number, never the whole status.
+            status.consumed_files = None
+
     if include_backlog:
-        status.backlog = _backlog(model, position)
+        status.backlog = _backlog(model, position, index)
     return status
 
 
-def _backlog(model: Any, position: Position) -> int | None:
+def _consumed_index(con: Any, store: Any, model: Any, position: Position) -> Any:
+    """This model's consumed-file index, or ``None`` if it must not be used.
+
+    Mirrors the engine's own opt-in test rather than assuming a file source: a
+    source declaring ``consumed`` on ``plan`` is one whose set lives in the
+    table, and any other source is left exactly as it was.
+
+    **And one more condition, which is the whole reason this is a function.**
+    A model whose stored position has not been migrated yet still keeps its
+    consumed set inside its offset, and its table is empty. Only a *run*
+    migrates, and ``status`` deliberately never runs one — so asking the empty
+    table would answer "this model has read nothing" and report the entire
+    landing tree as backlog. On the deployment ``CONTEXT.md`` 1.15 is written
+    about that is a backlog of 525,600 files reported to the operator checking
+    whether the upgrade went well, which reads exactly like the upgrade having
+    lost the position, and it goes out over ``--json`` to whatever is
+    thresholding on it.
+
+    So a model awaiting migration gets ``None`` here, and both callers then use
+    the shape its position is actually in. Asked of the source rather than
+    decided here, because which offsets are old is the source's business.
+    """
+    files = getattr(store, "consumed_files", None)
+    if files is None:
+        return None
+    source = getattr(model, "source", None)
+    plan = getattr(source, "plan", None)
+    if plan is None:
+        return None
+    try:
+        signature = inspect.signature(plan)
+    except (TypeError, ValueError):  # pragma: no cover - builtins only
+        return None
+    if "consumed" not in signature.parameters:
+        return None
+    migrate = getattr(source, "migrate_offset", None)
+    if callable(migrate):
+        try:
+            if migrate(position.offset) is not None:
+                return None
+        except Exception:
+            return None
+    try:
+        return files.index_for(con, model.name)
+    except Exception:  # pragma: no cover - constructing it touches nothing
+        return None
+
+
+def _backlog(model: Any, position: Position, index: Any = None) -> int | None:
     """How many source units are waiting, or ``None`` if the source cannot say.
 
     Optional by design: only a source can know, and asking is I/O against
@@ -276,7 +350,11 @@ def _backlog(model: Any, position: Position) -> int | None:
             return None
     try:
         end = source.latest_offset()
-        plan = source.plan(position.offset, end, BatchLimits())
+        plan = (
+            source.plan(position.offset, end, BatchLimits())
+            if index is None
+            else source.plan(position.offset, end, BatchLimits(), consumed=index)
+        )
     except Exception:
         return None
     if getattr(plan, "is_empty", False):

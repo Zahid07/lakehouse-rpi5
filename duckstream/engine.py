@@ -350,6 +350,16 @@ class RunReport:
 
     results: tuple[BatchResult, ...] = ()
 
+    adopted: tuple[tuple[str, int], ...] = ()
+    """Models whose consumed-file set this run moved out of the offset.
+
+    ``(model_name, records)`` per model, and empty on every run after the one
+    that migrates. It is reported rather than logged because the package writes
+    no logs — the CLI is the reporting surface — and it is reported at all
+    because relocating a year of file names is a thing an operator should see
+    happen once, not discover from a graph.
+    """
+
     @property
     def batches(self) -> tuple[BatchResult, ...]:
         """Only the passes that committed something."""
@@ -523,6 +533,9 @@ class Engine:
         self._next_ids: dict[str, int] = {}
         self._policies: dict[str, WatermarkPolicy | None] = {}
         self._watermarks: dict[str, datetime | None] = {}
+        # Consumed-file sets relocated out of an offset by this run. Reset per
+        # run rather than accumulated, so a second run reports nothing.
+        self._adopted: list[tuple[str, int]] = []
 
         attach_lake(
             con,
@@ -683,10 +696,11 @@ class Engine:
 
         with self.lock:
             self._prepare()
+            self._adopted = []
             results: list[BatchResult] = []
             for target in selected:
                 results.extend(self._drain(target, trigger))
-        report = RunReport(tuple(results))
+        report = RunReport(tuple(results), tuple(self._adopted))
 
         # Every model got its turn before this fires. A failure that raised
         # where it happened would stop the models after it from running at all,
@@ -873,7 +887,7 @@ class Engine:
 
     def _run_batch(self, model: Model) -> BatchResult:
         """One pass of the lifecycle. See the module docstring for the order."""
-        position = self._position(model)
+        position = self._migrate_position(model, self._position(model))
         start = position.offset
 
         if position.failing:
@@ -891,9 +905,14 @@ class Engine:
                 )
 
         source = model.source
+        index = self._consumed_index(model)
         with self._model_context(model):
             end = source.latest_offset()
-            plan = source.plan(start, end, model.limits)
+            plan = (
+                source.plan(start, end, model.limits)
+                if index is None
+                else source.plan(start, end, model.limits, consumed=index)
+            )
 
         if plan.is_empty:
             # No transaction, no checkpoint, no snapshot. CONTEXT.md 1.8.
@@ -907,17 +926,21 @@ class Engine:
             )
 
         try:
-            return self._attempt_batch(model, plan, position)
+            return self._attempt_batch(model, plan, position, index)
         except Exception as exc:
             # The batch's own transaction is already rolled back -- the inner
             # handler in _attempt_batch does that, and it is what makes the
             # failure safe. What is left is to record the attempt, decide
             # whether this batch has had enough of them, and hand back a result
             # rather than an exception, so the models after this one still run.
-            return self._handle_failure(model, plan, position, exc)
+            return self._handle_failure(model, plan, position, exc, index)
 
     def _attempt_batch(
-        self, model: Model, plan: BatchPlan, position: Position
+        self,
+        model: Model,
+        plan: BatchPlan,
+        position: Position,
+        index: Any = None,
     ) -> BatchResult:
         """The batch lifecycle proper, for a plan already known to be non-empty."""
         source = model.source
@@ -925,6 +948,9 @@ class Engine:
         start = position.offset
 
         batch_id = self._batch_id(model.name)
+        # None until the consumed-file rows are written, and checked before the
+        # commit. See the check below for why it starts here rather than there.
+        recorded: int | None = None
         ctx = BatchContext(model_name=model.name, batch_id=batch_id, plan=plan)
         self.faults.fire(
             "after_plan",
@@ -954,6 +980,20 @@ class Engine:
             try:
                 with self._model_context(model):
                     rows_out = sink.write(self.con, written, model, ctx)
+                    # Inside the transaction, and that is the whole point: the
+                    # rows saying "these files were read" and the output that
+                    # read them become durable in one DuckLake snapshot, or
+                    # neither does. Written here rather than at commit so a
+                    # fault injected at `after_sink_write` finds them already
+                    # staged and proves the rollback covers them too.
+                    if index is not None:
+                        recorded = index.record(
+                            ctx.batch_id,
+                            plan.payload,
+                            start=plan.start,
+                            end=plan.end,
+                        )
+                self._require_recorded(model, batch_id, index, recorded)
                 self.faults.fire(
                     "after_sink_write",
                     FaultEvent(
@@ -1034,6 +1074,110 @@ class Engine:
             return self.state.load_position(self.con, model.name)
 
     @staticmethod
+    def _require_recorded(
+        model: Model, batch_id: int, index: Any, recorded: int | None
+    ) -> None:
+        """Refuse to commit a batch that never recorded what it consumed.
+
+        Deliberately a separate call rather than an ``else`` on the branch that
+        does the recording, and a named method rather than an inline ``if``, for
+        the same reason in both cases: so that losing the recording does not
+        also lose the check, and so the check has somewhere a test can reach it.
+
+        The failure it prevents is not a stall, it is a loop. A batch that
+        commits without its rows reads the same files on the next trigger and
+        folds them into the mart again, for ever — and the drain loop's own
+        stalled-loop guard cannot see it, because that guard watches the
+        checkpoint and the checkpoint still moves. The mutation audit found
+        this by hanging rather than by failing, which is the one outcome a
+        suite cannot report.
+        """
+        if index is None or recorded is not None:
+            return
+        raise DuckstreamError(
+            f"model {model.name!r}: batch {batch_id} was about to commit "
+            f"without recording which files it consumed. Committing would "
+            f"re-read them on the next trigger, and on every trigger after "
+            f"that, folding them into the sink each time — and nothing "
+            f"downstream would notice, because the checkpoint advances either "
+            f"way. This is a bug in duckstream, not in the model."
+        )
+
+    def _consumed_index(self, model: Model) -> Any:
+        """The consumed-file index this model's source planned against, if any.
+
+        Keyed off the source's own ``plan`` signature rather than off its type,
+        which is the same signature-driven injection the config loader uses to
+        hand a component ``base_dir``: a source opts in by declaring the
+        parameter, and one that does not declare it is called exactly as it was
+        before and never learns this exists.
+
+        Building it is free -- it is a name and a connection, no query -- so it
+        happens per batch rather than being cached against a connection that
+        could be swapped underneath it.
+        """
+        if not self._takes_consumed(model.source):
+            return None
+        files = getattr(self.state, "consumed_files", None)
+        if files is None:
+            raise DuckstreamError(
+                f"model {model.name!r}: source "
+                f"{type(model.source).__name__!r} keeps its consumed-file set "
+                f"as rows, but state store {type(self.state).__name__!r} does "
+                f"not provide a `consumed_files` table to keep them in. The set "
+                f"has to live in the same catalog as the sink (CONTEXT.md 1.9) "
+                f"or the offset cannot commit with the rows it check points."
+            )
+        return files.index_for(self.con, model.name)
+
+    @staticmethod
+    def _takes_consumed(source: Any) -> bool:
+        import inspect
+
+        plan = getattr(source, "plan", None)
+        if plan is None:
+            return False
+        try:
+            signature = inspect.signature(plan)
+        except (TypeError, ValueError):  # pragma: no cover - builtins only
+            return False
+        parameter = signature.parameters.get("consumed")
+        if parameter is not None:
+            return parameter.kind is not parameter.POSITIONAL_ONLY
+        return any(
+            p.kind is p.VAR_KEYWORD for p in signature.parameters.values()
+        )
+
+    def _migrate_position(self, model: Model, position: Position) -> Position:
+        """Relocate a consumed set that is still inside the stored offset.
+
+        Runs on the trigger path rather than at prepare time, because the
+        position is already in hand here and reading it again would cost ~10 ms
+        every tick (``CONTEXT.md`` 1.11) to answer a question that is 'no' for
+        the entire life of a deployment after the first run. The check itself is
+        a version comparison on a dict already in memory.
+
+        Costs one extra snapshot, once, on the run that migrates.
+        """
+        index = self._consumed_index(model)
+        if index is None:
+            return position
+        migrate = getattr(model.source, "migrate_offset", None)
+        if not callable(migrate):
+            return position
+        with self._model_context(model):
+            outcome = migrate(position.offset)
+        if outcome is None:
+            return position
+        new_offset, entries = outcome
+        with self._model_context(model):
+            adopted = self.state.adopt_consumed(
+                self.con, model.name, entries, new_offset, position
+            )
+        self._adopted.append((model.name, adopted))
+        return replace(position, offset=new_offset)
+
+    @staticmethod
     def _backoff_remaining(position: Position) -> "timedelta | None":
         """How much longer this model must wait, or ``None`` if it may run now.
 
@@ -1051,7 +1195,12 @@ class Engine:
         return ready - now if ready > now else None
 
     def _handle_failure(
-        self, model: Model, plan: BatchPlan, position: Position, exc: Exception
+        self,
+        model: Model,
+        plan: BatchPlan,
+        position: Position,
+        exc: Exception,
+        index: Any = None,
     ) -> BatchResult:
         """Record a failed attempt, and decide whether this batch gets another.
 
@@ -1101,6 +1250,7 @@ class Engine:
                     payload=plan.payload,
                     attempts=attempt,
                     error=exc,
+                    consumed=index,
                 )
                 outcome, end_offset = "quarantined", plan.end
             elif exhausted and at_ceiling:

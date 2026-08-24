@@ -6,7 +6,7 @@ that parallel work does not collide and interfaces do not drift.
 
 The manager (main session) owns this file. Subagents read it and never edit it.
 
-## Where the build stands (2026-08-23)
+## Where the build stands (2026-08-24)
 
 **Phase 1 is committed** at `693e691` on `feat/duckstream`. **Phase 2 — event
 time — is complete**: watermarks, tumbling windows, sealing past the lateness
@@ -20,6 +20,12 @@ new modules.
 **Phase 2b — operability and failure handling — is also complete.** It was not
 in `PLAN.md` when phases 1 and 2 were built; it was added after, because the gap
 it closes was a gap in the plan rather than in the code. See "Phase 2b" below.
+
+**Phase 3 is half done** — tier two executes and `udf.py` ships; tier three does
+not. **Phase 4's first item is complete**: the consumed-file set is rows, not a
+JSON cell. See "Phase 4, item 1" at the end of this file, and `CONTEXT.md` 1.16
+for the measurement that decided it — including two corrections to 1.15's own
+arithmetic.
 
 One shipped phase-1 behaviour was **deliberately reversed** in phase 2 —
 `mode="append"` together with a `grain` — and the reasoning is recorded under
@@ -607,3 +613,112 @@ without a benefit the user can see. Recorded so the option is not re-researched.
   one-snapshot-per-trigger assertion, `ducklake_list_files` non-empty assertion
 
 Phases 2–6 follow only after this passes.
+---
+
+## Phase 4, item 1 — the consumed-file set as rows
+
+`PLAN.md` phase 4 says the first item is not compaction, it is the file source's
+consumed-file map, and `CONTEXT.md` 1.15 is why. Built as one work unit, for the
+same reason phase 2 was: the offset shape, the source's planning and the
+engine's transaction boundary are one decision wearing three hats.
+
+| File | Status |
+|---|---|
+| `duckstream/consumed.py` | **new** — the table, the two index shapes, the anti-join |
+| `duckstream/offsets.py` | a v2 offset shape; `consumed()` now *refuses* a v2 offset |
+| `duckstream/sources/files.py` | `plan(..., consumed=)`, `migrate_offset` |
+| `duckstream/engine.py` | injects the index, records inside the transaction, migrates |
+| `duckstream/state.py` | the table's DDL, `adopt_consumed`, quarantine records the skip, `prune` excludes it |
+| `duckstream/metrics.py` | `consumed_files` on `ModelStatus` |
+| `tests/unit/test_consumed.py` | **new** |
+| `tests/unit/test_file_source.py` | the consumed-set contract now runs against **both** shapes |
+| `tests/conformance/harness.py` | the snapshot walk reads the rows, not the offset |
+
+### Resolved, phase 4 — ratified
+
+**The set is rows; the offset is a count.** `CONTEXT.md` 1.16. Measured: 7.97 MB
+written per trigger becomes 4.9 KB, and a commit of 1,078 ms becomes 13.8 ms, at
+525,600 consumed files. Both flat in the number of files consumed, which is the
+property 1.12 says to look for.
+
+**A v2 offset is not an empty v1 offset.** `FileOffset.consumed()` raises rather
+than returning `{}`. Returning an empty map would read as "this model has
+consumed nothing" and replay the entire landing tree, folding every row into the
+mart a second time — the section 4 bug class, delivered by an upgrade. This is
+the single most important line in the change.
+
+**The count in the offset is a report, never the authority.** It exists so the
+drain loop's stalled-loop guard has something that moves and so `status` can say
+how far along a model is without an aggregate. It is carried forward from the
+previous checkpoint rather than read back (1.10, 1.11). Two things keep it
+honest: `TableIndex._verify` refuses a checkpoint whose count does not match the
+rows written in the same transaction, and a conformance test asserts the two
+agree at **every snapshot in catalog history**, not just at the end.
+
+**Both are written in one transaction, and that is what "skip past it" means
+now.** Quarantine used to advance past a bad batch by advancing the offset,
+because the offset *was* the set. It is not any more, so `state.quarantine` takes
+the index and records the skip alongside the record of it. Without that a
+quarantine writes a permanent "data was lost" row and then re-plans the same
+batch for ever — the worst of both policies, and the same hole a phase-2b
+mutation found from the other direction.
+
+**`plan()` gains a keyword, and the engine injects it from the signature.**
+`Source.plan` is a frozen interface, so the addition is opt-in in the strict
+sense: `Engine._takes_consumed` inspects the source's own `plan` signature and
+passes `consumed=` only to a source that declares it. This is the mechanism the
+config loader already uses to hand a component `base_dir`, ratified in phase 1
+for the same reason — a component opts in by declaring a parameter. A
+third-party source is called exactly as it was before.
+
+The hazard that comes with it is a source that *wraps* a file source and forgets
+to forward the parameter. That source plans against a v2 checkpoint with no set
+inside it, and the answer is the refusal above: loud, not silent. Pinned by a
+test.
+
+**Nothing prunes `consumed_files`.** `prune` bounds every other state table by
+keeping the newest row per model, which is safe because those tables hold a
+*history* of positions and only the newest is read. These rows **are** the
+position. Deleting one makes duckstream read that file again. The lever for
+their growth is retention at the source — fewer files — and it is still open.
+
+**`relpath_fold` is written on every platform; only the join column is chosen at
+read time.** Folding at write time only where it is read would make a
+Linux-written catalog re-read every uppercase path the first time it is opened
+on Windows. Folding at read time in SQL would put DuckDB's `lower` against
+Python's `casefold`, which disagree on non-ASCII — and a disagreement there is a
+file read twice or skipped, silently.
+
+**The probe is narrowed to the scan's own mtime span, and that is a deduction
+rather than a heuristic.** The join matches `mtime_ns` by equality, so no row
+outside that span can match. Worth 3x on planning and it lets DuckLake prune on
+statistics. It carries a trap for tests, recorded in 1.16: with a **one-file**
+scan `BETWEEN t AND t` is exactly `= t`, so the window silently stands in for
+the equality and a single-file test does not test identity at all.
+
+**Migration is automatic, not an operator step.** A v1 offset is relocated into
+rows on the first run, in one transaction, carrying the model's retry state with
+it. Refusing and asking somebody to run a command reads as the more careful
+option and is not: the obvious manual fix for a refused offset is to delete it,
+which replays everything.
+
+### Notes the next phase must not rediscover
+
+1. **The audit runs in throwaway worktrees now, not in the working tree.** That
+   turns "never commit while an audit is running" from a rule somebody has to
+   remember — one that has already been broken here once, pushing a mutated
+   `engine.py` — into something that cannot happen. There is nothing to restore
+   and no integrity check to forget.
+2. **Report the audit in three categories, not two.** *red*, *survived*, and
+   *not auditable on this platform*. Two mutations here are inert on Windows
+   because the code they change is already the Windows branch; calling those
+   survivors invents a hole and calling them red invents coverage.
+3. **A one-file scan cannot test file identity.** See above. This cost a real
+   survivor.
+4. **Stream audit results as they complete, not in submission order.** The first
+   run appeared stalled at 10 of 22 for twenty minutes; ten results were sitting
+   finished behind one mutation that had put the engine into an infinite loop.
+5. **The checkpoint moving is no longer proof that progress was made.** It used
+   to be: the offset contained the consumed set, so a changed offset meant new
+   files. It is now a counter the source computes optimistically, so the engine
+   verifies it against the rows actually written rather than trusting it.
