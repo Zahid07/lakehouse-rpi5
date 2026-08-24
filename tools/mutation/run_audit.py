@@ -19,12 +19,17 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 PYTHON = REPO / ".venv" / "Scripts" / "python.exe"
-WORKTREES = HERE / "_wt"
+# Outside the repository, deliberately. A worktree under `tools/` shows up in
+# `git status` as untracked, which is the same "something the audit left in your
+# checkout" hazard this design exists to remove -- one `git add -A` away from
+# committing a tree full of mutated copies of the package.
+WORKTREES = pathlib.Path(tempfile.gettempdir()) / "duckstream-mutation-worktrees"
 WORKERS = 4
 
 sys.path.insert(0, str(HERE))

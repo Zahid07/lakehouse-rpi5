@@ -44,3 +44,7 @@ config/*.local.env
 *.egg-info/
 build/
 dist/
+
+# The mutation audit writes its results here; the worktrees it uses live in
+# the system temp directory, not in the repository. See tools/mutation/README.md.
+tools/mutation/audit_results.json
