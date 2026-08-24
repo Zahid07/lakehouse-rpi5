@@ -710,7 +710,7 @@ which replays everything.
    `engine.py` — into something that cannot happen. There is nothing to restore
    and no integrity check to forget.
 2. **Report the audit in three categories, not two.** *red*, *survived*, and
-   *not auditable on this platform*. Two mutations here are inert on Windows
+   *not auditable on this platform*. One mutation here is inert on Windows
    because the code they change is already the Windows branch; calling those
    survivors invents a hole and calling them red invents coverage.
 3. **A one-file scan cannot test file identity.** See above. This cost a real
