@@ -292,7 +292,9 @@ From constraint 1: bound rows, not UDF cost.
    **Where a tier-three recompute reads from is settled by measurement, not
    preference.** It re-derives a whole window from source, and those rows are in
    files consumed long ago — still on disk and still identifiable, because the
-   offset keeps a consumed-file *map* rather than a high-water mark. But
+   position keeps a consumed-file *set* rather than a high-water mark — rows in
+   `duckstream.consumed_files` since phase 4, which is where the time-range index
+   below now belongs. But
    constraint 13 measured that handing DuckDB the whole list with a time
    predicate costs **~0.1 ms per file listed whether it is read or not**: the
    footer still has to be opened to decide. At one file per trigger on a
