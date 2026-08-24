@@ -558,13 +558,20 @@ later costs **~0.1 ms per file listed whether or not it is skipped** — statist
 pruning skips data pages, never the file open. Prefer minutes to seconds, and
 size `max_rows_per_trigger` so a batch fills a file worth writing.
 
-**Watch the offset.** The file source's committed offset carries every file it
-has ever consumed, and it is rewritten **in full on every trigger**. Measured:
-45.7 MB after a year at one file a minute, which is ~65 GB of writes a day for
-nothing but re-recording file names. `duckstream status` reports its size and
-says so once it passes 1 MB. Until this is fixed properly, keep the landing tree
-pruned — a directory that is drained and cleaned bounds the offset to the
-retention window.
+**The offset no longer grows, but the file count still does.** The file source
+used to carry every file it had ever consumed inside its offset, rewritten in
+full on every trigger — 7.97 MB of writes per trigger after a year at one file a
+minute, ~11.2 GB a day, for nothing but re-recording file names. Those files are
+now rows in `duckstream.consumed_files`, and a trigger writes **4.9 KB**
+regardless of how much has been read. `duckstream status` reports
+`consumed_files` and still warns if an offset ever passes 1 MB, which after this
+change should mean a source that has reintroduced the problem.
+
+What is *not* fixed is the number of files. `latest_offset()` still walks the
+whole landing tree every trigger, and reading a window out of many small files
+costs ~0.1 ms per file listed. Keep the landing tree drained: retention at the
+source is the lever, and it is now a speed problem rather than one that wears
+the card out.
 
 **Set `memory_limit` and `threads` yourself.** DuckDB defaults to most of the
 machine, which on a 4 GB Pi sharing space with everything else is not what you
@@ -619,13 +626,18 @@ And the small honest ones:
   means its last window seals only when a later-timestamped row arrives from
   anywhere in the same model.
 - **State grows by two rows per committed trigger** — the offset and the batch
-  record — plus a third, the watermark, for a model with a lateness horizon.
-  Nothing reclaims it automatically. That is deliberate: append-only state
-  measured about 4x faster than mutating one row per model, because a matching
-  DuckLake `DELETE` writes a tombstone file and costs ~26 ms, and it is strictly
-  safer under a crash, since an uncommitted append is simply invisible.
-  `DuckLakeStateStore.prune()` bounds the growth; schedule it with your other
-  maintenance.
+  record — plus a third, the watermark, for a model with a lateness horizon, and
+  one row per file consumed in `duckstream.consumed_files`. Nothing reclaims it
+  automatically. That is deliberate: append-only state measured about 4x faster
+  than mutating one row per model, because a matching DuckLake `DELETE` writes a
+  tombstone file and costs ~26 ms, and it is strictly safer under a crash, since
+  an uncommitted append is simply invisible. `DuckLakeStateStore.prune()` bounds
+  the growth; schedule it with your other maintenance.
+- **`prune()` will not touch `consumed_files`, and neither should you.** Every
+  other state table keeps a *history* of positions and only its newest row is
+  read, which is what makes dropping the rest safe. Those rows **are** the
+  position: delete one and duckstream forgets it read that file, reads it again,
+  and folds its rows into the mart a second time. A year of them is 8.8 MB.
 - **A halted model retries on every tick.** Cheaply, and writing nothing after
   the first verdict — so fixing the underlying problem is all it takes to
   recover — but it does re-read and re-plan its batch each time.

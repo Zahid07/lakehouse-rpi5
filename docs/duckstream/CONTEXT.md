@@ -18,7 +18,10 @@ noted to approximate a Raspberry Pi 5.
 
 These are the load-bearing numbers. **If one conflicts with your intuition, trust
 the number or re-measure it — do not reason around it.** §1.8, §1.9 and §1.10
-were measured during the phase-1 build; §1.11 during phase 2.
+were measured during the phase-1 build; §1.11 during phase 2; §1.16 during phase
+4, where it corrected two figures in §1.15 that had been *derived* rather than
+measured. "Trust the number" means the measured one — a number computed from
+another number is an argument, and §1.16 is what happens when one is checked.
 
 ### 1.1 The memory ceiling is DuckDB's buffer manager, not Python
 
@@ -577,6 +580,87 @@ time. But the source learns which files exist by scanning the tree, so a network
 mount that blinks returns an empty scan, every entry looks deleted, and the next
 successful scan re-reads the entire landing directory. The failure is silent,
 total, and arrives on the day the NAS reboots.
+
+> **Two of the numbers above are wrong, and 1.16 has the measured ones.** The
+> "~65 GB a day" was the encoded JSON size multiplied by the cadence, not bytes
+> measured on the disk; the offset is a `VARCHAR` in a DuckLake table and reaches
+> the disk as parquet. Measured: **7.97 MB per trigger, ~11.2 GB a day.** The
+> zlib figure is off in the same direction. Everything else here stands, and the
+> conclusion stands more firmly than when it was written — see 1.16.
+
+### 1.16 The consumed-file set as rows: 1,665x fewer bytes, and 1.15 re-measured
+
+**Method.** Built the file source's offset at 1,000 / 10,000 / 100,000 / 525,600
+files — the last being one file a minute for a year, as in 1.15 — and ran 20
+triggers of each shape against a real DuckLake catalog, `threads=2`, median.
+Bytes were counted by measuring the catalog directory before and after, which is
+a volume rather than a timing and so is immune to the drift 1.11 warns about.
+
+| Files | shape | plan | commit | on disk per trigger |
+|---|---|---|---|---|
+| 525,600 | the map inside the offset (1.15's shape) | — | **1,078 ms** | **7.97 MB** |
+| 525,600 | consumed files as rows | 10.7 ms | 14.0 ms | 4.9 KB |
+| 525,600 | rows, probe narrowed to the scan's mtime span | **3.6 ms** | **13.8 ms** | **4.9 KB** |
+
+Both row variants are **flat in the number of files consumed**: planning stays at
+~3.4 ms and the commit at ~14 ms whether 1,000 files have been consumed or
+525,600. That is 1.12's property arriving where 1.15 said it would.
+
+**Two corrections to 1.15. Its conclusion was right and its arithmetic was not.**
+
+*First, ~65 GB a day is ~11 GB a day.* 1.15 measured the encoded offset at
+45.7 MB and multiplied by the cadence. But the offset is a `VARCHAR` in a
+DuckLake table, so what reaches the disk is parquet, and parquet compresses it:
+
+```
+encoded offset JSON       :  45.11 MB
+bytes on disk per trigger :   7.97 MB      (5.66x)
+derived from the JSON     :  63.4 GB/day
+measured on the disk      :  11.2 GB/day
+```
+
+The recorded figure was derived rather than measured, and it was 5.7x too large.
+It did not change the decision — 11.2 GB a day spent re-recording file names it
+already knows still kills an SD card, and it was still the largest single
+obstacle to running unattended on a Pi — but a number this project quotes has to
+be a number this project measured.
+
+*Second, compression was rejected for the right reason and the wrong number.*
+1.15 recorded zlib at 7.4x, taking "65 GB a day to 8.8 GB a day". Re-measured on
+the same data: zlib level 6 gives **9.2x** on the JSON but only **2.38x** on the
+disk — 7.97 MB to 3.36 MB — because parquet had already taken most of what there
+was to take. The honest comparison is therefore 2.38x for **+185 ms a trigger**,
+against the rows fix's 1,665x for **−1,064 ms**. The rejection stands and is now
+much better supported than when it was written.
+
+**The result.**
+
+| | the map in the offset | rows |
+|---|---|---|
+| bytes written per trigger | 7.97 MB | **4.9 KB** (1,665x) |
+| per day at one file a minute | 11.2 GB | **6.8 MB** |
+| commit | 1,078 ms | **13.8 ms** (78x) |
+| planning | 545 ms to decode | **3.6 ms**, flat |
+| the whole year of file names | rewritten every trigger | **8.8 MB, written once** |
+
+That last row is the change in one line: the entire consumed history, stored
+once, is about the size of what the old shape wrote **every single trigger**.
+
+**The probe window is a deduction, not a heuristic.** The anti-join matches
+`mtime_ns` by equality, so no consumed row outside the scan's own mtime span can
+match one, and restricting the probe to that span cannot change the answer. It
+is worth 3x on planning and it lets DuckLake skip data files on their statistics.
+
+It also carries a trap that the mutation audit found and review did not: for a
+**single-file** scan, `BETWEEN t AND t` is exactly `= t`, so the window silently
+stands in for the mtime equality and a one-file test does not test file identity
+at all. Any test of identity must use a scan spanning more than one mtime.
+
+**What this does not fix.** The number of *files* is still unbounded, and
+`latest_offset()` still walks the whole landing tree every trigger, where 1.13's
+~0.1 ms per file listed applies. Retention at the source is the lever and it is
+still phase 4's business — but it is now a cost problem rather than a
+write-endurance one.
 
 ---
 

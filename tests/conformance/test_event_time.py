@@ -748,6 +748,12 @@ def test_the_watermark_lands_in_the_same_snapshot_as_the_offset(make_parity):
                     "ORDER BY batch_id DESC LIMIT 1",
                     [UPDATE_SCENARIO.name],
                 ).fetchone()
+                files = con.execute(
+                    "SELECT count(DISTINCT relpath) "
+                    f"FROM duckstream.consumed_files AT (VERSION => {version}) "
+                    "WHERE model_name = ?",
+                    [UPDATE_SCENARIO.name],
+                ).fetchone()
             except Exception:
                 continue  # snapshots from before the state tables existed
             if offset is None:
@@ -759,7 +765,19 @@ def test_the_watermark_lands_in_the_same_snapshot_as_the_offset(make_parity):
             assert watermark is not None and watermark[0] is not None, (
                 f"snapshot {version} committed an offset without a watermark"
             )
-            consumed = len(json.loads(offset[0])["consumed"])
+            # Three things now have to land in one snapshot rather than two:
+            # the offset, the watermark, and the rows saying which files were
+            # read. The offset carries a *count* of those rows and the table
+            # carries their identity (CONTEXT.md 1.15), and asserting the two
+            # agree at every point in history is what keeps the count honest --
+            # it is documented as a report rather than the authority, and a
+            # report nobody checks is how the two drift apart.
+            consumed = files[0]
+            assert json.loads(offset[0])["entries"] == consumed, (
+                f"snapshot {version}: the offset counts "
+                f"{json.loads(offset[0])['entries']} consumed record(s) but the "
+                f"table holds {consumed} — they did not commit together"
+            )
             expected = replay(
                 parity.batches[:consumed], grain="hour", lateness=HORIZON
             )

@@ -1,22 +1,24 @@
 # duckstream — status and handover
 
 **Start here if you are a new session.** This file says where the work stands, what
-is proven, what is not, and what to do next. It is current as of **2026-08-23**.
+is proven, what is not, and what to do next. It is current as of **2026-08-24**.
 
 Read in this order:
 
 1. **this file** — where things are
-2. `CONTEXT.md` — measured constraints and settled decisions. **Fifteen** measured
+2. `CONTEXT.md` — measured constraints and settled decisions. **Sixteen** measured
    constraints; §1.8, §1.9 and §1.10 were measured during the phase-1 build,
-   §1.11 during phase 2 and §1.12 during the phase-2b cleanup, and none of them
-   is derivable from anything else. §1.10, §1.11 and §1.12 are the *same*
-   constraint met three times in three disguises — read them together
+   §1.11 during phase 2, §1.12 during the phase-2b cleanup and §1.16 during
+   phase 4, and none of them is derivable from anything else. §1.10, §1.11 and
+   §1.12 are the *same* constraint met three times in three disguises — read
+   them together, and read §1.16 as the fourth. **§1.16 also corrects two
+   numbers in §1.15**, which had been derived rather than measured
 3. `PLAN.md` — the specification: what to build, phase by phase
 4. `BUILD_GRAPH.md` — the decision record: frozen interfaces, every ratified
    decision with its reasoning, and the notes each task left for the next
 
-**Phases 1, 2 and 2b are complete. Phase 3 is half done.** Phases 4–6 are not
-started.
+**Phases 1, 2 and 2b are complete. Phase 3 is half done. Phase 4's first item is
+done.** Phases 5–6 are not started.
 
 Phase 3 is foldability. **Tier two executes** — `avg`, `stddev`, `var`,
 population and sample — maintained through sufficient statistics and proved
@@ -24,6 +26,11 @@ against the production bug in `CONTEXT.md` §4. **`udf.py` is written**, so tier
 three has its tooling. **Tier three itself does not execute yet**: a
 `recompute_window` model is still refused, loudly, with a message that says it
 is not built rather than that it cannot be done.
+
+Phase 4's first item — the one `PLAN.md` says outranks compaction — is complete:
+**the file source's consumed set is rows, not a JSON cell.** §1.16 measured
+7.97 MB of writes per trigger becoming 4.9 KB, and a 1,078 ms commit becoming
+13.8 ms, both flat in the number of files consumed.
 
 Phase **2b** was not in `PLAN.md` when phases 1 and 2 were built. It was added
 afterwards, because the gap it closes was a gap in the plan: the framework had a
@@ -34,16 +41,15 @@ what happens when the *data* will not process.
 
 ## Where to start
 
-**There are two candidates and they are a genuine trade. Pick deliberately.**
-
-**A — finish phase 3: tier three (`recompute_window`).** The last of the
-differentiator, and the reason to build this rather than adopt Arroyo. Its
-design is already settled by measurement, so this is implementation rather than
-research:
+**Tier three (`recompute_window`), and it is now the cheaper job it should
+always have been.** Finishing phase 3 is the last of the differentiator and the
+reason to build this rather than adopt Arroyo. Its design is settled by
+measurement, so this is implementation rather than research:
 
 - Re-derive a window from source. The rows are in files consumed long ago —
-  still on disk and still identifiable, because the offset keeps a consumed-file
-  *map* rather than a high-water mark.
+  still on disk and still identifiable, because the position records every file
+  consumed rather than a high-water mark. It is now a **table** you can query,
+  which is the part that changed.
 - **Do not hand DuckDB the whole file list with a time predicate.** §1.13
   measured ~0.1 ms per file listed *whether or not it is skipped*: statistics
   pruning skips data pages, never the file open. 1.7 ms against 217 ms at 2,160
@@ -53,26 +59,20 @@ research:
   Over-selecting reads extra files and is still right; under-selecting is
   silently wrong. Close to free — the watermark scan already reads each batch
   once, so grouping it by `read_parquet`'s `filename` yields per-file bounds.
+- **That index is now two columns on `duckstream.consumed_files`.** Add `min_ts`
+  and `max_ts` beside `relpath`, and file selection becomes
+  `WHERE max_ts >= lo AND min_ts < hi` — a query against a table that already
+  exists, with the same anti-join machinery and the same tests. This is why
+  phase 4's first item was done first: measured, putting that index in the old
+  JSON offset took it from 45.1 MB to 71.2 MB per trigger, **1.58x worse on the
+  project's worst number**, and the alternative was building a separate table
+  that this change would then have had to fold back in.
 - `udf.py` is done and is what tier three's aggregates call.
 - Window-range chunking sized from estimated rows comes with it (§1.1: memory is
   bounded by rows in flight, never by making the UDF faster).
 
-**B — phase 4's first item: the consumed-file map (§1.15).** The largest
-obstacle to running duckstream unattended on a Pi. The offset is rewritten *in
-full* every trigger: **45.7 MB after a year at one file a minute, ~65 GB of
-writes a day.** Two shortcuts are already measured and rejected in §1.15 —
-the reserved high-water mark (silently skips a file with an older mtime) and
-compression (7.4x, and *adds* 185 ms a trigger). The fix is storing consumed
-files as **rows** rather than one JSON cell, which is §1.12's rule in its most
-extreme form.
-
-  This is phase-4-sized: `plan()` and `latest_offset()` are both built around
-  the map, `plan()` takes no connection, and nine test files touch it.
-
-**My reading:** A is the product thesis; B is what decides whether it survives a
-month on real hardware. If the Pi deployment is near, do B first. `status` now
-reports offset size and warns past 1 MB, so the cliff is at least visible either
-way.
+The rest of phase 4 is unchanged and still waiting. Retention at the source
+moved *down* that list rather than off it — see "Known open items".
 
 Everything deferred out of the phase-2b sweep was written **explicitly into the
 phase that owns it** rather than left as a note here: `PLAN.md` phase 4 now names
@@ -84,53 +84,170 @@ two unmeasured numbers, and release discipline.
 
 ```bash
 cd d:\lakehouse-rpi5
-.venv\Scripts\python.exe -m pytest -q                        # 1112 passed, 1 skipped, ~5m
-.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 985, the fast ones, ~65s
+.venv\Scripts\python.exe -m pytest -q                        # 1162 passed, 1 skipped, ~5m
+.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 1035, the fast ones, ~70s
 .venv\Scripts\python.exe -m pytest -q -m conformance         # 127, the expensive ones, ~4m
 .venv\Scripts\duckstream.exe --help                          # the console script is installed
 ```
 
-**Never commit while a mutation audit is running**, and never edit a package
-file while the suite is running. Both rewrite files under you. A commit taken
-mid-audit once pushed a deliberately mutated `engine.py`; only the audit's hash
-check caught it, because the mutation is restored before the next one starts and
-`git status` looks clean by then.
+Never edit a package file while the suite is running. **The mutation audit no
+longer has this problem**: it runs each mutation in a throwaway `git worktree`
+rather than in the working tree, so nothing it does can reach your checkout and
+there is nothing to restore afterwards. That replaces the old rule — "never
+commit while an audit is running" — which had already been broken once here,
+pushing a deliberately mutated `engine.py` that only the audit's own hash check
+caught. A rule nobody can forget beats a rule nobody must forget.
 
 `.venv/` at the repo root, Python 3.14.3, `duckdb==1.5.5` **pinned exactly** —
 constraints §1.5 and §1.7 are version-sensitive and the aggregate classifier reads
 DuckDB's AST format. The package is installed editable (`pip install -e .`), which
 is what makes the console script exist; without it one conformance test skips.
 
-The one expected skip is correct: Windows cannot hold two filenames differing only
-by case, so the POSIX half of a case-sensitivity pair cannot run here.
+The expected skips are correct and there are now **two**, which is one test in
+two parametrisations: Windows cannot hold two filenames differing only by case,
+so the POSIX half of a case-sensitivity pair cannot run here, and that test now
+runs against both consumed-set shapes. A filtered run (`-m conformance`) skips a
+third — the front-door exemption audit, which needs an unfiltered collection to
+mean anything and says so.
 
-### Git state — read this before you touch anything
+### Git state
 
-Committed: phase 1 at `693e691`, and `143e43b` "feat: add pushes for phas 2".
+Committed on `feat/duckstream`, newest last:
 
-**`143e43b` contains a deliberate defect.** It was taken while a mutation audit
-had `engine.py` mutated, and captured this:
-
-```python
-previous = policy.advance(previous, observation.max_event_ts)   # not real code
+```
+693e691  phase 1
+143e43b  feat: add pushes for phas 2
+ee9e3c0  chore(duckstream): normalise line endings to LF
+f501eef  fix(duckstream): flat-cost status, guard hole, unused imports
+9351d13  feat(duckstream): tier-2 sufficient statistics, Pi measurements
+f8c6e1c  feat(duckstream): Arrow-mode UDF registrars for tier three
 ```
 
-which makes each batch judge its own rows against its own new watermark instead
-of the committed one — the silent under-counting failure. **The working tree is
-already correct**; the fix is uncommitted and the diff against that commit is
-exactly those two lines coming back out. It goes away with the next commit.
+**The defect that was in `143e43b` is gone.** That commit was taken while a
+mutation audit had `engine.py` mutated and captured a batch judging its own rows
+against its own new watermark instead of the committed one. It was fixed by the
+commits after it; `git show HEAD:duckstream/engine.py` no longer contains it.
+Nothing is uncommitted that should not be — and the audit can no longer cause a
+repeat, because it does not touch the working tree at all any more.
 
-Everything since — phases 2, 2b, step 0, tier two, `udf.py` — is **uncommitted**.
-Suggest two commits, because a line-ending normalisation is mixed in:
+## Phase 4, item 1: the consumed-file set as rows
+
+`PLAN.md` phase 4 says its first item is not compaction — it is the file
+source's consumed-file map, and it "outranks everything else in this phase".
+Done.
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| The consumed set is rows, not a JSON cell | met | `duckstream.consumed_files`; `duckstream/consumed.py` |
+| **The per-trigger write collapses** | **met** | §1.16: 7.97 MB → **4.9 KB**, 1,665x; 11.2 GB/day → 6.8 MB/day |
+| …and stays flat as the stream ages | met | plan 3.6 ms and commit 13.8 ms at 1,000 files and at 525,600 alike |
+| A v1 catalog migrates instead of replaying | met | automatic, one transaction, carrying the retry state; three engine-level tests |
+| **A v2 offset is never mistaken for an empty one** | **met** | `FileOffset.consumed()` raises; the message names the table and the constraint |
+| The rows commit with the output they check point | met | one transaction, and the conformance snapshot walk now reads them `AT (VERSION => n)` |
+| Quarantine still means "skip past it" | met | the skip is recorded in the same transaction as the record of it |
+| Nothing prunes the position | met | `prune` excludes `consumed_files`, asserted |
+| The count and the rows cannot drift | met | refused at write time, and asserted at **every** snapshot in history |
+
+### The four decisions, each forced by something
+
+**The set is rows and the offset is a count** — §1.16, above.
+
+**A v2 offset refuses to hand back an empty map.** The single most important
+line in the change. Returning `{}` would read as "this model has consumed
+nothing", replay the whole landing tree and fold every row into the mart a
+second time: `CONTEXT.md` §4's bug class, arriving as an upgrade note.
+
+**`plan()` gains a keyword and the engine injects it from the signature.**
+`Source.plan` is a frozen interface, so a source opts in by *declaring*
+`consumed` — the same signature-driven injection phase 1 ratified for
+`base_dir`. A third-party source is called exactly as before. The hazard is a
+source that wraps a file source and forgets to forward it; that lands on the
+refusal above, loudly, and a test pins it.
+
+**Migration is automatic rather than an operator step.** Refusing and asking
+somebody to run a command reads as the more careful option and is not: the
+obvious manual fix for a refused offset is to delete it, which replays
+everything.
+
+### Three things the build surfaced that were on no list
+
+**Quarantine stopped meaning what it said.** Advancing past a bad batch *was*
+advancing the offset, because the offset was the set. With rows it is two
+writes, and only the second one stops the next trigger re-planning the batch.
+Caught by an existing phase-2b test — the same hole that audit found from the
+other direction.
+
+**The checkpoint moving is no longer proof of progress.** It used to be: a
+changed offset meant new files were in it. It is now a counter the source
+computes optimistically, so a source that plans files and declares none would
+advance it, record nothing, and be handed the same files for ever — an infinite
+loop the drain guard cannot see, because the guard watches the checkpoint and
+the checkpoint moves. Now checked twice: the count is verified against the rows
+written in the same transaction, and the engine refuses to commit a batch that
+recorded nothing.
+
+**`status` lied on an un-migrated catalog.** It never runs a batch, so it never
+migrates — and it was reading the empty table, reporting every already-consumed
+file as backlog. On the deployment §1.15 is written about that is `backlog:
+525600` shown to the person checking whether the upgrade went well, and it goes
+out over `--json` to whatever is thresholding on it. Found by review, not by the
+audit; fixed by asking the source whether the position has moved yet, and
+reporting `consumed_files: None` — "cannot say" — rather than `0`.
+
+### The suite was audited by mutation, and it found two real holes
+
+**26 deliberate defects, 25 auditable on this platform, all 25 turn the suite
+red.** The one excluded is honest rather than convenient: it changes the code
+path that only a case-sensitive filesystem takes, so on Windows it applies
+textually and does nothing. Calling that a survivor would invent a hole; calling
+it red would invent coverage. It reports as *not auditable here*.
+
+Getting to 25 took three rounds, and what the rounds found is the point.
+
+**A test that could not test what it was named for.** *"the anti-join ignores
+mtime"* survived. The probe is narrowed to `BETWEEN min(scan mtime) AND
+max(scan mtime)`, and the test used a **one-file** scan — where that is
+`BETWEEN t AND t`, which is exactly the equality it was supposed to be
+independent of. Deleting the equality changed nothing the test could see. Now
+tested with a scan spanning two mtimes and a file rewritten inside that span.
+
+**A guard that hung instead of failing.** *"a committed batch records no
+consumed files"* did not go red — it **timed out**, because it puts the engine
+into an infinite drain. A suite that hangs has not caught anything. That
+produced the `_require_recorded` check above, and then that check survived its
+own mutation, because nothing exercised it; so it was extracted into a named
+method a test can reach. Both are red now.
+
+**And two process lessons.** The audit runs in throwaway `git worktree`s, so it
+cannot touch the working tree — the "never commit during an audit" rule is now
+unnecessary rather than merely restated. And results stream as they complete
+rather than in submission order: the first run looked stalled at 10 of 22 for
+twenty minutes while ten finished results sat behind the one mutation that had
+hung.
+
+**The audit is now in the repository**, at `tools/mutation/`, instead of being
+rebuilt from scratch by each session as it has been until now:
 
 ```bash
-git diff --shortstat                    # large
-git diff --shortstat --ignore-cr-at-eol # the real change
+.venv/Scripts/python.exe tools/mutation/run_audit.py          # all of them
+.venv/Scripts/python.exe tools/mutation/run_audit.py 3 11 14  # by index
 ```
 
-Commit `.gitattributes` plus the files whose *only* change is line endings
-first, then the rest. `.gitattributes` is new and scopes LF to duckstream's own
-directories, so this does not recur.
+`tools/mutation/README.md` covers how to add one, how to read the three
+verdicts, and why `ERROR`/`TIMEOUT` is a finding about the suite rather than a
+pass. Adding mutations for the next phase is now appending to a list. **Its
+anchors will go stale as the code moves** — the README has the one-liner that
+checks them, and a stale anchor reports as *skipped*, which is how an audit
+claims coverage it does not have.
+
+### Reviewed adversarially as well, and it was worth it
+
+Five independent lenses over the diff, each finding then trying to refute its
+own findings. It ran **partially** — five of its twelve agents hit a spend limit,
+so the migration and claims lenses never reported — and it still found the
+`status` defect above from two directions, with a detail the audit missed:
+`status` calls `ensure()`, which *creates* the empty table, so the "table does
+not exist" fallback that would have saved it never fires.
 
 ## Phase 3 so far: tier two, and the tooling for tier three
 
@@ -388,6 +505,13 @@ to stop everything behind the bad batch, so the trade against quarantine is
 visible rather than asserted; one model failing while another commits in the
 same run; a non-zero exit for every unhealthy outcome.
 
+Phase 4 adds: the consumed-file rows landing in the **same snapshot** as the
+output they check point and the offset that counts them, walked `AT (VERSION =>
+n)` across the whole catalog history and diffed against a replay at every step;
+a quarantine's skip and the record of it proved atomic *including the rows*; a
+v1 catalog migrating to rows without re-reading a file, keeping its retry state,
+and doing it once, driven through the engine rather than by hand.
+
 **Implemented but not demonstrated** — single-writer safety, still. Phase 2 added
 a *second* memoised value on that assumption (the committed watermark, §1.11), so
 there are two caches that a second writer would invalidate together. Phase 2b's
@@ -395,9 +519,15 @@ lock makes an overlap *diagnosable* but is advisory: the guarantee still rests o
 DuckDB's catalog file lock, and no test runs two engines concurrently against one
 catalog from two processes.
 
-**Neither** — tiers two and three still do not execute; they are refused with a
-clear phase-3 message. So "chunked equals unchunked for every `non_foldable`
-model" remains asserted on the additive tier only.
+**Neither** — tier three still does not execute; it is refused with a clear
+message saying so. "Chunked equals unchunked for every `non_foldable` model"
+therefore remains asserted on the foldable tiers only.
+
+**And one number is demonstrated on a dev box, not on a Pi.** §1.16's 1,665x is
+measured with `threads=2` against local SSD. The direction is not in doubt — it
+is fewer bytes, not faster bytes — but the *day* figures (11.2 GB against
+6.8 MB) assume this machine's parquet sizes, and the soak run phase 6 owes is
+still owed.
 
 ## Known open items
 
@@ -407,7 +537,9 @@ model" remains asserted on the additive tier only.
 | `status` walks the landing tree for its backlog | `metrics.py` | Deliberately unbounded — a backlog reported through `max_files_per_trigger` would read `10` whether ten files or ten thousand were waiting, which is exactly the difference worth knowing. It is I/O against a tree that may be a network mount, so it is skippable (`include_backlog=False`) and a source that raises costs a number rather than the whole status. Phase 3 gives the source time-range planning, which this should then reuse. |
 | A halted model re-reads and re-plans every tick | `engine.py` | It writes nothing after the first verdict, which is the expensive half, but it does redo the planning. Cheap, and it is what lets it recover unattended. |
 | First tick costs 2 setup snapshots | `Engine._prepare_model` | Unchanged. Pinned by `test_setup_costs_two_snapshots_even_when_there_is_nothing_to_do`. |
-| `prune` exists but nothing calls it | `state.py` | Unchanged. Phase 4 maintenance should schedule it. |
+| `prune` exists but nothing calls it | `state.py` | Unchanged. Phase 4 maintenance should schedule it. **It must never be pointed at `consumed_files`** — those rows are the position, not a history of positions. |
+| The landing tree is still walked in full every trigger | `sources/files.py` | `latest_offset()` scans every ready file, and §1.13's ~0.1 ms per file listed applies. This is what is left of §1.15 after §1.16: a speed problem rather than a card-wear one, and the lever is retention at the source. |
+| `status` creates the state tables | `cli.py` | `_cmd_status` calls `ensure`, so a "read-only" command writes a snapshot the first time it meets a catalog that predates a table. Pre-existing, and now reachable on every *upgraded* catalog rather than only on a fresh one. Harmless, but it is not what the docstring says. |
 | A rewrite with identical size *and* mtime is invisible | `offsets.py` | Unchanged; inherent to the identity. |
 | `FileSource.__eq__` ignores `base_dir` | `sources/files.py` | Unchanged. Conformance parity compares **output**, never source equality — keep it that way. |
 | A window whose key stops reporting seals only on someone else's timestamp | `watermark.py` | The watermark is per model, not per key, so a sensor that goes silent leaves its last window open until any later-timestamped row arrives for that model. Standard for event-time engines, but it surprises people, so it is documented in the README's limits. |
@@ -416,8 +548,9 @@ model" remains asserted on the additive tier only.
 
 ## Measured this session
 
-Constraints §1.11 through §1.15 were all measured during phases 2, 2b and 3, and
-three of them overturned something that was already written down:
+Constraints §1.11 through §1.16 were measured during phases 2, 2b, 3 and 4, and
+**five** of them overturned something that was already written down — including,
+now, one of `CONTEXT.md`'s own measurements:
 
 | | Finding | What it overturned |
 |---|---|---|
@@ -425,12 +558,23 @@ three of them overturned something that was already written down:
 | §1.12 | reduce state in SQL; `status` was O(n) at 213 ms, now flat at 48 ms | — |
 | §1.13 | statistics pruning does not save the file open: ~0.1 ms per file | my own assumption that it would make tier three cheap |
 | §1.14 | `sum_sq` returns 524 for a true variance of 0.25, and 0.0 at 1e8 | **`PLAN.md`'s specified state for tier two** |
-| §1.15 | the consumed-file map is rewritten in full every trigger: 45.7 MB, ~65 GB/day | — |
+| §1.15 | the consumed-file map is rewritten in full every trigger: 45.7 MB encoded | — |
+| §1.16 | as rows: **4.9 KB a trigger against 7.97 MB**, 1,665x, and flat in files consumed | — |
+| §1.16 | the offset reaches the disk as parquet: **11.2 GB/day, not 65** | **§1.15's own arithmetic**, derived rather than measured |
+| §1.16 | zlib saves 2.38x *on the disk*, not 7.4x | **§1.15's second number**, same cause |
 | §2.5 | contention is *not* structurally impossible; the catalog file lock is what saves you | **`CONTEXT.md` §2.5's own claim** |
 | §1.2 | the enum is `duckdb.func`, not `duckdb.functional` | **§1.2's own code sample**, which had never been executed |
 
 §1.10, §1.11 and §1.12 are the same constraint met three times in three
-disguises. Read them together; assume there is a fourth.
+disguises — do not read state you just wrote, and do not move state to the
+arithmetic when the arithmetic can go to the state. §1.16 is the fourth, and it
+was the most expensive of them. Assume there is a fifth.
+
+**And a rule the §1.15 correction earns its own line for: a derived number is an
+argument, not a measurement.** 65 GB/day was 45.7 MB times a cadence, and it
+went unchallenged for a phase because it was sitting in a table of measured
+things. If a number in `CONTEXT.md` was computed rather than observed, it has
+the standing of intuition and this project's first rule applies to it.
 
 ## Still unmeasured
 
@@ -467,7 +611,7 @@ variants one after another and gave a baseline of 100.8 ms on one run and 67.8 m
 on the next; machine drift over a two-minute run swamped the effect. Running one
 trigger of each variant in turn made the deltas reproducible to ~1 ms.
 
-## Traps waiting for phase 3
+## Traps waiting for whoever is next
 
 The phase-1 traps still hold. In order of how much damage they do:
 
@@ -538,6 +682,41 @@ And two from phase 3 so far:
     the name. `udf.py` refuses it up front. Expect the same class of surprise
     from `median`, `mode`, `kurtosis`.
 
+And five that phase 4 added:
+
+16. **A one-file scan cannot test file identity.** The consumed-file probe is
+    narrowed to `BETWEEN min(scan mtime) AND max(scan mtime)`, and with one file
+    that is `BETWEEN t AND t` — indistinguishable from the `mtime_ns` equality it
+    is meant to be independent of. A test using a single-file scan does not test
+    identity at all. This cost a real mutation survivor; see §1.16.
+
+17. **The checkpoint moving is not proof that progress was made.** It was, when
+    the offset carried the consumed set. It is now a counter the source computes
+    optimistically, so the drain loop's stalled-loop guard can watch it advance
+    while nothing is recorded and the same files are re-read for ever. Two
+    checks stand in its place — `TableIndex._verify` and
+    `Engine._require_recorded` — and anything added to the batch lifecycle that
+    advances a position must keep them true.
+
+18. **Anything that advances a position must record the rows in the same
+    transaction.** Quarantine is the one that already caught this out: it used
+    to skip past a bad batch *by* advancing the offset, and with rows that is
+    two writes rather than one. `state.quarantine` takes the index for exactly
+    this reason.
+
+19. **`prune` must never be pointed at `consumed_files`.** Every other state
+    table keeps a history of positions and only its newest row is read, which is
+    what makes trimming safe. These rows *are* the position. Deleting one makes
+    duckstream read that file again and fold it into the mart a second time —
+    the §4 bug class, produced by the maintenance meant to prevent bloat.
+
+20. **`status` never migrates, so it must not read the migrated shape.** It runs
+    no batch by design, so on an upgraded-but-not-yet-run catalog the
+    consumed-file table is empty while the position is still in the offset.
+    Reading the table there reports every consumed file as backlog. Any new
+    reader of that table has to ask the source whether the position has moved
+    yet — `metrics._consumed_index` is the pattern.
+
 One phase-1 invariant that phase 2 **deliberately breaks**, so do not restore it:
 **"chunked equals unchunked" no longer holds once a horizon exists.** The
 watermark is a function of what has been observed, so a batch boundary between
@@ -564,7 +743,8 @@ anything.
 | `trigger.py` | `AvailableNow`, `Once` |
 | `state.py` | append-only offsets/watermarks/batches; DuckLake and in-memory stores |
 | `lake.py` | attach, settings, inlining enforcement, snapshot introspection |
-| `offsets.py` | offset encoding and the file-offset shape |
+| `offsets.py` | offset encoding, and both file-offset shapes — v2 counts, v1 carried a map |
+| `consumed.py` | the consumed-file set as rows: the table, the anti-join, and the two index shapes |
 | `sources/files.py` | directory tailing with completion markers |
 | `sinks/table.py` | append, update-by-merge, and sealed windowed append |
 | `sql.py` | identifier and literal quoting |
@@ -573,6 +753,26 @@ anything.
 | `cli.py` | `run`, `validate`, `models` |
 
 Not yet written, and named in `PLAN.md`: `sources/mqtt.py` (phase 5).
+
+## How the phase-4 build was run
+
+One work unit again, and for the same reason phase 2 was: the offset shape, the
+source's planning and the engine's transaction boundary are one decision wearing
+three hats, so there was no interface to negotiate between agents.
+
+What did fan out was the *checking*, and it earned its cost twice. The mutation
+audit ran 26 defects across four parallel worktrees and found two holes review
+had missed — a test that could not test the thing it was named for, and a guard
+that hung instead of failing. An adversarial review ran five independent lenses
+over the diff, each trying to refute its own findings, and found the `status`
+defect that the audit had no mutation for. Neither would have found what the
+other did.
+
+**The review ran partially and it is worth saying so.** Five of its twelve
+agents hit a spend limit, so the migration and claims lenses never reported.
+What it did return was confirmed and acted on; what those two lenses would have
+found is unknown, and re-running them is cheap if the next session wants the
+coverage.
 
 ## How the phase-2 build was run
 

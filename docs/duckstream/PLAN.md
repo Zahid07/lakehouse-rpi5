@@ -317,27 +317,35 @@ From constraint 1: bound rows, not UDF cost.
    not reintroduce the dependency. Also add partitioning of sink tables by time
    grain, which is what makes window-range scans prune to a few files.
 
-   **The first item is not compaction.** Constraint 15 measured the file
-   source's consumed-file map at **45.7 MB after a year at one file a minute**,
-   rewritten in full on every trigger — roughly **65 GB of writes a day**. On a
-   Raspberry Pi that is an SD card's write budget being spent re-recording file
-   names it already knows, and it is the single largest obstacle to running
-   duckstream unattended on one. It outranks everything else in this phase.
+   **The first item was not compaction, and it is DONE.** Constraint 15 measured
+   the file source's consumed-file map at **45.7 MB after a year at one file a
+   minute**, rewritten in full on every trigger. On a Raspberry Pi that was an SD
+   card's write budget being spent re-recording file names it already knew, and
+   it was the single largest obstacle to running duckstream unattended on one.
 
-   The fix is to stop storing the consumed set as one JSON value and store it
-   as **rows**: consuming a file becomes an insert of one row, and "has this
-   been consumed?" becomes an anti-join the database answers. That is exact and
-   it is constraint 12's rule applied to the most extreme case of it — a state
-   table read back and looped over in Python, where the whole table is a single
-   cell.
+   The fix shipped: the consumed set is **rows** in `duckstream.consumed_files`,
+   consuming a file is an insert, and "has this been consumed?" is an anti-join
+   the database answers. Constraint 12's rule applied to its most extreme case —
+   a state table read back and looped over in Python, where the whole table was a
+   single cell. Measured in constraint **16**: **7.97 MB of writes per trigger
+   becomes 4.9 KB** (1,665x), the commit goes from 1,078 ms to 13.8 ms, and both
+   are now flat in the number of files consumed. Constraint 16 also corrects two
+   figures in 15 that were derived rather than measured — the daily write volume
+   was 11.2 GB, not 65 GB, because the offset reaches the disk as parquet.
 
-   Two shortcuts are tempting and both are wrong. `offsets.py` reserves
-   `high_water_mtime_ns` for collapsing old entries, which bounds the map but
-   silently skips a file that arrives with an older mtime. And dropping entries
-   for files that no longer exist sounds exact, but the source learns what
-   exists by scanning the tree — so a network mount that blinks returns an empty
-   scan, every entry looks deleted, and the next good scan re-reads the whole
-   landing directory.
+   Two shortcuts were tempting and both were wrong, and neither should come
+   back. `offsets.py` reserves `high_water_mtime_ns` for collapsing old entries,
+   which bounds the map but silently skips a file that arrives with an older
+   mtime; the key is still reserved and still unused. And dropping entries for
+   files that no longer exist sounds exact, but the source learns what exists by
+   scanning the tree — so a network mount that blinks returns an empty scan,
+   every entry looks deleted, and the next good scan re-reads the whole landing
+   directory.
+
+   **What is still open is the number of files.** `latest_offset()` walks the
+   whole landing tree every trigger and constraint 13's ~0.1 ms per file listed
+   applies to that walk. Retention at the source is the lever. It is now a speed
+   problem rather than a write-endurance one, which is a different priority.
 
    Three further items belong here, deferred from the phase-2b sweep because
    they are data-lifecycle concerns rather than failure-handling ones:

@@ -49,6 +49,7 @@ import uuid
 from pathlib import Path
 from typing import Any, ClassVar, Iterator, Mapping, Sequence
 
+from duckstream.consumed import ENTRIES_KEY, MapIndex
 from duckstream.errors import ConfigError, DuckstreamError
 from duckstream.offsets import FileEntry, FileOffset
 from duckstream.protocols import BatchLimits, BatchPlan, Offset
@@ -451,43 +452,42 @@ class FileSource:
         start: Offset | None,
         end: Offset,
         limits: BatchLimits | None = None,
+        *,
+        consumed: Any = None,
     ) -> BatchPlan:
-        """Carve a bounded batch out of the files in ``end`` but not ``start``.
+        """Carve a bounded batch out of the files in ``end`` that are not consumed.
 
-        A file counts as unconsumed when it is absent from ``start`` **or** its
-        size or mtime differs from what ``start`` recorded — that second clause
-        is what catches a file rewritten in place.
+        A file counts as unconsumed when nothing records it **or** its size or
+        mtime differs from what was recorded — that second clause is what
+        catches a file rewritten in place.
+
+        ``consumed`` is a **consumed-file index** (:mod:`duckstream.consumed`),
+        and it is where the answer to "has this been consumed?" comes from. The
+        engine injects the table-backed one, keyed off this parameter appearing
+        in the signature — the same signature-driven injection the config loader
+        uses for ``base_dir``, so a source that does not want it never sees it.
+        Without one, the set is read out of ``start`` the way duckstream v1 read
+        it, which is what keeps this method testable without a catalog and is
+        the path a v1 offset is migrated through. It is not a silent fallback:
+        a v2 ``start`` has no map to read and says so.
 
         Files are ordered by ``(mtime_ns, relative path)``. Deterministic
         ordering is what makes a replayed batch identical to the original one;
         the path tiebreaker matters because a filesystem can stamp several files
         with the same mtime.
 
-        The returned ``end`` offset covers the batch's starting offset plus
-        **only the files actually included**. Never the whole scan: a truncated
-        batch that checkpointed the full scan would mark files consumed that it
-        never read, and they would be lost.
+        The returned ``end`` offset covers **only the files actually included**.
+        Never the whole scan: a truncated batch that checkpointed the full scan
+        would mark files consumed that it never read, and they would be lost.
         """
         limits = limits or BatchLimits()
-        start_consumed = FileOffset.consumed(start)
         end_consumed = FileOffset.consumed(end)
+        index = consumed if consumed is not None else MapIndex.from_offset(start)
 
-        # Built once: on Windows a lookup has to fold case, and folding per
-        # file against the whole map would make planning quadratic.
-        start_index = FileOffset.fold_index(start_consumed)
-
-        candidates: list[tuple[int, str]] = [
-            (entry[FileOffset.MTIME_KEY], relpath)
-            for relpath, entry in end_consumed.items()
-            if not FileOffset.is_consumed(
-                start_consumed,
-                relpath,
-                entry[FileOffset.SIZE_KEY],
-                entry[FileOffset.MTIME_KEY],
-                index=start_index,
-            )
-        ]
-        candidates.sort()
+        candidates = sorted(
+            (end_consumed[relpath][FileOffset.MTIME_KEY], relpath)
+            for relpath in index.unconsumed(end_consumed)
+        )
         ordered = [relpath for _mtime, relpath in candidates]
 
         max_files = _tighter(self.max_files_per_trigger, limits.max_files_per_trigger)
@@ -504,13 +504,18 @@ class FileSource:
             truncated = truncated or rows_truncated
 
         included: dict[str, FileEntry] = {rel: end_consumed[rel] for rel in ordered}
-        batch_end = FileOffset.merge(start, included)
+        batch_end = index.end_offset(start, included)
 
+        # `relpaths` and `entries` overlap on purpose. `relpaths` is the ordered
+        # list bind reads; `entries` is the identity the index records, and it
+        # has to carry size and mtime or a rewritten file could not be told
+        # apart from the version already consumed.
         payload: dict[str, Any] = {
             "format": self.format,
             "root": Path(os.path.abspath(os.fspath(self._root))).as_posix(),
             "files": [self._absolute(rel) for rel in ordered],
             "relpaths": list(ordered),
+            ENTRIES_KEY: included,
             "row_count": row_count,
         }
         return BatchPlan(
@@ -520,6 +525,26 @@ class FileSource:
             is_empty=not ordered,
             has_more=truncated,
         )
+
+    def migrate_offset(
+        self, offset: Offset | None
+    ) -> tuple[Offset, dict[str, FileEntry]] | None:
+        """What to write so this stored offset stops carrying its consumed set.
+
+        Returns ``(new_offset, entries)`` for a v1 offset, or ``None`` when
+        there is nothing to do — which is every offset this duckstream wrote,
+        and every model that has never committed. The engine calls it once per
+        model per process and writes both halves in one transaction.
+
+        The hook is optional and duck-typed: the engine calls it if the source
+        has it. It lives here rather than in the engine because knowing that a
+        ``v: 1`` offset holds a map is the file source's business and nothing
+        else's, and this is the last place that knowledge is needed.
+        """
+        if FileOffset.version_of(offset) >= FileOffset.ROWS_VERSION:
+            return None
+        entries = FileOffset.consumed(offset)
+        return FileOffset.rows(len(entries)), entries
 
     def bind(self, con: Any, plan: BatchPlan) -> str:
         """Register a temp view over exactly the planned files; return its name.
