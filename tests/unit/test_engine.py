@@ -41,7 +41,7 @@ from duckstream import state as state_module
 from duckstream.errors import BatchFailed, DuckstreamError
 from duckstream.lake import data_file_count, snapshot_count
 from duckstream.model import Model
-from duckstream.offsets import FileOffset
+from duckstream.offsets import FileOffset, encode_offset
 from duckstream.protocols import BatchLimits, BatchPlan
 from duckstream.sinks.table import TableSink
 from duckstream.sources.files import FileSource
@@ -154,6 +154,24 @@ def sink_rows(con) -> list[tuple]:
         "SELECT window_ts, sensor_id, n, total FROM marts.hourly_counts "
         "ORDER BY window_ts, sensor_id"
     ).fetchall()
+
+
+def consumed_relpaths(engine, model_name: str) -> list[str]:
+    """What the catalog says this model has read, straight from the rows.
+
+    The offset stopped carrying this in phase 4 (``CONTEXT.md`` 1.15), and the
+    distinction is worth keeping in the assertions rather than hiding behind a
+    helper that could read either: the offset's count is a *report*, and these
+    rows are what the next ``plan`` actually consults.
+    """
+    return sorted(
+        row[0]
+        for row in engine.con.execute(
+            f"SELECT relpath FROM {engine.state.consumed_files_table} "
+            f"WHERE model_name = ?",
+            [model_name],
+        ).fetchall()
+    )
 
 
 def write_config(tmp_path, landing: Path, **model_overrides) -> Path:
@@ -300,8 +318,12 @@ def test_offsets_advance_and_a_second_run_changes_nothing(tmp_path, landing):
 
     offset = engine.state.load_offset(engine.con, "hourly_counts")
     assert offset is not None
-    consumed = offset["consumed"]
-    assert len(consumed) == 1
+    # The consumed set is rows now, not a map inside the offset (CONTEXT.md
+    # 1.15), so the offset carries a count and the table carries the identity.
+    # Both are asserted: the count is what the engine's stalled-loop guard
+    # watches, and the rows are what the next plan actually consults.
+    assert offset["entries"] == 1
+    assert consumed_relpaths(engine, "hourly_counts") == ["b1/part.parquet"]
 
     rows = sink_rows(engine.con)
     engine.run()
@@ -605,11 +627,19 @@ def test_attempts_run_out_and_the_batch_is_quarantined(tmp_path, landing, no_bac
     # *files*, not merely against non-None: a quarantine that recorded the loss
     # and left the position where it was would log a permanent "data was lost"
     # row and then retry the same batch for ever -- the worst of both policies.
+    #
+    # With the set stored as rows, advancing the offset is no longer *by itself*
+    # the skip: the count moving and the file being recorded are two writes, and
+    # only the second one stops the next plan re-selecting the batch. Both are
+    # asserted, and the row is the one that matters.
     position = engine.state.load_position(engine.con, "hourly_counts")
     assert position.attempt == 0 and position.offset is not None
-    consumed = sorted(position.offset.get("consumed", {}))
+    consumed = consumed_relpaths(engine, "hourly_counts")
     assert consumed == ["b1/part.parquet"], (
         f"the quarantined batch was not skipped past: {consumed}"
+    )
+    assert position.offset["entries"] == 1, (
+        "the offset's count and the consumed rows disagree about the skip"
     )
     quarantined = [r for r in report if r.quarantined][0]
     assert quarantined.end_offset == position.offset, (
@@ -1388,4 +1418,141 @@ def test_the_filter_view_is_dropped_with_the_batch_view(tmp_path, landing):
         "SELECT count(*) FROM duckdb_views() WHERE view_name LIKE 'duckstream%'"
     ).fetchone()[0]
     assert views == 0
+    engine.con.close()
+
+
+def _downgrade_to_v1(engine, model_name: str) -> dict:
+    """Rewrite this model's catalog state into the shape duckstream v1 wrote.
+
+    There is no other way to test the migration honestly. Every catalog this
+    suite creates is written by the current code, so the migration path is a
+    no-op in all of them -- which is exactly how a migration ships broken. So
+    the position is put back the way an upgrading deployment will actually find
+    it: the consumed set inside the offset, and no rows behind it.
+    """
+    relpaths = consumed_relpaths(engine, model_name)
+    entries = {}
+    for rel in relpaths:
+        stat = os.stat(engine.model(model_name).source._absolute(rel))
+        entries[rel] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    store = engine.state
+    engine.con.execute("BEGIN")
+    engine.con.execute(
+        f"DELETE FROM {store.consumed_files_table} WHERE model_name = ?",
+        [model_name],
+    )
+    engine.con.execute(
+        f"UPDATE {store.offsets_table} SET offset_json = ? WHERE model_name = ?",
+        [encode_offset(FileOffset.build(entries)), model_name],
+    )
+    engine.con.execute("COMMIT")
+    # The engine memoises; a fresh process is what an upgrade actually is.
+    engine._next_ids.clear()
+    engine.state._last_batch_id.clear()
+    return entries
+
+
+def test_a_v1_catalog_migrates_instead_of_replaying(tmp_path, landing):
+    """The upgrade path, end to end, through the engine rather than by hand.
+
+    An existing deployment has a consumed map inside its offset. On the first
+    run of the new code that map has to move into rows -- once, atomically, and
+    without re-reading a single file. Getting it wrong in the obvious direction
+    replays the whole landing tree and folds every row into the mart a second
+    time, which is the section 4 bug class arriving as an upgrade note.
+    """
+    drop_batch(landing, "b1", 7)
+    engine = open_engine(tmp_path)
+    engine.add(counts_model(landing))
+    engine.run()
+
+    before = sink_rows(engine.con)
+    entries = _downgrade_to_v1(engine, "hourly_counts")
+    assert entries, "the downgrade must actually have something to migrate"
+    assert consumed_relpaths(engine, "hourly_counts") == [], "rows were cleared"
+
+    # Nothing new has landed, so this run has no batch to run -- and must still
+    # migrate, because the migration is about the position, not about a batch.
+    report = engine.run()
+
+    assert report.adopted == (("hourly_counts", len(entries)),), (
+        f"the run did not report a migration: {report.adopted}"
+    )
+    assert consumed_relpaths(engine, "hourly_counts") == sorted(entries), (
+        "the consumed map did not reach the table"
+    )
+    position = engine.state.load_position(engine.con, "hourly_counts")
+    assert position.offset == FileOffset.rows(len(entries))
+    assert sink_rows(engine.con) == before, (
+        "the migration re-read the landing tree and folded it a second time"
+    )
+
+    # And it happens once. A second run migrates nothing and changes nothing.
+    again = engine.run()
+    assert again.adopted == ()
+    assert consumed_relpaths(engine, "hourly_counts") == sorted(entries)
+    assert sink_rows(engine.con) == before
+    engine.con.close()
+
+
+def test_a_v1_catalog_that_still_has_work_migrates_and_then_does_it(tmp_path, landing):
+    """The same upgrade, on a deployment with a backlog waiting.
+
+    The migration and the batch are separate transactions, and this pins that
+    the first does not swallow the second: the new drop is still read, exactly
+    once, on the same run.
+    """
+    drop_batch(landing, "b1", 3)
+    engine = open_engine(tmp_path)
+    engine.add(counts_model(landing))
+    engine.run()
+    entries = _downgrade_to_v1(engine, "hourly_counts")
+
+    drop_batch(landing, "b2", 5, first=100)
+    report = engine.run()
+
+    assert report.adopted == (("hourly_counts", len(entries)),)
+    assert sorted(consumed_relpaths(engine, "hourly_counts")) == [
+        "b1/part.parquet",
+        "b2/part.parquet",
+    ]
+    total = engine.con.execute(
+        "SELECT sum(n) FROM marts.hourly_counts"
+    ).fetchone()[0]
+    assert total == 8, f"expected 3 + 5 rows folded exactly once, got {total}"
+    engine.con.close()
+
+
+def test_a_v1_catalog_keeps_its_failure_state_across_the_migration(tmp_path, landing):
+    """Relocating the position must not overturn a failure decision.
+
+    An upgrade that hands a stuck model a clean attempt budget would let a
+    crash-looping deployment postpone its own quarantine indefinitely, once per
+    release. The unit-level version of this is in tests/unit/test_consumed.py;
+    this is the engine actually doing it.
+    """
+    drop_batch(landing, "b1", 2)
+    engine = open_engine(tmp_path)
+    engine.add(counts_model(landing))
+    engine.run()
+    _downgrade_to_v1(engine, "hourly_counts")
+
+    store = engine.state
+    position = store.load_position(engine.con, "hourly_counts")
+    store.record_failure(
+        engine.con,
+        "hourly_counts",
+        store.next_batch_id(engine.con, "hourly_counts"),
+        position,
+        RuntimeError("something upstream"),
+    )
+    failing = store.load_position(engine.con, "hourly_counts")
+    assert failing.attempt == 1
+
+    engine.run()
+
+    after = store.load_position(engine.con, "hourly_counts")
+    assert after.offset == FileOffset.rows(1), "it did migrate"
+    assert after.attempt == 1, "and did not refund the attempt"
+    assert after.error == failing.error
     engine.con.close()

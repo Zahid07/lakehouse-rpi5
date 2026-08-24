@@ -349,3 +349,111 @@ def test_model_status_defaults_are_a_coherent_empty_state():
     status = ModelStatus(name="x")
     assert status.healthy and status.state == "idle"
     assert not status.behind_horizon
+
+
+# --------------------------------------------------------------------------
+# status on a catalog that has not been migrated yet
+# --------------------------------------------------------------------------
+
+
+def test_status_does_not_report_a_migrated_model_s_files_as_backlog(tmp_path):
+    """The wrong number an upgrade would otherwise put in front of an operator.
+
+    ``status`` never runs a batch, so it never migrates. A model whose position
+    is still a v1 map therefore has an *empty* consumed-file table -- and asking
+    that table would answer "this model has read nothing" and report the whole
+    landing tree as waiting. On the deployment ``CONTEXT.md`` 1.15 is written
+    about that is a backlog of 525,600 files, shown to the person checking
+    whether the upgrade went well, and emitted over ``--json`` to whatever is
+    thresholding on it. It reads exactly like the upgrade having lost the
+    position, which is the one thing it must not do.
+
+    ``consumed_files`` goes to ``None`` rather than ``0`` for the same reason:
+    ``None`` is the documented "cannot say", and ``0`` would be a lie.
+    """
+    import os
+
+    import duckdb
+
+    from duckstream.engine import Engine
+    from duckstream.metrics import status_for
+    from duckstream.model import Model
+    from duckstream.offsets import FileOffset, encode_offset
+    from duckstream.sinks.table import TableSink
+    from duckstream.sources.files import FileSource
+
+    landing = tmp_path / "landing"
+    landing.mkdir()
+
+    def drop(name):
+        directory = landing / name
+        directory.mkdir()
+        writer = duckdb.connect()
+        try:
+            writer.execute(
+                "COPY (SELECT TIMESTAMP '2026-01-01 00:00:00' AS event_ts, "
+                "'s' AS sensor_id, 1.0 AS value) "
+                f"TO '{(directory / 'p.parquet').as_posix()}' (FORMAT PARQUET)"
+            )
+        finally:
+            writer.close()
+        (directory / "_READY").write_text("", encoding="utf-8")
+        return directory
+
+    read_already = drop("b1")
+    con = duckdb.connect()
+    engine = Engine(
+        con, catalog=tmp_path / "c.ducklake", data_path=tmp_path / "lake"
+    )
+    engine.add(
+        Model(
+            name="m",
+            source=FileSource(landing.as_posix(), marker="_READY"),
+            time_column="event_ts",
+            grain="hour",
+            key=["window_ts", "sensor_id"],
+            aggregates={"n": "count(*)"},
+            sink=TableSink("marts.m", mode="update"),
+        )
+    )
+    engine.run()
+
+    # Put the catalog back the way an upgrading deployment will be found:
+    # the set inside the offset, and no rows behind it.
+    store = engine.state
+    stat = os.stat(read_already / "p.parquet")
+    con.execute("BEGIN")
+    con.execute(
+        f"DELETE FROM {store.consumed_files_table} WHERE model_name = 'm'"
+    )
+    con.execute(
+        f"UPDATE {store.offsets_table} SET offset_json = ? WHERE model_name = 'm'",
+        [
+            encode_offset(
+                FileOffset.build(
+                    {"b1/p.parquet": {"size": stat.st_size,
+                                      "mtime_ns": stat.st_mtime_ns}}
+                )
+            )
+        ],
+    )
+    con.execute("COMMIT")
+
+    drop("b2")  # one file that genuinely is waiting
+
+    before = status_for(con, store, engine.model("m"))
+    assert before.backlog == 1, (
+        f"status reported {before.backlog} file(s) waiting; only b2 is. Reading "
+        f"an empty consumed-file table for a model whose position has not "
+        f"migrated counts everything it has already read as unread."
+    )
+    assert before.consumed_files is None, (
+        "0 would be a lie; None is the documented 'cannot say'"
+    )
+
+    engine.run()
+
+    after = status_for(con, store, engine.model("m"))
+    assert after.backlog == 0
+    assert after.consumed_files == 2
+    con.close()

@@ -93,22 +93,97 @@ def relpaths(plan) -> list[str]:
     return list(plan.payload["relpaths"])
 
 
-def drain(source, *, limits=None, max_batches: int = 50) -> list[list[str]]:
+class Consumption:
+    """Plans batches the way the engine does, against one consumed-set shape.
+
+    The two shapes are parametrised over rather than one being picked, because
+    they differ in *when* a file becomes consumed and that is the whole thing
+    this file is about. With the map, planning a batch and remembering it are
+    one act -- the returned offset already carries the files. With rows, ``plan``
+    only *decides*, and the recording is a separate write the engine makes
+    inside the batch's transaction. A suite that only ever exercised the first
+    would not notice a source that decided correctly and then declared nothing
+    to record, which is a silent replay of every batch for ever.
+
+    ``take`` is therefore plan-then-commit, in that order, exactly as
+    ``Engine._attempt_batch`` does it.
+    """
+
+    def __init__(self, shape: str) -> None:
+        self.shape = shape
+        self.offset = None
+        self.batch_id = 0
+        self.con = None
+        self.index = None
+        if shape == "rows":
+            from duckstream.state import MemoryStateStore
+
+            self.con = duckdb.connect()
+            self.store = MemoryStateStore("duckstream")
+            self.store.ensure(self.con)
+            self.index = self.store.consumed_files.index_for(self.con, "m")
+
+    def close(self) -> None:
+        if self.con is not None:
+            self.con.close()
+
+    def plan(self, source, limits=None):
+        """Decide the next batch. Nothing is consumed until :meth:`commit`."""
+        end = source.latest_offset()
+        limits = BatchLimits() if limits is None else limits
+        if self.index is None:
+            return source.plan(self.offset, end, limits)
+        return source.plan(self.offset, end, limits, consumed=self.index)
+
+    def commit(self, plan):
+        """What the engine writes inside the batch's transaction."""
+        self.batch_id += 1
+        if self.index is not None:
+            self.con.execute("BEGIN")
+            self.index.record(self.batch_id, plan.payload)
+            self.con.execute("COMMIT")
+        self.offset = plan.end
+        return plan
+
+    def take(self, source, limits=None):
+        return self.commit(self.plan(source, limits))
+
+    def consumed(self) -> list[str]:
+        """Everything this model has read, whichever shape holds it."""
+        if self.index is None:
+            return sorted(FileOffset.consumed(self.offset))
+        return sorted(
+            row[0]
+            for row in self.con.execute(
+                f"SELECT relpath FROM {self.store.consumed_files_table} "
+                f"WHERE model_name = 'm'"
+            ).fetchall()
+        )
+
+
+@pytest.fixture(params=["map", "rows"])
+def consumption(request):
+    """One :class:`Consumption` per consumed-set shape. See its docstring."""
+    state = Consumption(request.param)
+    try:
+        yield state
+    finally:
+        state.close()
+
+
+def drain(source, consumption, *, limits=None, max_batches: int = 50) -> list[list[str]]:
     """Run the source to exhaustion. Returns the relpaths of each batch.
 
     This is the loop the ``AvailableNow`` trigger runs, reduced to the source's
     part of it, and it is where truncation bugs actually show up.
     """
-    limits = limits or BatchLimits()
-    offset = None
     batches: list[list[str]] = []
     for _ in range(max_batches):
-        end = source.latest_offset()
-        plan = source.plan(offset, end, limits)
+        plan = consumption.plan(source, limits)
         if plan.is_empty:
             break
         batches.append(relpaths(plan))
-        offset = plan.end
+        consumption.commit(plan)
         if not plan.has_more:
             break
     else:  # pragma: no cover - a runaway loop is a test failure, not a hang
@@ -248,38 +323,38 @@ def test_pattern_filters_by_name(tmp_path, writer):
 # -- incremental planning --------------------------------------------------
 
 
-def test_second_plan_returns_only_new_files(tmp_path, writer):
+def test_second_plan_returns_only_new_files(tmp_path, writer, consumption):
     """Two batches minimum: batch one proves discovery, batch two proves memory."""
     write_parquet(writer, tmp_path / "a.parquet", 2)
     write_parquet(writer, tmp_path / "b.parquet", 2)
     mark(tmp_path)
     source = FileSource(tmp_path)
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.take(source)
     assert sorted(relpaths(first)) == ["a.parquet", "b.parquet"]
     assert not first.is_empty
     assert not first.has_more
 
-    # Nothing new: the second plan is empty and the offset does not move.
-    idle = source.plan(first.end, source.latest_offset(), BatchLimits())
+    # Nothing new: the second plan is empty and the position does not move.
+    idle = consumption.plan(source)
     assert idle.is_empty
     assert relpaths(idle) == []
     assert encode_offset(idle.end) == encode_offset(first.end)
 
-    # One new file: only that file is planned, and the offset accumulates.
+    # One new file: only that file is planned, and the position accumulates.
     write_parquet(writer, tmp_path / "c.parquet", 2)
     mark(tmp_path)
-    second = source.plan(first.end, source.latest_offset(), BatchLimits())
+    second = consumption.take(source)
     assert relpaths(second) == ["c.parquet"]
-    assert sorted(consumed(second.end)) == ["a.parquet", "b.parquet", "c.parquet"]
+    assert consumption.consumed() == ["a.parquet", "b.parquet", "c.parquet"]
 
 
-def test_rewritten_file_is_replanned(tmp_path, writer):
+def test_rewritten_file_is_replanned(tmp_path, writer, consumption):
     write_parquet(writer, tmp_path / "a.parquet", 2)
     mark(tmp_path)
     source = FileSource(tmp_path)
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.take(source)
     assert relpaths(first) == ["a.parquet"]
 
     # Same path, different contents. Both size and mtime move.
@@ -287,26 +362,25 @@ def test_rewritten_file_is_replanned(tmp_path, writer):
     touch_mtime(tmp_path / "a.parquet", delta_seconds=5)
     mark(tmp_path)
 
-    second = source.plan(first.end, source.latest_offset(), BatchLimits())
+    second = consumption.take(source)
     assert relpaths(second) == ["a.parquet"], "a rewritten file is unconsumed"
 
     # And once re-consumed at its new identity, it settles again.
-    third = source.plan(second.end, source.latest_offset(), BatchLimits())
-    assert third.is_empty
+    assert consumption.plan(source).is_empty
 
 
-def test_rewrite_detected_by_mtime_alone(tmp_path, writer):
+def test_rewrite_detected_by_mtime_alone(tmp_path, writer, consumption):
     """Same byte length, different mtime, still a rewrite."""
     write_parquet(writer, tmp_path / "a.parquet", 4)
     mark(tmp_path)
     source = FileSource(tmp_path)
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    consumption.take(source)
 
     size_before = (tmp_path / "a.parquet").stat().st_size
     touch_mtime(tmp_path / "a.parquet", delta_seconds=10)
     assert (tmp_path / "a.parquet").stat().st_size == size_before
 
-    second = source.plan(first.end, source.latest_offset(), BatchLimits())
+    second = consumption.plan(source)
     assert relpaths(second) == ["a.parquet"]
 
 
@@ -344,7 +418,9 @@ def test_ordering_follows_mtime_before_path(tmp_path, writer):
 # -- limits ----------------------------------------------------------------
 
 
-def test_max_files_truncates_and_end_offset_covers_only_included(tmp_path, writer):
+def test_max_files_truncates_and_the_position_covers_only_included(
+    tmp_path, writer, consumption
+):
     names = [f"f{i}.parquet" for i in range(5)]
     for i, name in enumerate(names):
         write_parquet(writer, tmp_path / name, 1)
@@ -352,28 +428,29 @@ def test_max_files_truncates_and_end_offset_covers_only_included(tmp_path, write
     mark(tmp_path)
     source = FileSource(tmp_path, max_files_per_trigger=2)
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.take(source)
     assert relpaths(first) == names[:2]
     assert first.has_more is True
-    assert sorted(consumed(first.end)) == sorted(names[:2]), (
-        "the batch's end offset must cover only the files it actually included; "
-        "checkpointing the whole scan would mark unread files consumed"
+    assert consumption.consumed() == sorted(names[:2]), (
+        "a batch must check point only the files it actually included; "
+        "recording the whole scan would mark unread files consumed"
     )
 
-    second = source.plan(first.end, source.latest_offset(), BatchLimits())
+    second = consumption.take(source)
     assert relpaths(second) == names[2:4]
     assert second.has_more is True
 
-    third = source.plan(second.end, source.latest_offset(), BatchLimits())
+    third = consumption.take(source)
     assert relpaths(third) == names[4:]
     assert third.has_more is False
-    assert sorted(consumed(third.end)) == sorted(names)
+    assert consumption.consumed() == sorted(names)
 
-    fourth = source.plan(third.end, source.latest_offset(), BatchLimits())
-    assert fourth.is_empty
+    assert consumption.plan(source).is_empty
 
 
-def test_batches_partition_the_file_set_exactly_once(tmp_path, writer):
+def test_batches_partition_the_file_set_exactly_once(
+    tmp_path, writer, consumption
+):
     """No gap and no duplication — the property exactly-once rests on."""
     names = [f"f{i:02d}.parquet" for i in range(7)]
     for i, name in enumerate(names):
@@ -382,7 +459,7 @@ def test_batches_partition_the_file_set_exactly_once(tmp_path, writer):
     mark(tmp_path)
     source = FileSource(tmp_path, max_files_per_trigger=3)
 
-    batches = drain(source)
+    batches = drain(source, consumption)
     seen = [rel for batch in batches for rel in batch]
 
     assert len(batches) > 1, "the limit must actually have split the work"
@@ -412,7 +489,7 @@ def test_caller_may_tighten_but_never_loosen_limits(tmp_path, writer):
     assert len(relpaths(unlimited.plan(None, unlimited.latest_offset(), None))) == 6
 
 
-def test_max_rows_per_trigger_on_parquet(tmp_path, writer):
+def test_max_rows_per_trigger_on_parquet(tmp_path, writer, consumption):
     # 40, 40, 40 rows; a 100-row budget takes two files, then the third.
     for i, rows in enumerate((40, 40, 40)):
         path = write_parquet(writer, tmp_path / f"f{i}.parquet", rows)
@@ -420,20 +497,22 @@ def test_max_rows_per_trigger_on_parquet(tmp_path, writer):
     mark(tmp_path)
     source = FileSource(tmp_path, max_rows_per_trigger=100)
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.take(source)
     assert relpaths(first) == ["f0.parquet", "f1.parquet"]
     assert first.payload["row_count"] == 80
     assert first.has_more is True
 
-    second = source.plan(first.end, source.latest_offset(), BatchLimits())
+    second = consumption.take(source)
     assert relpaths(second) == ["f2.parquet"]
     assert second.payload["row_count"] == 40
     assert second.has_more is False
 
-    assert source.plan(second.end, source.latest_offset(), BatchLimits()).is_empty
+    assert consumption.plan(source).is_empty
 
 
-def test_single_oversized_file_still_makes_progress(tmp_path, writer):
+def test_single_oversized_file_still_makes_progress(
+    tmp_path, writer, consumption
+):
     """A file bigger than the whole budget must not wedge the pipeline."""
     big = write_parquet(writer, tmp_path / "big.parquet", 500)
     small = write_parquet(writer, tmp_path / "small.parquet", 1)
@@ -441,18 +520,18 @@ def test_single_oversized_file_still_makes_progress(tmp_path, writer):
     mark(tmp_path)
     source = FileSource(tmp_path, max_rows_per_trigger=10)
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.plan(source)
     assert relpaths(first) == ["big.parquet"]
     assert first.payload["row_count"] == 500
     assert first.has_more is True
 
-    batches = drain(source)
+    batches = drain(source, consumption)
     seen = [rel for batch in batches for rel in batch]
     assert sorted(seen) == ["big.parquet", "small.parquet"]
     assert len(seen) == len(set(seen))
 
 
-def test_file_and_row_limits_compose(tmp_path, writer):
+def test_file_and_row_limits_compose(tmp_path, writer, consumption):
     for i in range(6):
         path = write_parquet(writer, tmp_path / f"f{i}.parquet", 10)
         touch_mtime(path, delta_seconds=i)
@@ -461,17 +540,17 @@ def test_file_and_row_limits_compose(tmp_path, writer):
         tmp_path, max_files_per_trigger=4, max_rows_per_trigger=25
     )
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.plan(source)
     assert relpaths(first) == ["f0.parquet", "f1.parquet"]  # rows bind before files
     assert first.has_more is True
 
-    batches = drain(source)
+    batches = drain(source, consumption)
     seen = [rel for batch in batches for rel in batch]
     assert sorted(seen) == sorted(f"f{i}.parquet" for i in range(6))
     assert len(seen) == len(set(seen))
 
 
-def test_max_rows_is_not_enforced_for_csv(tmp_path):
+def test_max_rows_is_not_enforced_for_csv(tmp_path, consumption):
     """Documented v1 limit: row counts are parquet-only, files still bind."""
     for i in range(4):
         path = write_csv(tmp_path / f"f{i}.csv", 100)
@@ -481,12 +560,12 @@ def test_max_rows_is_not_enforced_for_csv(tmp_path):
         tmp_path, format="csv", max_rows_per_trigger=1, max_files_per_trigger=2
     )
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.plan(source)
     assert relpaths(first) == ["f0.csv", "f1.csv"]
     assert first.payload["row_count"] is None
     assert first.has_more is True
 
-    batches = drain(source)
+    batches = drain(source, consumption)
     seen = [rel for batch in batches for rel in batch]
     assert sorted(seen) == ["f0.csv", "f1.csv", "f2.csv", "f3.csv"]
     assert len(seen) == len(set(seen))
@@ -627,19 +706,25 @@ def test_missing_directory_is_an_empty_batch_not_a_stack_trace(tmp_path):
     assert sorted(consumed(source.latest_offset())) == ["a.parquet"]
 
 
-def test_deleted_file_stays_consumed_and_is_not_replayed(tmp_path, writer):
+def test_deleted_file_stays_consumed_and_is_not_replayed(
+    tmp_path, writer, consumption
+):
+    """A file that vanishes stays consumed. ``CONTEXT.md`` 1.15 is why: the
+    tempting optimisation is to forget entries whose file is gone, and a network
+    mount that blinks then makes every entry look deleted and replays the tree.
+    """
     write_parquet(writer, tmp_path / "a.parquet", 2)
     write_parquet(writer, tmp_path / "b.parquet", 2)
     mark(tmp_path)
     source = FileSource(tmp_path)
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.take(source)
     assert sorted(relpaths(first)) == ["a.parquet", "b.parquet"]
 
     (tmp_path / "a.parquet").unlink()
-    second = source.plan(first.end, source.latest_offset(), BatchLimits())
+    second = consumption.plan(source)
     assert second.is_empty
-    assert "a.parquet" in consumed(second.end)
+    assert "a.parquet" in consumption.consumed()
 
 
 # -- offsets ---------------------------------------------------------------
@@ -869,62 +954,84 @@ POSIX_ONLY = pytest.mark.skipif(
 
 
 @WINDOWS_ONLY
-def test_case_only_rename_is_not_a_second_file(tmp_path, writer):
+def test_case_only_rename_is_not_a_second_file(tmp_path, writer, consumption):
     """On Windows ``A.parquet`` and ``a.parquet`` are one file, so re-reading it
-    would double-count its rows and strand the old key in the offset map."""
+    would double-count its rows.
+
+    Run against both consumed-set shapes deliberately: the map folds case in
+    Python and the table folds it into ``relpath_fold`` and joins on that
+    column, so this is the one behaviour where the two shapes could most easily
+    diverge without any other test noticing.
+    """
     write_parquet(writer, tmp_path / "A.parquet", 3)
     mark(tmp_path)
     source = FileSource(tmp_path)
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.take(source)
     assert relpaths(first) == ["A.parquet"]
 
+    before = (tmp_path / "A.parquet").stat()
     (tmp_path / "A.parquet").rename(tmp_path / "a.parquet")
-    stat = (tmp_path / "a.parquet").stat()
-    assert list(consumed(first.end).values())[0] == {
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-    }, "the rename must not have changed size or mtime, or this proves nothing"
+    after = (tmp_path / "a.parquet").stat()
+    assert (after.st_size, after.st_mtime_ns) == (
+        before.st_size,
+        before.st_mtime_ns,
+    ), "the rename must not have changed size or mtime, or this proves nothing"
 
-    second = source.plan(first.end, source.latest_offset(), BatchLimits())
+    second = consumption.plan(source)
     assert second.is_empty, "a case-only rename is the same bytes, already read"
-    assert len(consumed(second.end)) == 1, "the offset map must not grow"
+    assert consumption.consumed() == ["A.parquet"], (
+        "nothing was read, so nothing may have been recorded"
+    )
 
 
 @WINDOWS_ONLY
-def test_case_only_rename_with_new_content_replaces_the_key(tmp_path, writer):
-    """When the file genuinely changed it is re-planned - under one key, not two."""
+def test_case_only_rename_with_new_content_is_replanned(
+    tmp_path, writer, consumption
+):
+    """When the file genuinely changed it is re-planned, under either shape.
+
+    What the two shapes do with the *old* spelling differs, and the difference
+    is recorded rather than smoothed over. The map deletes it, because two keys
+    for one file is how that map leaked entries it could never reclaim. The
+    table keeps it, because per-trigger deletes cost ~26 ms of tombstone
+    (``CONTEXT.md`` 1.10) to save one row -- and one row is all it is, since the
+    fold join finds the file under either spelling.
+    """
     write_parquet(writer, tmp_path / "A.parquet", 3)
     mark(tmp_path)
     source = FileSource(tmp_path)
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    consumption.take(source)
 
     (tmp_path / "A.parquet").unlink()
     write_parquet(writer, tmp_path / "a.parquet", 40)
     touch_mtime(tmp_path / "a.parquet", delta_seconds=5)
 
-    second = source.plan(first.end, source.latest_offset(), BatchLimits())
+    second = consumption.take(source)
     assert relpaths(second) == ["a.parquet"]
-    assert list(consumed(second.end)) == [
-        "a.parquet"
-    ], "the new spelling replaces the old key rather than joining it"
+    assert consumption.consumed() == (
+        ["a.parquet"] if consumption.shape == "map" else ["A.parquet", "a.parquet"]
+    )
+    assert consumption.plan(source).is_empty, (
+        "whichever spellings are on record, the file is consumed exactly once"
+    )
 
 
 @POSIX_ONLY
-def test_case_variants_are_distinct_files_on_posix(tmp_path, writer):
+def test_case_variants_are_distinct_files_on_posix(tmp_path, writer, consumption):
     """Folding case here would turn a real second file into a silent skip."""
     write_parquet(writer, tmp_path / "A.parquet", 3)
     mark(tmp_path)
     source = FileSource(tmp_path)
 
-    first = source.plan(None, source.latest_offset(), BatchLimits())
+    first = consumption.take(source)
     assert relpaths(first) == ["A.parquet"]
 
     write_parquet(writer, tmp_path / "a.parquet", 4)
     mark(tmp_path)
-    second = source.plan(first.end, source.latest_offset(), BatchLimits())
+    second = consumption.take(source)
     assert relpaths(second) == ["a.parquet"]
-    assert sorted(consumed(second.end)) == ["A.parquet", "a.parquet"]
+    assert consumption.consumed() == ["A.parquet", "a.parquet"]
 
 
 def test_fold_follows_the_platform():

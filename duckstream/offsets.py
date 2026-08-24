@@ -15,13 +15,33 @@ and a checkpoint row does not churn when nothing has changed.
 The file offset shape
 ---------------------
 
-::
+There are two, and which one a stored offset uses says where its consumed set
+lives::
 
+    v2, what duckstream writes now:
+    {"kind": "file", "v": 2, "entries": 41230}
+
+    v1, still readable so it can be migrated:
     {"kind": "file", "v": 1,
      "consumed": {"<relative/path>": {"size": 123, "mtime_ns": 456}}}
 
-This is a **consumed-file map, not a high-water mark**, and the difference is
-load bearing:
+**v2 carries no set.** The consumed files are rows in
+``duckstream.consumed_files`` (see :mod:`duckstream.consumed`), because
+``CONTEXT.md`` 1.15 and 1.16 measured v1's map at **45.7 MB encoded after a year
+at one file a minute, rewritten in full on every trigger** -- 7.97 MB reaching
+the disk each time, ~11.2 GB of writes a day, and the largest single obstacle to
+running duckstream unattended on a Pi. As rows it is 4.9 KB a trigger. ``entries``
+is a count carried forward from the previous checkpoint: it moves so the
+engine's stalled-loop guard has something to compare, and it is a report, never
+the authority. The table is the authority.
+
+:meth:`FileOffset.consumed` therefore **refuses** a v2 offset rather than
+returning an empty map. Answering "nothing has been consumed" would replay the
+whole landing tree and fold every row a second time, which is precisely the
+silent wrong answer this framework exists to remove.
+
+Both shapes describe a **consumed-file set, not a high-water mark**, and that
+difference is load bearing:
 
 * Replay is exact. Re-planning from a stored offset yields precisely the files
   that were never consumed, so a crash mid-batch cannot skip a file that landed
@@ -53,20 +73,20 @@ turn a real second file into a *skip* — losing data, which is strictly worse
 than reading twice. So the fold follows the filesystem rather than picking one
 answer for both.
 
-Known v1 limit
---------------
+The v1 limit, and why the obvious fix was not taken
+---------------------------------------------------
 
-The consumed map **grows with the number of files ever consumed**. For a landing
-directory that is drained and pruned this is bounded by the retention window,
-but for an append-only tree it grows without limit, and the whole map is
-rewritten on every checkpoint.
+v1's map grew with the number of files ever consumed and was rewritten whole on
+every checkpoint. :data:`FileOffset.HIGH_WATER_KEY` (``"high_water_mtime_ns"``)
+was reserved for collapsing old entries behind a mark, and that is the fix that
+was **not** taken: it bounds the map, and it also makes a file arriving with an
+mtime older than the mark disappear without a word. The key stays reserved and
+unused, and remains a key a reader must tolerate the absence of.
 
-The fix is pruning: once every file older than some mtime is known to have been
-consumed, those entries collapse into a single high-water mark and only files
-newer than it need individual tracking. The key :data:`FileOffset.HIGH_WATER_KEY`
-(``"high_water_mtime_ns"``) is **reserved for that** and is deliberately unused
-in v1 — readers must tolerate its absence, and a future writer that sets it must
-bump ``v``.
+What replaced it is :mod:`duckstream.consumed` — the set as rows, so the
+checkpoint stops carrying it at all. The one thing that had to survive the
+change is stated at the top: a v2 offset is not an empty v1 offset, and asking
+it for a consumed map is an error rather than a silence.
 """
 
 from __future__ import annotations
@@ -174,11 +194,27 @@ class FileOffset:
     """
 
     KIND = "file"
-    VERSION = 1
+
+    #: The shape that carries its consumed set inside itself. Still read, so a
+    #: catalog written by an earlier duckstream migrates instead of replaying.
+    MAP_VERSION = 1
+
+    #: The shape that keeps its set in ``duckstream.consumed_files`` and carries
+    #: only a count. What :meth:`rows` writes and what every commit now stores.
+    ROWS_VERSION = 2
+
+    #: Highest version this duckstream can read. A stored offset above it is
+    #: refused rather than guessed at.
+    VERSION = ROWS_VERSION
 
     KIND_KEY = "kind"
     VERSION_KEY = "v"
     CONSUMED_KEY = "consumed"
+
+    #: v2's payload: how many consumption records exist for this model. A
+    #: report and an advance marker, never the authority -- see the module
+    #: docstring.
+    ENTRIES_KEY = "entries"
 
     #: Reserved for the pruning described in the module docstring. Unused in v1;
     #: a writer that starts setting it must bump :attr:`VERSION`.
@@ -200,8 +236,35 @@ class FileOffset:
         return FileOffset.build({})
 
     @staticmethod
+    def rows(entries: int) -> Offset:
+        """A v2 checkpoint: the set is in the table, this is the count of it.
+
+        ``entries`` counts consumption *records*, not distinct paths, so it
+        rises by one for a file rewritten in place as well as for a new one.
+        That is deliberate — it is what makes it strictly increase on every
+        committed batch, which the engine's stalled-loop guard relies on.
+        """
+        count = int(entries)
+        if count < 0:
+            raise DuckstreamError(
+                f"a file offset cannot have consumed {count} entries; the count "
+                f"only ever advances, so a negative value means it was computed "
+                f"from something other than the previous checkpoint"
+            )
+        return {
+            FileOffset.KIND_KEY: FileOffset.KIND,
+            FileOffset.VERSION_KEY: FileOffset.ROWS_VERSION,
+            FileOffset.ENTRIES_KEY: count,
+        }
+
+    @staticmethod
     def build(consumed: Mapping[str, Mapping[str, Any]]) -> Offset:
-        """Assemble a file offset from a consumed map.
+        """Assemble a **v1** file offset from a consumed map.
+
+        Still the shape :meth:`~duckstream.sources.files.FileSource.latest_offset`
+        returns, and that is not a leftover: what is *on disk right now* really
+        is a map, it is never checkpointed, and it never leaves the pair of
+        calls that plan a batch. What gets stored is :meth:`rows`.
 
         Values are normalised to exactly ``{"size": int, "mtime_ns": int}`` so
         that an offset built here and one decoded from the state store encode
@@ -216,7 +279,7 @@ class FileOffset:
             normalised[relpath] = FileOffset._normalise_entry(relpath, entry)
         return {
             FileOffset.KIND_KEY: FileOffset.KIND,
-            FileOffset.VERSION_KEY: FileOffset.VERSION,
+            FileOffset.VERSION_KEY: FileOffset.MAP_VERSION,
             FileOffset.CONSUMED_KEY: normalised,
         }
 
@@ -262,14 +325,56 @@ class FileOffset:
     def consumed(offset: Offset | None) -> dict[str, FileEntry]:
         """The consumed map, as a fresh mutable dict. ``None`` means empty.
 
+        Only a **v1** offset has one. A v2 offset keeps its set in
+        ``duckstream.consumed_files``, so this refuses rather than answering
+        ``{}`` — see :meth:`version_of`.
+
         Raises:
-            DuckstreamError: if ``offset`` is not a file offset, or was written
-                by a newer duckstream. Failing loudly on an unreadable offset is
-                deliberate — silently treating it as empty would replay the
-                entire landing tree.
+            DuckstreamError: if ``offset`` is not a file offset, was written by
+                a newer duckstream, or is a v2 offset whose set is elsewhere.
+                Failing loudly on an unreadable offset is deliberate — silently
+                treating it as empty would replay the entire landing tree.
         """
         if offset is None:
             return {}
+        version = FileOffset.version_of(offset)
+        if version >= FileOffset.ROWS_VERSION:
+            raise DuckstreamError(
+                f"this file offset (v{version}) does not carry a consumed map: "
+                f"its consumed files are rows in the state store's "
+                f"{__name__.rsplit('.', 1)[0]}.consumed_files table, because "
+                f"carrying them here cost 7.97 MB of writes per trigger after a "
+                f"year (CONTEXT.md 1.16). Ask the consumed-file index instead of "
+                f"the offset. Returning an empty map here would look like a "
+                f"model that has consumed nothing and replay the whole landing "
+                f"tree."
+            )
+        raw = offset.get(FileOffset.CONSUMED_KEY, {})
+        if not isinstance(raw, Mapping):
+            raise DuckstreamError(
+                f"file offset {FileOffset.CONSUMED_KEY!r} must be an object, got "
+                f"{type(raw).__name__}"
+            )
+        return {
+            relpath: FileOffset._normalise_entry(relpath, entry)
+            for relpath, entry in raw.items()
+        }
+
+    @staticmethod
+    def version_of(offset: Offset | None) -> int:
+        """Which file-offset shape ``offset`` is, validated. ``None`` is v2.
+
+        A missing offset reports the **current** version rather than v1: a model
+        that has never committed starts on the shape duckstream writes today,
+        and reporting v1 would send a fresh model down the migration path.
+
+        Raises:
+            DuckstreamError: if it is not a file offset at all, or names a
+                version this duckstream cannot read. Both are refusals rather
+                than guesses, because every wrong guess here re-reads data.
+        """
+        if offset is None:
+            return FileOffset.ROWS_VERSION
         if not isinstance(offset, Mapping):
             raise DuckstreamError(
                 f"expected a file offset object, got {type(offset).__name__}: "
@@ -289,16 +394,28 @@ class FileOffset:
                 f"understands (v{FileOffset.VERSION}). Upgrade duckstream rather "
                 f"than resetting the checkpoint, which would replay everything."
             )
-        raw = offset.get(FileOffset.CONSUMED_KEY, {})
-        if not isinstance(raw, Mapping):
-            raise DuckstreamError(
-                f"file offset {FileOffset.CONSUMED_KEY!r} must be an object, got "
-                f"{type(raw).__name__}"
-            )
-        return {
-            relpath: FileOffset._normalise_entry(relpath, entry)
-            for relpath, entry in raw.items()
-        }
+        return version
+
+    @staticmethod
+    def entry_count(offset: Offset | None) -> int:
+        """How many consumption records ``offset`` says exist behind it.
+
+        Defined for both shapes so a v1 offset migrates to a v2 one whose count
+        is right from the first batch rather than restarting at zero. For v1
+        that means the size of its map; for v2 the number it carries.
+        """
+        version = FileOffset.version_of(offset)
+        if offset is None:
+            return 0
+        if version >= FileOffset.ROWS_VERSION:
+            raw = offset.get(FileOffset.ENTRIES_KEY, 0)
+            if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+                raise DuckstreamError(
+                    f"file offset {FileOffset.ENTRIES_KEY!r} must be a "
+                    f"non-negative integer, got {raw!r}"
+                )
+            return raw
+        return len(FileOffset.consumed(offset))
 
     @staticmethod
     def fold(relpath: str) -> str:

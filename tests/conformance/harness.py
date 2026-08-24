@@ -639,11 +639,18 @@ class World:
             return lakemod.data_file_count(con, ALIAS, self.scenario.table)
 
     def offset_files(self) -> list[str]:
-        """Relative paths the committed offset records as consumed."""
+        """Relative paths the catalog records as consumed.
+
+        From the rows rather than the offset -- see :func:`_offset_at`.
+        """
         with self.connect() as con:
             store = DuckLakeStateStore(STATE_SCHEMA, catalog=ALIAS)
-            offset = store.load_offset(con, self.scenario.name)
-        return sorted((offset or {}).get("consumed", {}))
+            rows = con.execute(
+                f"SELECT DISTINCT relpath FROM {store.consumed_files_table} "
+                f"WHERE model_name = ?",
+                [self.scenario.name],
+            ).fetchall()
+        return sorted(row[0] for row in rows)
 
     def quarantined(self) -> list[dict[str, Any]]:
         """Batches this world gave up on, straight from the catalog."""
@@ -773,26 +780,32 @@ def _fetch_mart(
 
 
 def _offset_at(con: Any, store: DuckLakeStateStore, model: str, sid: int) -> list[str]:
-    """Files the committed offset covered as of snapshot ``sid``.
+    """Files the catalog had consumed as of snapshot ``sid``.
 
-    The offsets table lives in the same catalog as the mart, which is not an
+    Read from ``duckstream.consumed_files``, not from the offset. The offset
+    stopped carrying the set in phase 4 (``CONTEXT.md`` 1.15) and now carries a
+    count, so asking it would answer nothing at all -- and the *rows* are what
+    the next ``plan`` consults, which makes them the right thing to walk history
+    against in the first place.
+
+    The consumed rows live in the same catalog as the mart, which is not an
     implementation detail: ``CONTEXT.md`` 1.9 measured that one transaction
-    cannot write two attached databases, so the offset *has* to share the
-    snapshot with the rows it checkpoints. That is what makes this query
+    cannot write two attached databases, so the position *has* to share its
+    snapshot with the rows it check points. That is what makes this query
     meaningful -- both sides of the comparison are read at the same instant of
-    catalog history.
+    catalog history, and a batch that wrote output without recording what it
+    read would show up here as a mart ahead of its own source list.
     """
     sql = (
-        f"SELECT offset_json FROM {store.offsets_table} AT (VERSION => {int(sid)}) "
-        f"WHERE model_name = ? ORDER BY batch_id DESC LIMIT 1"
+        f"SELECT DISTINCT relpath "
+        f"FROM {store.consumed_files_table} AT (VERSION => {int(sid)}) "
+        f"WHERE model_name = ?"
     )
     try:
-        row = con.execute(sql, [model]).fetchone()
+        rows = con.execute(sql, [model]).fetchall()
     except duckdb.Error:
         return []
-    if not row or not row[0]:
-        return []
-    return sorted(json.loads(row[0]).get("consumed", {}))
+    return sorted(row[0] for row in rows)
 
 
 def _recompute(
