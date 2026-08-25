@@ -20,8 +20,14 @@ These are the load-bearing numbers. **If one conflicts with your intuition, trus
 the number or re-measure it — do not reason around it.** §1.8, §1.9 and §1.10
 were measured during the phase-1 build; §1.11 during phase 2; §1.16 during phase
 4, where it corrected two figures in §1.15 that had been *derived* rather than
-measured. "Trust the number" means the measured one — a number computed from
-another number is an argument, and §1.16 is what happens when one is checked.
+measured; §1.17, §1.18 and §1.19 during phase 3's tier three. "Trust the number" means
+the measured one — a number computed from another number is an argument, and
+§1.16 is what happens when one is checked.
+
+**§1.17 is the one to read if you are short of time.** It is §1.10's rule in a
+fifth disguise, and it caught a design that was about to be written the obvious
+way: the obvious encoding of "unknown" is NULL, and NULL turns the index that
+removes an O(n) scan back into an O(n) scan.
 
 ### 1.1 The memory ceiling is DuckDB's buffer manager, not Python
 
@@ -261,7 +267,35 @@ is the measured justification for phase 4.
 | write two attached databases in one transaction | **`TransactionContext Error`** |
 | write one attached database in one transaction | OK |
 
-**Conclusion.** DuckDB will not span a transaction across attached databases.
+**Conclusion.** DuckDB will not span a transaction across attached databases —
+**for data writes**, which is what was measured here and all that was measured.
+
+**Re-measured during tier three, because the codebase had quietly widened it.**
+`engine.py` extended this constraint to `CREATE TEMP VIEW` and stated that
+binding a view inside the transaction would raise `TransactionContext Error`.
+That sentence had never been executed. It is false: inside one DuckLake
+transaction, a temp view, a temp table, and even a `DROP VIEW` all succeed
+alongside inserts and deletes, in either order.
+
+| Inside one DuckLake transaction | Result |
+|---|---|
+| temp view, then `INSERT` into the lake | OK |
+| `INSERT` into the lake, then temp view | OK |
+| temp view over `read_parquet`, then `INSERT ... SELECT` from it | OK |
+| several temp views + `DELETE` + `INSERT` (a multi-chunk recompute) | OK |
+| `DROP VIEW` inside the transaction | OK |
+| `CREATE TEMP TABLE`, then `INSERT` into the lake | OK |
+
+The distinction is *rows*, not *catalogs in the statement*: `temp` is not a
+second write target in the sense this section measured.
+
+**Consequence.** Tier three depends on the true version — a recompute cannot
+bind its views before the transaction opens, because which files it reads is
+decided by data read inside it. Binding the ordinary *batch* view early remains
+right, but as a preference (keep the transaction short) rather than a
+requirement. And this is the fourth time a claim in this project turned out to
+be an argument wearing a measurement's clothes; §1.15's derived GB/day and
+§1.2's never-run import line were the others.
 
 **Consequence — this is load-bearing for the whole exactly-once claim.** The sink
 and the state store must live in **the same** catalog, which means both inside
@@ -662,6 +696,226 @@ at all. Any test of identity must use a scan spanning more than one mtime.
 still phase 4's business — but it is now a cost problem rather than a
 write-endurance one.
 
+### 1.17 A NULL "unknown" defeats file pruning: encode it as infinity
+
+**Method.** The tier-three file → time-range index (1.13) has to answer *"which
+consumed files can hold a row in `[lo, hi)`?"*, and its contract is that a file
+it cannot place must be **selected**, never skipped. Two encodings of that same
+rule were timed against a real DuckLake `consumed_files` table at three sizes,
+five repetitions, median, `threads=2`, with the rows written **one insert per
+trigger** — which is duckstream's actual layout, because inlining is off (1.7)
+and every trigger writes its own small parquet file:
+
+```
+A   WHERE min_ts IS NULL OR max_ts IS NULL OR (max_ts >= lo AND min_ts < hi)
+B   WHERE max_ts >= lo AND min_ts < hi                    -- skips unknowns: wrong
+C   WHERE max_ts >= lo AND min_ts < hi, unknown stored as [-inf, +inf]
+```
+
+| Consumed files | A — disjunction | B — bare range | C — sentinel |
+|---|---|---|---|
+| 168 | 14.4 ms | 9.4 ms | 7.3 ms |
+| 720 | 42.9 ms | 7.9 ms | 10.4 ms |
+| 2,160 | **117.5 ms** | **8.9 ms** | **12.1 ms** |
+
+**Conclusion.** The disjunction is **O(files ever consumed)** and the plain
+conjunctive range is flat. `IS NULL OR ...` is not a predicate DuckLake can
+prune data files on, so every one of the table's per-trigger parquet files is
+opened — which is 1.13's ~0.1 ms per file arriving a second time, in the very
+index built to remove it. Written as one bulk insert instead, A measures 4.2 ms
+flat, which confirms the cause is the disjunction meeting the many-small-files
+layout rather than the row count.
+
+C's mild growth is the design working: the unknown rows planted in it grow
+linearly (4 → 44) and are genuinely selected every time.
+
+**Consequence.** An unmeasured file is stored at `[-infinity, +infinity]` — in
+Python, `datetime.min` and `datetime.max`. This is not a trick standing in for
+NULL. *"This file may contain a row at any time"* is a true statement about a
+file nobody has measured, and stating it that way makes the widest answer fall
+out of the ordinary comparison instead of needing a special case that a reader
+of the SQL can forget to write. Same reasoning as 1.16's probe window: a
+deduction, not a heuristic.
+
+**Also verified**, because the sentinel has to survive three different writers
+and a round trip: a SQL `TIMESTAMP '-infinity'` literal, a Python
+`datetime.min` bound parameter and a `pyarrow` `timestamp('us')` column all
+store and read back as exactly `datetime.min` / `datetime.max`, unchanged after
+a `CHECKPOINT`. And `ALTER TABLE ... ADD COLUMN ... DEFAULT TIMESTAMP
+'-infinity'` is **refused** by DuckLake — *"we cannot add a column with a
+non-literal default value"* — so an upgraded catalog is backfilled with an
+explicit `UPDATE`, measured at 44 ms over 1,000 rows and 109 ms over 100,000,
+paid once per catalog. Leaving those rows NULL would silently narrow every
+recompute after an upgrade, which is section 4's bug class arriving as an
+upgrade note.
+
+### 1.18 Per-file bounds cost 1.4–6.7 ms a batch, and `filename` is free
+
+**Method.** The index needs `(min, max, rows)` per consumed file. Two ways to
+get them were timed over one parquet corpus, best of nine, median, `threads=2`:
+a grouped scan using `read_parquet`'s `filename` pseudo-column, and the footer
+statistics from `parquet_metadata`.
+
+| Batch | `observe()` scan (1.11) | bounds scan | plain scan, `filename=false` | …`filename=true` |
+|---|---|---|---|---|
+| 1 file, 2 k rows | 0.61 ms | **1.41 ms** | 0.48 ms | **0.51 ms** |
+| 10 files, 20 k rows | 1.84 ms | **3.14 ms** | 1.49 ms | **1.50 ms** |
+| 40 files, 80 k rows | 5.64 ms | **6.69 ms** | 4.36 ms | **4.42 ms** |
+
+At a 240-file corpus the footer route is 21.6 ms against the grouped scan's
+34.6 ms — 1.6x cheaper.
+
+**Conclusion, and the footer route is rejected despite winning.** It returns
+`stats_min_value` as **VARCHAR**, so every bound would be re-parsed from
+DuckDB's rendering of the column's logical type. A timestamp reconstructed from
+a string is precisely the "plausible wrong number" this framework exists to
+remove, and it would be wrong in the direction that *narrows* — a file excluded
+from a recompute that should have been read. It is also parquet-only, while the
+file source reads CSV and JSON too. 1.6x is not worth buying that with.
+
+`filename=true` is **free** (0.51 ms against 0.48 ms, inside the noise) and
+verified working on `read_parquet`, `read_csv` and `read_json`, echoing back the
+exact path string it was handed — which is what the mapping to relative paths
+depends on.
+
+**Consequence.** One grouped scan per batch, `SELECT filename, min(ts), max(ts),
+count(ts) ... GROUP BY filename`, and the row count rides along for nothing.
+Charged **only to models that will be recomputed**: 1.4 ms on a one-file batch
+is not a rounding error against 1.8's ~15 ms committing trigger, and a tier-one
+model would be paying it to build an index nothing reads. A model that becomes
+tier three later therefore has unmeasured rows behind it, and 1.17's sentinel is
+what makes that safe rather than merely tolerable — those files are read by
+every recompute instead of by none.
+
+### 1.19 A recompute costs ~17 ms plus ~0.14 ms per file in the window
+
+**Method.** The recompute *step* in isolation — select the window's files, read
+them, aggregate, clear the range, insert — inside one transaction against a real
+DuckLake catalog, at six window sizes, median of nine, `threads=2`. Isolated
+rather than measured through a whole trigger on purpose: a first attempt timed
+`engine.run()` end to end and every variant landed between 130 and 165 ms with
+tier three sometimes *below* tier one, because the trigger's own fixed costs
+swamped the difference. That number is not reported, because it does not measure
+what it appears to.
+
+| Files in the window | Rows | Clear + re-insert |
+|---|---|---|
+| 1 | 200 | 17.5 ms |
+| 10 | 2,000 | 19.2 ms |
+| 50 | 10,000 | 24.3 ms |
+| 100 | 20,000 | **31.3 ms** |
+
+**Conclusion.** An intercept of ~17.5 ms and a slope of **~0.14 ms per file**.
+The intercept is 1.8's commit floor, which a recompute pays like any other
+write. The slope is 1.13's ~0.1 ms per file open plus the cost of actually
+reading 200 rows out of each — so the two measurements agree, taken three phases
+apart by different methods.
+
+**Consequence, and it is the sentence to quote when somebody asks why their
+recompute got slower.** A tier-three trigger's cost is a function of the
+**window** it recomputes, not of the batch that touched it. A one-row batch
+landing in an hour fed by a hundred files pays for a hundred files. The lever is
+a finer `grain`, or fewer files per window — which is retention and compaction,
+phase 4 — and emphatically *not* a smaller `max_files_per_trigger`, which makes
+it worse by recomputing the same window more often.
+
+### 1.20 The landing-tree scan was 81% Python, not filesystem — now 3–9x faster
+
+**Method.** `FileSource.latest_offset()` against real landing trees, profiled
+with `cProfile`, then old and new implementations timed **interleaved** — one of
+each in turn — and asserted to return byte-identical results before either was
+timed.
+
+**The first attempt at this section reported per-file constants across tree
+sizes and concluded "minutes per trigger". Those numbers are withdrawn.** They
+were taken one configuration after another rather than interleaved, and a later
+run disagreed with them by **7x on the same tree and the same shape**. §1.11
+already says to interleave anything on this box that takes minutes; the first
+pass did not, and the conclusion it reached was about this machine's mood.
+What follows is what survives that correction.
+
+**What the profile says, and a profile is a ratio within one run, so drift
+cannot flatter it.** At 2,000 files:
+
+```
+bare os.stat() loop        4.7 us per file
+latest_offset()           24.3 us per file
+                          ---------------
+overhead above the syscall  81% of total
+```
+
+The top entries were `ntpath.normcase` — **160,000 calls for 2,000 files** — and
+`ntpath.relpath`, reached from `FileOffset.relative_path` once per file. At one
+file per directory, `nt.scandir` was called **twice per directory**: once inside
+`os.walk` and once again to list the files it had just read.
+
+So the scan was not I/O-bound at all. It was rebuilding path strings.
+
+**The fix, and it is a pure optimisation.** One `scandir` per directory; the
+relative prefix carried down the walk instead of recomputed per file; size and
+mtime taken from the `DirEntry` the walk already fetched; the completion
+marker's stat taken from the same listing. Interleaved, nine repetitions,
+median, with the two implementations asserted equal first:
+
+| Files | Per directory | Before | After | |
+|---|---|---|---|---|
+| 2,000 | 100 | 59.5 ms | 7.0 ms | **8.5x** |
+| 2,000 | 1 | 220.2 ms | 72.1 ms | **3.0x** |
+| 5,000 | 50 | 147.7 ms | 16.3 ms | **9.0x** |
+
+**Tree shape matters, which the withdrawn version denied.** At one file per
+directory — duckstream's real shape, one drop per trigger — the per-*directory*
+work dominates and the win is 3x; where a directory holds several files it is
+8–9x. Both are worth having and neither is the whole answer.
+
+**Consequence.** This is CPU, not I/O, so it transfers to a Pi *better* than a
+DuckDB measurement would: a Pi's cores are slower than this box's, so Python
+path manipulation costs it more, while `stat` on local storage is comparable.
+That is the opposite of the usual caveat and worth stating plainly.
+
+**What is still not measured.** The absolute cost at a year of files (525,600),
+on either machine. The scan remains **linear in ready files** and is still paid
+on every trigger including idle ones, so bounding the number of files — the
+retention half of phase 4 — is still the structural fix and this is a constant
+factor in front of it. Quoting a projected per-trigger figure for a year is
+exactly what the withdrawn version got wrong; measure it on the target, in
+phase 6's soak, or not at all.
+
+---|---|---|---|
+| 100 | 100 | 15.4 ms | 154 µs |
+| 1,000 | 1,000 | 139.6 ms | 140 µs |
+| 5,000 | 5,000 | 2,455.9 ms | 491 µs |
+| 20,000 | 20,000 | 8,581.0 ms | 429 µs |
+| 50,000 | 50,000 | **23,460 ms** | 469 µs |
+
+Same 2,000 files, three shapes: **322 ms** at one file per directory, **251 ms**
+at ten, **353 ms** at a hundred. And doubling the directories doubles the time
+(1.96x, 2.02x, 2.52x).
+
+**Conclusion.** The walk is **linear in files and near-indifferent to tree
+shape** — it is the per-file `stat` that costs, not the directory traversal. The
+constant is **~0.15–0.5 ms per ready file**, which is **1.4x to 5x** what
+`PLAN.md` assumed when it carried 1.13's ~0.1 ms across to this walk. 1.13
+measured *DuckDB opening a parquet footer*; this is `os.walk` plus a `stat` plus
+a glob match, and the two constants are not the same number. Carrying one across
+to the other is the derived-figure mistake 1.15 made, in a new place.
+
+**Consequence, and it is worse than phase 4 was scoped for.** At one file a
+minute for a year — 525,600 ready files — this is **minutes per trigger**, and
+it is paid on *every* trigger including idle ones, because the scan is how the
+source learns there is nothing to do. It dwarfs every other number in this
+document: 1.16 took the commit from 1,078 ms to 13.8 ms, and this would sit at
+four minutes in front of it.
+
+**It is also not fixed by retention alone.** The cost is per *ready* file, and
+every already-consumed file is re-`stat`ed on every trigger purely so the
+anti-join can discard it. Retention bounds the tree; making the scan skip what
+it has already consumed would bound the *work*, and the two are different
+levers. Note that 1.15's forbidden shortcut is specifically a high-water **mtime
+mark**, because a file may arrive with an older mtime — a directory-level rule
+gated on the completion marker is a different proposition and has not been
+measured or ruled out.
+
 ---
 
 ## 2. Researched constraints
@@ -896,7 +1150,7 @@ Do not re-litigate these without new evidence.
 | Attempt accounting | **Only failures that fail cleanly spend an attempt.** A hard kill records nothing. | A crash-looping deployment must not be able to quarantine its own data; infrastructure trouble is not bad data. |
 | Lateness horizon | **Opt-in per model** (`lateness`), and it is what turns a model on to event time. Without it there is no watermark, every window stays open forever, and nothing is ever dropped — which is exactly phase-1 behaviour. | A horizon is a claim about the data, not a default anyone can pick correctly on a user's behalf. Making it opt-in also means the phase-1 path keeps costing what it cost (§1.11), so event time is paid for only by models that asked for it. |
 | Windowed `append` | **Requires a horizon**, refused at load without one. Each window is folded in an open-window accumulator beside the target and written to the target **once**, when the watermark passes its end. | Phase 1 accepted `append` with a `grain` and wrote one *partial* row per window per batch. That equals the truth only when no two batches ever touch the same window — a condition the user cannot enforce and the engine never checked. It is the §4 bug class in the one place the framework had left it, so phase 2 refuses it and offers the correct mechanism instead. |
-| Rows outside the horizon | **Dropped and counted**, durably, in `duckstream.batches`. Late rows (`rows_late`) and rows with no event time (`rows_undated`) are counted apart. | `PLAN.md` requires "dropped **and counted**, never silently absorbed", and a count that lives only in a return value or a rotated log has not been counted. Late and undated are separated because "arriving later than declared" and "carrying no timestamp" are different operational problems with different fixes. |
+| Rows outside the horizon | **Dropped and counted**, durably, in `duckstream.batches`. Late rows (`rows_late`) and rows with no event time (`rows_undated`) are counted apart. A **tier-three** model counts `rows_undated` even with no horizon: a recompute is scoped by a window range and no `[lo, hi)` contains NULL, so a row belonging to no window is dropped where a tier-one model would fold it into a NULL window — a real divergence from a full recompute, and therefore one that must be reported rather than absorbed. | `PLAN.md` requires "dropped **and counted**, never silently absorbed", and a count that lives only in a return value or a rotated log has not been counted. Late and undated are separated because "arriving later than declared" and "carrying no timestamp" are different operational problems with different fixes. |
 
 ### Why foldability is the thing worth building
 

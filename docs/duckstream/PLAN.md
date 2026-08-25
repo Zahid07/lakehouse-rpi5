@@ -285,31 +285,47 @@ From constraint 1: bound rows, not UDF cost.
      lock is advisory, portable (no `fcntl`), and breaks a lock whose owner is
      provably dead on this host.
 
-3. **Foldability.** All three tiers with load-time validation and the rejection
-   path. Arrow-mode UDF helpers for tier three. Window-range chunking sized from
-   estimated rows.
+3. **Foldability. Done.** All three tiers execute, with load-time validation and
+   the rejection path. Arrow-mode UDF helpers for tier three (`udf.py`).
+   Window-range chunking sized from estimated rows.
 
-   **Where a tier-three recompute reads from is settled by measurement, not
+   **Where a tier-three recompute reads from was settled by measurement, not
    preference.** It re-derives a whole window from source, and those rows are in
    files consumed long ago — still on disk and still identifiable, because the
    position keeps a consumed-file *set* rather than a high-water mark — rows in
    `duckstream.consumed_files` since phase 4, which is where the time-range index
-   below now belongs. But
+   below now lives. But
    constraint 13 measured that handing DuckDB the whole list with a time
    predicate costs **~0.1 ms per file listed whether it is read or not**: the
    footer still has to be opened to decide. At one file per trigger on a
    one-minute schedule that is 525,000 files a year, and on a Pi the cost is
    small random I/O, which SD and USB storage are worst at.
 
-   So tier three needs a **file → time-range index**, built as a *hint* rather
+   So tier three has a **file → time-range index**, built as a *hint* rather
    than as truth: it only ever narrows, it never removes entries, and anything
-   it cannot answer confidently falls back to the whole list. Correctness then
-   never depends on it and only cost does — over-selecting reads extra files and
+   it cannot place is selected rather than skipped. Correctness therefore never
+   depends on it and only cost does — over-selecting reads extra files and
    still gets the right answer, while under-selecting would be silently wrong,
-   which is the one outcome this framework refuses. It is close to free to
-   build: the engine already scans each bound batch once for the watermark, so
-   grouping that pass by `read_parquet`'s `filename` pseudo-column yields
-   per-file bounds with no extra I/O.
+   which is the one outcome this framework refuses. It is `min_ts`, `max_ts` and
+   `n_rows` beside `relpath` on `duckstream.consumed_files`, and selection is
+   `WHERE max_ts >= lo AND min_ts < hi`.
+
+   **Two things this section predicted turned out to be wrong, and constraints
+   17 and 18 are the measurements.** *"With no extra I/O"* was optimistic: the
+   watermark scan cannot supply per-file bounds, because it runs only for a
+   model with a lateness horizon and reads a view with no `filename` column. It
+   is a second grouped scan, 1.4 ms on a one-file batch and 6.7 ms at forty, and
+   it is charged only to models that will be recomputed. And *"falls back"* is
+   the wrong shape for the answer: expressed as `min_ts IS NULL OR ...` the
+   fallback destroys DuckLake's file pruning and puts the whole O(n) scan back —
+   118 ms against 2,160 consumed files. An unmeasured file is stored at
+   `[-infinity, +infinity]` instead, which is true rather than a workaround and
+   needs no disjunction.
+
+   The write is a **clear-then-insert over the window range**, not a merge. A
+   recompute produces the complete truth for its range, so a key that no longer
+   has source rows has to disappear — and a `MERGE` cannot express that, it
+   updates what it finds and silently leaves the rest looking current.
 4. **Maintenance and small files.** Because inlining is off, every trigger writes
    a parquet file — so compaction is part of the framework, not an operator
    chore. A maintenance model running `ducklake_merge_adjacent_files`,
@@ -344,10 +360,47 @@ From constraint 1: bound rows, not UDF cost.
    every entry looks deleted, and the next good scan re-reads the whole landing
    directory.
 
-   **What is still open is the number of files.** `latest_offset()` walks the
-   whole landing tree every trigger and constraint 13's ~0.1 ms per file listed
-   applies to that walk. Retention at the source is the lever. It is now a speed
-   problem rather than a write-endurance one, which is a different priority.
+   **What is still open is the number of files, and the walk over them is now
+   3-9x cheaper.** `latest_offset()` walks the whole landing tree on every
+   trigger, including idle ones. This section used to say constraint 13's
+   ~0.1 ms per file applied to that walk; constraint **20** measured it and the
+   carry-across was wrong in both directions. 13 measured *DuckDB opening a
+   parquet footer*, which is not `os.walk` plus a `stat` plus a glob match.
+
+   What the profile found was that the walk was not I/O-bound at all: **81% of
+   it was Python path manipulation** above a 4.7 us `stat`, with
+   `ntpath.normcase` called 160,000 times for 2,000 files and every directory
+   `scandir`-ed twice. Fixed — one `scandir` per directory, the relative prefix
+   carried down the walk instead of recomputed per file, and size/mtime read off
+   the `DirEntry` the walk already fetched. Measured interleaved and asserted
+   to return identical results: **8.5x** where a directory holds several files,
+   **3.0x** at one file per directory, which is duckstream's real shape.
+
+   That is a constant factor, not a fix. The scan is still **linear in ready
+   files** and still paid on every trigger, so **retention at the source remains
+   the structural lever** and is still the next item. Two shortcuts stay
+   forbidden, above.
+
+   **And tier three added a third condition that did not exist when this phase
+   was written.** A `recompute_window` model reads consumed files *back* — that
+   is the whole of how it works — so a file is safe to remove from the landing
+   tree only when:
+
+   1. every model reading that tree has consumed it; **and**
+   2. no tier-three model can still be asked to recompute a window the file
+      contributes to.
+
+   Condition 2 is only knowable **past a lateness horizon**. With one, a sealed
+   window is final: late rows are filtered out before planning, so no later
+   arrival can reopen it. Without one, any row can arrive for any window at any
+   time, so *no* file is ever provably safe and retention has no floor to stand
+   on. Deleting anyway would not fail — the recompute would read the files that
+   remain and write a window built from part of its data, which is section 4's
+   bug class produced by the maintenance meant to bound growth.
+
+   So retention on a tree feeding a tier-three model has to refuse without a
+   horizon, or bound itself by one. That is a decision for whoever builds it;
+   what is not open is whether the interaction exists.
 
    Three further items belong here, deferred from the phase-2b sweep because
    they are data-lifecycle concerns rather than failure-handling ones:
@@ -564,7 +617,17 @@ Correctness:
   recompute from source, under interleaved batches, out-of-order arrival, re-runs,
   late arrival within the horizon, and NULL grouping keys.
 - **Chunked equals unchunked.** Byte-identical output at chunk size 1 versus
-  unbounded, for every `non_foldable` model.
+  unbounded, for every `non_foldable` model. **Done**, and compared across
+  budgets as well as against ground truth — a recompute wrong in the same way
+  the hand-written recompute SQL is wrong would pass the second check and fail
+  the first.
+- **A recompute reads the whole window, not the batch.** A window fed by several
+  batches must equal a full recompute of all of them. This is `CONTEXT.md`
+  section 4's FFT mart stated as a test, and a single-batch scenario cannot see
+  it, so every tier-three scenario spreads one window over several batches.
+- **A window already written is corrected, and its neighbours are not touched.**
+  A later batch landing in an earlier window replaces that window's row while an
+  untouched window stays byte-identical.
 - **Foldability rejection.** Assert the *failure* path — an additive strategy over
   a non-foldable aggregate must be refused at load, not at runtime.
 - **Front-door parity.** Every conformance scenario runs through both the Python

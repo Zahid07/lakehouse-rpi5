@@ -53,6 +53,7 @@ from duckstream.consumed import ENTRIES_KEY, MapIndex
 from duckstream.errors import ConfigError, DuckstreamError
 from duckstream.offsets import FileEntry, FileOffset
 from duckstream.protocols import BatchLimits, BatchPlan, Offset
+from duckstream.sql import quote_ident
 
 __all__ = ["FileSource", "FORMATS"]
 
@@ -546,6 +547,81 @@ class FileSource:
         entries = FileOffset.consumed(offset)
         return FileOffset.rows(len(entries)), entries
 
+    def absolute_paths(self, relpaths: Sequence[str]) -> list[str]:
+        """Resolve consumed-file paths back to something a reader can open.
+
+        The consumed-file table stores paths **relative to the source root**, so
+        a landing tree that moves keeps working. A tier-three recompute reads
+        files straight out of that table, and it is the source that knows what
+        they are relative to -- so it is the source that turns them back, rather
+        than the engine composing a path from a root it inferred.
+
+        Optional and duck-typed like :meth:`time_bounds`, and a source without
+        it simply cannot be recomputed from its own consumed set; the engine
+        says so rather than guessing, because a guessed path is either an error
+        or, far worse, a readable file that is not the one meant.
+        """
+        return [self._absolute(relpath) for relpath in relpaths]
+
+    def time_bounds(
+        self, con: Any, plan: BatchPlan, time_column: str
+    ) -> dict[str, tuple[Any, Any, int]]:
+        """``{relpath: (min, max, rows)}`` over ``time_column``, per planned file.
+
+        The file -> time-range index ``CONTEXT.md`` 1.13 asks for, measured
+        rather than guessed. One grouped scan over exactly the files this batch
+        is consuming, using ``read_*``'s ``filename`` pseudo-column, which
+        echoes back the very path string it was handed -- verified, and what the
+        mapping back to relative paths below relies on.
+
+        The row count rides along in the same ``GROUP BY`` for nothing, and is
+        what lets a recompute size its chunks from estimated rows rather than
+        from a window count (``PLAN.md``; ``CONTEXT.md`` 1.1).
+
+        Optional and duck-typed, like :meth:`migrate_offset`: the engine calls
+        it when the source has it and the model is one that will be recomputed.
+        Nothing else calls it, and no model's *correctness* depends on it -- an
+        absent or wrong-but-wider answer costs a recompute extra file reads and
+        changes no number. That is the whole contract of a hint, and it is why
+        this may return fewer entries than the plan has files without anything
+        going wrong.
+
+        Cost, measured on this box at ``threads=2``: 1.4 ms for a one-file
+        batch, 3.1 ms at ten files, 6.7 ms at forty. It is a second pass over
+        the batch and it is not free -- but it reads one column, and it is paid
+        only by tier-three models, which are about to read whole windows back
+        out of source anyway.
+        """
+        files = self._plan_files(plan)
+        fmt = plan.payload.get("format", self.format)
+        reader = FORMATS.get(fmt, {}).get("reader")
+        if reader is None:  # pragma: no cover - bind refuses this first
+            return {}
+        relpaths = list(plan.payload.get("relpaths") or [])
+        by_absolute = {
+            self._absolute(relpath): relpath for relpath in relpaths
+        }
+
+        file_list = "[" + ", ".join(_sql_string_literal(f) for f in files) + "]"
+        column = quote_ident(time_column)
+        rows = con.execute(
+            f"SELECT filename, min({column}), max({column}), count({column}) "
+            f"FROM {reader}({file_list}, filename=true) "
+            f"GROUP BY filename"
+        ).fetchall()
+
+        bounds: dict[str, tuple[Any, Any, int]] = {}
+        for absolute, low, high, count in rows:
+            relpath = by_absolute.get(str(absolute))
+            if relpath is None:
+                # The pseudo-column did not echo a path this plan named. Saying
+                # nothing about that file leaves it at the sentinel range, so it
+                # is read by every recompute -- the safe direction. Guessing
+                # which file it meant is the unsafe one.
+                continue
+            bounds[relpath] = (low, high, int(count or 0))
+        return bounds
+
     def bind(self, con: Any, plan: BatchPlan) -> str:
         """Register a temp view over exactly the planned files; return its name.
 
@@ -643,18 +719,30 @@ class FileSource:
 
         now_ns = time.time_ns()
         found: dict[str, FileEntry] = {}
-        for directory in self._directories(root):
-            if not self._is_ready(directory, now_ns):
+        for prefix, directory, entries in self._walk(root):
+            # The marker is one of the entries the walk already read, so its
+            # stat comes back with it instead of costing a syscall of its own.
+            if not self._is_ready(directory, now_ns, entries):
                 continue
-            for name in self._filenames(directory):
+            # `prefix` is carried down the walk rather than recomputed per file
+            # with `relative_path`. Everything in a directory shares it, so the
+            # general relative-path algorithm has nothing left to work out --
+            # and it is not cheap. See `CONTEXT.md` 1.20; a unit test asserts
+            # the string this builds is the one `relative_path` would have
+            # returned, rather than trusting that it is.
+            for entry in entries:
+                name = entry.name
                 if self.marker is not None and name == self.marker:
                     continue
-                full = directory / name
-                relpath = FileOffset.relative_path(root, full)
+                relpath = f"{prefix}{name}"
                 if not self._pattern_re.match(relpath):
                     continue
                 try:
-                    stat = full.stat()
+                    # The DirEntry's own stat, which the directory read already
+                    # paid for on Windows and which avoids re-resolving the path
+                    # on POSIX. Worth 6-18% on its own; the prefix above is the
+                    # larger half.
+                    stat = entry.stat()
                 except OSError:
                     # Vanished between listing and stat. It is simply not part
                     # of this scan; if it comes back it is picked up next time.
@@ -670,30 +758,110 @@ class FileSource:
         implementation in ``realtime_queue_worker`` globs ``**`` from each ready
         folder, which reads files out of *unmarked* subdirectories and visits
         nested ready folders twice.
+
+        Retained for callers that want only the directories. :meth:`_walk` is
+        what :meth:`_scan` uses, because it hands back the entries it already
+        read rather than making the caller list them a second time.
         """
-        if not self.recursive:
-            yield root
-            return
-        for dirpath, dirnames, _filenames in os.walk(root):
-            dirnames.sort()  # deterministic traversal; ordering is re-imposed later
-            yield Path(dirpath)
+        for _prefix, directory, _entries in self._walk(root):
+            yield directory
+
+    def _walk(self, root: Path) -> Iterator[tuple[str, Path, list[Any]]]:
+        """``(relative prefix, directory, file entries)``, depth-first, sorted.
+
+        One ``scandir`` per directory, and the relative prefix carried down
+        rather than recomputed. Both matter, and ``CONTEXT.md`` 1.20 is why:
+        profiled at one file per directory -- duckstream's real shape, one drop
+        per trigger -- the previous version called ``scandir`` **twice** on
+        every directory, once inside ``os.walk`` and again to list the files,
+        and spent a further 16 ``ntpath.normcase`` calls per directory inside
+        ``os.path.relpath``. Neither bought anything: the walk has already read
+        the directory, and it already knows where it is.
+
+        Semantics are unchanged and that is the whole design constraint here.
+        ``is_dir(follow_symlinks=False)`` reproduces ``os.walk``'s default of
+        not descending into symlinked directories, while files are tested with
+        plain ``is_file()`` so a symlink *to* a file still counts as one --
+        exactly as before. Order stays deterministic, which a replayed batch
+        depends on.
+        """
+        stack: list[tuple[str, Path]] = [("", root)]
+        while stack:
+            prefix, directory = stack.pop()
+            files: list[Any] = []
+            subdirectories: list[Any] = []
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False):
+                            subdirectories.append(entry)
+                        elif entry.is_file():
+                            files.append(entry)
+            except OSError:
+                # Unreadable or vanished mid-walk. Not part of this scan; if it
+                # comes back it is picked up next time.
+                continue
+            files.sort(key=lambda entry: entry.name)
+            yield prefix, directory, files
+            if not self.recursive:
+                return
+            subdirectories.sort(key=lambda entry: entry.name, reverse=True)
+            for entry in subdirectories:
+                stack.append((f"{prefix}{entry.name}/", Path(entry.path)))
 
     @staticmethod
     def _filenames(directory: Path) -> list[str]:
+        """File names in ``directory``, sorted. Kept for callers wanting names."""
+        return [entry.name for entry in FileSource._entries(directory)]
+
+    @staticmethod
+    def _entries(directory: Path) -> list[Any]:
+        """``os.DirEntry`` per file in ``directory``, sorted by name.
+
+        The entries rather than the names, because a ``DirEntry`` carries the
+        size and mtime the directory read already fetched on Windows -- so
+        :meth:`_scan` gets them without a second syscall per file. Sorted for
+        the same reason the traversal is: a replayed batch has to be identical
+        to the original, and that starts with a deterministic scan order.
+        """
         try:
             with os.scandir(directory) as entries:
-                return sorted(e.name for e in entries if e.is_file())
+                return sorted(
+                    (entry for entry in entries if entry.is_file()),
+                    key=lambda entry: entry.name,
+                )
         except OSError:
             return []
 
-    def _is_ready(self, directory: Path, now_ns: int) -> bool:
-        """Whether ``directory``'s completion marker exists and has settled."""
+    def _is_ready(
+        self, directory: Path, now_ns: int, entries: "list[Any] | None" = None
+    ) -> bool:
+        """Whether ``directory``'s completion marker exists and has settled.
+
+        ``entries`` is the directory listing the walk already read. Given it,
+        the marker's stat comes from there rather than from a syscall of its
+        own -- measured at 13.5 us a directory, which is a sixth of the whole
+        per-directory cost at one file per directory. Without it the marker is
+        stat'ed directly, which is what a caller holding only a path gets.
+        """
         if self.marker is None:
             return True
-        try:
-            stat = (directory / self.marker).stat()
-        except OSError:
-            return False
+        stat = None
+        if entries is not None:
+            for entry in entries:
+                if entry.name == self.marker:
+                    try:
+                        stat = entry.stat()
+                    except OSError:
+                        return False
+                    break
+            else:
+                return False
+        else:
+            try:
+                stat = (directory / self.marker).stat()
+            except OSError:
+                return False
         if self._settle_ns <= 0:
             return True
         return (now_ns - stat.st_mtime_ns) >= self._settle_ns

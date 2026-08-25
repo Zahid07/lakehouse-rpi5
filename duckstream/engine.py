@@ -25,12 +25,28 @@ commit. So an idle pass is not merely cheap, it adds **zero snapshots** — a
 property a test can assert, and one that keeps the snapshot history a record of
 work done rather than of cron ticks that happened.
 
-**(2) The view is bound outside the transaction.** ``CREATE TEMP VIEW`` is DDL
-against the ``temp`` database, and ``CONTEXT.md`` 1.9 measured that one DuckDB
-transaction cannot write to two attached databases: doing it inside would raise
-``TransactionContext Error``. The same constraint is why the sink and the state
-store must both live in the DuckLake catalog — which is what makes the single
-commit below possible at all.
+**(2) The batch view is bound outside the transaction**, and it is bound there
+because nothing requires it to be inside — not because it may not be.
+``CONTEXT.md`` 1.9 measured that one DuckDB transaction cannot **write data to**
+two attached databases, and that is why the sink and the state store must both
+live in the DuckLake catalog; it is what makes the single commit below possible
+at all. An earlier version of this paragraph extended that to ``CREATE TEMP
+VIEW`` and claimed doing it inside would raise ``TransactionContext Error``.
+**Measured, and it does not** — temp views, temp tables and even ``DROP VIEW``
+all succeed inside a DuckLake transaction alongside inserts and deletes. That
+claim had never been executed; 1.9's own measurement wrote *rows* to two
+catalogs, which is a different statement.
+
+It matters because tier three depends on the true version: a recompute cannot
+bind its views before the transaction opens, since which files it reads is
+decided by data read inside it. See :meth:`Engine._range_view`. Binding the
+*batch* view early stays the right thing to do — it keeps the transaction as
+short as the commit it exists for — but it is a preference, not a constraint.
+
+What genuinely must wait for the transaction to close is **dropping** the views,
+and for an unrelated reason: a rolled-back batch must leave nothing behind, so
+the drops belong in a ``finally`` that runs after ``COMMIT`` or ``ROLLBACK``
+either way.
 
 Event time sits inside step (2) and step (3). A model that declares a
 ``lateness`` horizon has its bound batch scanned once for its counts and its
@@ -63,16 +79,25 @@ something a test reaches in by monkeypatching privates. See :class:`FaultHooks`.
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping
 
+from duckstream.aggregates import RECOMPUTE_WINDOW
+from duckstream.consumed import (
+    ENTRIES_KEY,
+    UNKNOWN_MAX,
+    UNKNOWN_MIN,
+    ConsumedFile,
+)
 from duckstream.errors import BatchFailed, DuckstreamError
 from duckstream.lake import DEFAULT_ALIAS, attach_lake
 from duckstream.lock import RunLock
 from duckstream.model import Model
 from duckstream.protocols import BatchContext, BatchPlan, Offset
-from duckstream.sql import quote_ident
+from duckstream.recompute import plan_chunks, touched_windows
+from duckstream.sql import quote_ident, quote_literal
 from duckstream.state import DEFAULT_STATE_SCHEMA, DuckLakeStateStore, Position
 from duckstream.trigger import AvailableNow, Trigger
 from duckstream.watermark import WatermarkPolicy, policy_for
@@ -428,6 +453,21 @@ class RunReport:
 # --------------------------------------------------------------------------
 # The engine
 # --------------------------------------------------------------------------
+
+
+def _recomputes(model: Model) -> bool:
+    """Does this model re-derive whole windows from source on every batch?
+
+    Two conditions, and the second is easy to lose. The strategy has to be
+    ``recompute_window`` -- and the model has to actually *window*, because
+    unwindowed ``append`` is the tier-agnostic escape hatch: it never folds and
+    never revises a row, so each batch's rows are written as they are and there
+    is nothing to re-derive. ``Model.validate`` exempts it from needing a grain
+    for exactly this reason, so a model can legitimately arrive here at tier
+    three with ``grain=None``, and taking the recompute path for it would ask
+    :mod:`duckstream.recompute` to find the windows of a model that has none.
+    """
+    return model.resolved_strategy == RECOMPUTE_WINDOW and model.grain is not None
 
 
 def _fingerprint(offset: Offset | None) -> str:
@@ -976,10 +1016,21 @@ class Engine:
                 FaultEvent("after_bind", self, model, self.con, plan, ctx, written),
             )
 
+            # Measured before the transaction opens, because it is a read: one
+            # grouped scan giving this batch's files their time ranges and row
+            # counts, which the index records alongside them. Only tier three
+            # pays for it, and only tier three reads it back.
+            bounds = self._file_bounds(model, plan)
+
             self.state.begin(self.con)
             try:
                 with self._model_context(model):
-                    rows_out = sink.write(self.con, written, model, ctx)
+                    if _recomputes(model):
+                        rows_out = self._recompute(
+                            model, written, ctx, plan, index, bounds, views
+                        )
+                    else:
+                        rows_out = sink.write(self.con, written, model, ctx)
                     # Inside the transaction, and that is the whole point: the
                     # rows saying "these files were read" and the output that
                     # read them become durable in one DuckLake snapshot, or
@@ -992,6 +1043,7 @@ class Engine:
                             plan.payload,
                             start=plan.start,
                             end=plan.end,
+                            bounds=bounds,
                         )
                 self._require_recorded(model, batch_id, index, recorded)
                 self.faults.fire(
@@ -1102,6 +1154,247 @@ class Engine:
             f"downstream would notice, because the checkpoint advances either "
             f"way. This is a bug in duckstream, not in the model."
         )
+
+    def _file_bounds(self, model: Model, plan: BatchPlan) -> Any:
+        """This batch's per-file time ranges, or ``None`` if they are not wanted.
+
+        Asked of the source, duck-typed like ``migrate_offset``, and asked
+        **only** for a model that will be recomputed. The index is a hint for
+        tier three and nothing else reads it, so a tier-one model must not pay
+        the scan: measured at 1.4 ms for a one-file batch and 6.7 ms at forty,
+        against a committing trigger's ~15 ms floor (``CONTEXT.md`` 1.8), it is
+        not a rounding error on the phase-1 path.
+
+        A model that becomes tier three later therefore has rows without bounds
+        behind it, and that is safe rather than merely tolerable: an unmeasured
+        file is stored at the widest possible range, so it is read by every
+        recompute instead of by none. The index degrades to the whole file list,
+        which is exactly what it degrades to for a catalog written before it
+        existed.
+
+        Nothing here may fail the batch. A source that cannot answer, a format
+        whose reader will not take ``filename``, a time column that is not in
+        the file -- all of them cost the *hint* and none of them cost the
+        *answer*, so they land on the sentinel range and are read.
+        """
+        if not _recomputes(model) or not model.time_column:
+            return None
+        measure = getattr(model.source, "time_bounds", None)
+        if not callable(measure):
+            return None
+        try:
+            with self._model_context(model):
+                return measure(self.con, plan, model.time_column)
+        except Exception:
+            return None
+
+    def _recompute(
+        self,
+        model: Model,
+        view: str,
+        ctx: BatchContext,
+        plan: BatchPlan,
+        index: Any,
+        bounds: Any,
+        extra: list[str],
+    ) -> int | None:
+        """Tier three: re-derive every window this batch touched, in chunks.
+
+        The batch itself is never what gets written. It says *which windows
+        moved*; the rows that go to the sink are read back out of every consumed
+        file that can contain a row in those windows. That is the whole of
+        ``PLAN.md``'s "recompute the affected window from source", and
+        ``CONTEXT.md`` section 4 is what the shortcut costs -- an FFT mart that
+        transformed only each batch's own rows held a spectrum over half a
+        window, 51 bins where the truth was 201.
+
+        Returns the rows written. Every temp view it creates is appended to
+        ``extra`` as it is created, so the caller drops them whether this
+        returns or raises.
+
+        Three properties are worth stating because none of them is obvious.
+
+        **The batch's own files are supplied to the planner, not read back.**
+        They are recorded in the same transaction as this write, so whether the
+        index can see them yet is a question about DuckLake's read-your-own-
+        writes behaviour that nothing here should have to depend on. Supplying
+        them in Python makes the recompute correct on a first run and on a
+        replay after a crash, where they are not in the table at all — and they
+        go to :func:`plan_chunks` rather than into its answer so that their rows
+        are counted by the row budget. Merging them in afterwards would leave
+        the budget exempting exactly the data being added.
+
+        **A window is never split across chunks.** Chunk bounds are window
+        bounds, so every row of a window is in exactly one execution. Splitting
+        one would produce two partial recomputes of the same window, each
+        clearing and rewriting what the other wrote -- the tier-three bug in
+        miniature.
+
+        **Nothing is written when nothing was touched.** A batch of entirely
+        undated rows touches no window and recomputes nothing, which is the same
+        answer the ``rows_undated`` counter already gave.
+        """
+        windows = touched_windows(self.con, view, model.time_column, model.grain)
+        if not windows:
+            return 0
+
+        chunks = plan_chunks(
+            windows,
+            model.grain,
+            files_for=lambda lo, hi: (
+                [] if index is None else index.overlapping(lo, hi)
+            ),
+            own=self._own_files(plan, bounds),
+            max_rows=self._chunk_budget(model),
+        )
+
+        written = 0
+        for chunk in chunks:
+            relpaths = list(chunk.relpaths)
+            if not relpaths:  # pragma: no cover - the batch's own files are in it
+                continue
+            # Registered in `extra` as they are created, never on the way out.
+            # A chunk that raises leaves the views its predecessors made behind,
+            # and a model that keeps failing would accumulate two temp views per
+            # chunk per retry for the life of the connection. The caller drops
+            # whatever is in this list in its `finally`, so partial progress is
+            # cleaned up exactly like complete progress.
+            scoped = self._range_view(model, plan, relpaths, chunk, extra)
+            rows = model.sink.write(
+                self.con,
+                scoped,
+                model,
+                replace(ctx, window_range=(chunk.lo, chunk.hi)),
+            )
+            if isinstance(rows, int):
+                written += rows
+        return written
+
+    @staticmethod
+    def _own_files(plan: BatchPlan, bounds: Any) -> list[ConsumedFile]:
+        """This batch's files as index entries, whether or not they are measured.
+
+        The *paths* come from the payload the source built, never from
+        ``bounds`` -- a file the bounds scan could not place still has to be
+        read, and taking the list from the plan is what guarantees it is. The
+        *bounds* are then filled in where they are known and left at the
+        sentinel range where they are not, which is the same rule
+        :meth:`TableIndex.append` applies when it writes them.
+
+        These go to the chunk planner rather than being merged into its answer,
+        so that the batch's own rows are counted by the row budget. The index
+        cannot be relied on to know about them yet: they are recorded in the same
+        transaction as the write.
+        """
+        payload = plan.payload or {}
+        relpaths = payload.get("relpaths") or list(payload.get(ENTRIES_KEY) or {})
+        measured = bounds or {}
+        files: list[ConsumedFile] = []
+        for path in relpaths:
+            low, high, rows = measured.get(str(path), (None, None, None))
+            files.append(
+                ConsumedFile(
+                    relpath=str(path),
+                    min_ts=UNKNOWN_MIN if low is None else low,
+                    max_ts=UNKNOWN_MAX if high is None else high,
+                    n_rows=None if rows is None else int(rows),
+                )
+            )
+        return files
+
+    def _range_view(
+        self,
+        model: Model,
+        plan: BatchPlan,
+        relpaths: list[str],
+        chunk: Any,
+        created: list[str],
+    ) -> str:
+        """A view over ``relpaths`` narrowed to ``chunk``'s window range.
+
+        Both view names are appended to ``created`` before the statement that
+        makes them, so a failure part-way still leaves the caller something to
+        drop. ``_drop_view`` uses ``IF EXISTS``, so naming one that was never
+        created costs nothing.
+
+        Built by handing the source a plan naming exactly those files, so the
+        reader, the format and the path handling all stay the source's business
+        and ``bind`` is used exactly as it is on the trigger path. The range
+        predicate is inlined as two literals -- ``CONTEXT.md`` 1.5 forbids the
+        subquery, and the literals also let DuckLake and parquet statistics
+        prune inside the files that were selected.
+        """
+        source = model.source
+        payload = dict(plan.payload or {})
+        payload["relpaths"] = list(relpaths)
+        payload["files"] = self._absolute_for(source, model, relpaths)
+        # This plan reads; it never check points. Emptying `entries` says so:
+        # nothing may mistake it for a consumption record.
+        payload[ENTRIES_KEY] = {}
+        payload["row_count"] = None
+        reading = replace(plan, payload=payload, is_empty=False, has_more=False)
+
+        with self._model_context(model):
+            base = source.bind(self.con, reading)
+        created.append(base)
+        column = quote_ident(model.time_column)
+        scoped = f"duckstream_recompute_{uuid.uuid4().hex}"
+        created.append(scoped)
+        self.con.execute(
+            f"CREATE TEMP VIEW {quote_ident(scoped)} AS "
+            f"SELECT * FROM {quote_ident(base)} "
+            f"WHERE {column} >= {quote_literal(chunk.lo)} "
+            f"  AND {column} < {quote_literal(chunk.hi)}"
+        )
+        return scoped
+
+    @staticmethod
+    def _absolute_for(source: Any, model: Model, relpaths: list[str]) -> list[str]:
+        """Ask the source to turn consumed-file paths back into readable ones.
+
+        Refuses rather than falling back. The consumed set stores paths relative
+        to the source's own root, and a plausible-looking guess at that root is
+        the worst outcome available here: not an error, but a set of files that
+        open and hold the wrong rows. A source that keeps a consumed set and
+        cannot resolve it is a source that cannot be recomputed, and saying so
+        is the whole of this method.
+        """
+        resolve = getattr(source, "absolute_paths", None)
+        if not callable(resolve):
+            raise DuckstreamError(
+                f"model {model.name!r} is recomputed window by window, which "
+                f"means reading its consumed files back from "
+                f"{type(source).__name__!r} — but that source does not provide "
+                f"`absolute_paths(relpaths)`, so the paths in "
+                f"duckstream.consumed_files cannot be resolved to files. They "
+                f"are stored relative to the source's own root and only the "
+                f"source knows what that is; guessing would risk reading files "
+                f"that open cleanly and hold the wrong rows. Add "
+                f"`absolute_paths` to the source, or use a foldable strategy."
+            )
+        return [str(path) for path in resolve(relpaths)]
+
+    @staticmethod
+    def _chunk_budget(model: Model) -> int | None:
+        """Rows a single recompute execution may read. ``None`` for unbounded.
+
+        ``max_rows_per_trigger``, deliberately reused rather than given its own
+        knob. ``CONTEXT.md`` 1.1 names one lever and one only -- "memory is
+        controlled by bounding rows in flight **per execution**
+        (``max_rows_per_trigger``, window-range chunking)" -- and a recompute
+        chunk is an execution. A second knob would let a user bound the batch
+        and not the recompute, which is the half that actually materialises a
+        window.
+
+        The source's own limit tightens the model's, the same way it does when
+        the batch is planned, so the tighter of the two always wins.
+        """
+        candidates = [
+            getattr(model.limits, "max_rows_per_trigger", None),
+            getattr(model.source, "max_rows_per_trigger", None),
+        ]
+        present = [value for value in candidates if value]
+        return min(present) if present else None
 
     def _consumed_index(self, model: Model) -> Any:
         """The consumed-file index this model's source planned against, if any.
@@ -1347,6 +1640,8 @@ class Engine:
         """
         policy = self._watermark_policy(model)
         if policy is None:
+            if _recomputes(model):
+                return self._observe_undated(model, view)
             return _EventTime(view=view, rows_in=self._count_rows(view))
 
         previous = self._committed_watermark(model)
@@ -1362,6 +1657,46 @@ class Engine:
             rows_late=observation.rows_late,
             rows_undated=observation.rows_undated,
             watermark=policy.advance(previous, observation.max_event_ts),
+        )
+
+    def _observe_undated(self, model: Model, view: str) -> "_EventTime":
+        """Count the rows a recompute will drop for having no event time.
+
+        A tier-three model with **no lateness horizon** still discards undated
+        rows, and until this existed it did so silently. That is the one thing
+        ``CONTEXT.md``'s ratified decision on dropped rows forbids: *"dropped
+        **and counted**, never silently absorbed"*, and *"a count that lives only
+        in a return value or a rotated log has not been counted"*. The rows go
+        into ``duckstream.batches`` where ``status`` can still find them after
+        the log has rotated.
+
+        Why they are dropped at all, rather than folded into a NULL window the
+        way a tier-one model does: a recompute is scoped by a window range, and
+        no ``[lo, hi)`` contains NULL. A row belonging to no window cannot be
+        re-derived from one. Tier one can carry a NULL window because it never
+        re-reads anything; tier three cannot, and the difference is visible in
+        the mart, so it has to be visible in the counters too.
+
+        One scan, not two: ``CONTEXT.md`` 1.11 measured that adding aggregates
+        beside a ``count(*)`` over the same pass costs ~0.26 ms, and splitting
+        them is the mistake that section warns about. A failure here is
+        bookkeeping and must never cost the batch, so it falls back to the plain
+        count exactly as :meth:`_count_rows` does.
+        """
+        column = quote_ident(model.time_column or "")
+        try:
+            row = self.con.execute(
+                f"SELECT count(*), count(*) FILTER (WHERE {column} IS NULL) "
+                f"FROM {quote_ident(view)}"
+            ).fetchone()
+        except Exception:
+            return _EventTime(view=view, rows_in=self._count_rows(view))
+        if row is None:  # pragma: no cover - an aggregate always returns a row
+            return _EventTime(view=view, rows_in=None)
+        return _EventTime(
+            view=view,
+            rows_in=int(row[0] or 0),
+            rows_undated=int(row[1] or 0),
         )
 
     # -- helpers -------------------------------------------------------------

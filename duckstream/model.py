@@ -27,6 +27,7 @@ from datetime import timedelta
 from typing import Any
 
 from duckstream.aggregates import (
+    RECOMPUTE_WINDOW,
     STRATEGIES,
     STRATEGY_FOR_TIER,
     Tier,
@@ -471,18 +472,54 @@ class Model:
 
         There is no shortcut for tier three: the affected windows must be
         recomputed from source. That needs a ``time_column`` to identify which
-        windows a batch touched, and a ``memory_profile`` because recomputing a
-        window may materialise it whole -- 256 MB against 64 MB for a plain
-        GROUP BY, measured in ``CONTEXT.md`` section 1.1.
+        windows a batch touched, a ``grain`` to say how wide one is, and a
+        ``memory_profile`` because recomputing a window may materialise it whole
+        -- 256 MB against 64 MB for a plain GROUP BY, measured in ``CONTEXT.md``
+        section 1.1.
+
+        ``grain`` is required of anything that *resolves* to
+        ``recompute_window`` **and windows**, and that is the one requirement
+        here which is about the strategy rather than the tier. Declaring
+        ``recompute_window`` over additive aggregates stays legal -- it is
+        correct, just slower, and a reasonable thing to ask for while
+        reconciling -- but "recompute the affected window" has no meaning
+        without windows. The alternative to refusing is recomputing the entire
+        history on every trigger, which works on the first day and is discovered
+        in a cron log some months later.
+
+        **Unwindowed ``append`` is exempt, and has to be.** It is the
+        tier-agnostic escape hatch: with no grain and no fold, each batch's rows
+        are written as they are and no window is ever revised, so there is
+        nothing to recompute and nothing that could be silently wrong. That is
+        the same exemption ``_check_output_mode`` and ``TableSink`` already
+        make, read off the sink's mode the same way and for the same reason --
+        a sink with no notion of modes is unaffected, because this rule is about
+        what ``append`` means.
         """
-        if classify_model(self.aggregates)[0] is not Tier.NON_FOLDABLE:
+        tier = classify_model(self.aggregates)[0]
+        unwindowed_append = (
+            self.grain is None and getattr(self.sink, "mode", None) == "append"
+        )
+        recomputing = (
+            self.resolved_strategy == RECOMPUTE_WINDOW and not unwindowed_append
+        )
+        if tier is not Tier.NON_FOLDABLE and not recomputing:
             return
 
+        # Order matters, and `grain` is reported last on purpose. The other two
+        # are demanded by the *tier* -- properties of the aggregates the user
+        # wrote -- while `grain` is demanded by the *strategy*, and rule 3
+        # already refuses a grain declared without a time_column. Naming grain
+        # first would therefore send somebody to add a grain that rule 3 then
+        # rejects, which is the wrong end of their own problem.
         missing = []
-        if not self.time_column:
-            missing.append("time_column")
-        if not self.memory_profile:
-            missing.append("memory_profile")
+        if tier is Tier.NON_FOLDABLE:
+            if not self.time_column:
+                missing.append("time_column")
+            if not self.memory_profile:
+                missing.append("memory_profile")
+        if recomputing and not self.grain:
+            missing.append("grain")
         if not missing:
             return
 
@@ -491,15 +528,33 @@ class Model:
             for column, t in self.column_tiers.items()
             if t is Tier.NON_FOLDABLE
         )
-        raise ModelValidationError(
+        # Two different models reach here and each needs to be told the truth
+        # about itself: one classified as tier three by its own aggregates, and
+        # one that merely asked for the tier-three strategy.
+        because = (
             f"this model is tier {Tier.NON_FOLDABLE.value!r} ({offenders}), so it "
-            f"must be recomputed window by window, but {' and '.join(missing)} "
+            f"must be recomputed window by window"
+            if tier is Tier.NON_FOLDABLE
+            else f"this model declares strategy {RECOMPUTE_WINDOW!r}, so it is "
+            f"recomputed window by window even though its aggregates would fold"
+        )
+        remedies = {
+            "grain": "grain says how wide a window is, e.g. grain='hour' — "
+            "without it there is no window to recompute and the only "
+            "consistent reading would be to re-derive the whole history on "
+            "every trigger",
+            "time_column": "time_column identifies which windows a batch "
+            "touched",
+            "memory_profile": "memory_profile ('streaming' or 'materialising') "
+            "tells the engine whether a whole window has to be held in memory "
+            "at once",
+        }
+        raise ModelValidationError(
+            f"{because}, but {' and '.join(missing)} "
             f"{'is' if len(missing) == 1 else 'are'} not declared",
             model=self.name,
             field=missing[0],
-            remedy="time_column identifies which windows a batch touched; "
-            "memory_profile ('streaming' or 'materialising') tells the engine "
-            "whether a whole window has to be held in memory at once.",
+            remedy="; ".join(remedies[name] for name in missing) + ".",
         )
 
     def _check_udfs(self) -> None:
