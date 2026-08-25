@@ -785,13 +785,20 @@ def test_a_source_whose_offset_does_not_advance_fails_loudly(tmp_path, landing):
 # ---------------------------------------------------------------------------
 
 
-def test_an_unmergeable_update_model_is_refused_naming_the_model(tmp_path, landing):
-    """A median cannot be merged at all, and the engine says so before running.
+def test_an_unmergeable_update_model_is_recomputed_rather_than_folded(tmp_path, landing):
+    """A median cannot be merged at all, so the engine re-derives its windows.
 
-    ``avg`` used to be refused here too. It is now maintained through its
-    sufficient statistics, so the test that proves the refusal still fires had
-    to move to an aggregate that genuinely has no decomposition -- otherwise it
-    would have gone on passing while testing nothing.
+    This test used to assert the *refusal*, because tier three did not execute.
+    It now asserts the answer, and it is deliberately the same model: what
+    changed is that "no merge can express this" stopped meaning "duckstream
+    cannot do this". The refusal it replaced still exists one level down --
+    ``TableSink.merge_sql`` will not build a fold for this model, and a unit
+    test pins that -- so nothing was traded away for the capability.
+
+    Two batches, because a median folded batch-by-batch would look right on the
+    first one. 4 rows then 4 more, all inside one hour: fold them and the second
+    batch's median overwrites the first's. Recompute and the answer is the
+    median of all eight, which is what a full recompute from source gives.
     """
     drop_batch(landing, "b1", 4)
     engine = open_engine(tmp_path)
@@ -802,15 +809,25 @@ def test_an_unmergeable_update_model_is_refused_naming_the_model(tmp_path, landi
             aggregates={"mid_value": "median(value)"},
             strategy="recompute_window",
             memory_profile="materialising",
+            sink=TableSink("marts.mid_value", mode="update"),
         )
     )
-    with pytest.raises(DuckstreamError) as caught:
-        engine.run()
-    message = str(caught.value)
-    assert "mid_value" in message
-    assert "non_foldable" in message
-    # Refused before any work: no sink table, no offset.
-    assert engine.state.load_offset(engine.con, "mid_value") is None
+    engine.run()
+    drop_batch(landing, "b2", 4, first=4)
+    engine.run()
+
+    got = engine.con.execute(
+        "SELECT window_ts, sensor_id, mid_value FROM marts.mid_value "
+        "ORDER BY window_ts, sensor_id"
+    ).fetchall()
+    truth = engine.con.execute(
+        "SELECT date_trunc('hour', event_ts) AS window_ts, sensor_id, "
+        "       median(value) AS mid_value "
+        f"FROM read_parquet('{(landing / '**' / '*.parquet').as_posix()}') "
+        "GROUP BY 1, 2 ORDER BY 1, 2"
+    ).fetchall()
+    assert got == truth
+    assert engine.state.load_offset(engine.con, "mid_value") is not None
     engine.con.close()
 
 
@@ -1555,4 +1572,303 @@ def test_a_v1_catalog_keeps_its_failure_state_across_the_migration(tmp_path, lan
     assert after.offset == FileOffset.rows(1), "it did migrate"
     assert after.attempt == 1, "and did not refund the attempt"
     assert after.error == failing.error
+    engine.con.close()
+
+
+# ---------------------------------------------------------------------------
+# Tier three: the recompute path
+#
+# `test_an_unmergeable_update_model_is_recomputed_rather_than_folded` above
+# covers the answer. These cover the machinery that gets there, and each one is
+# a way of being wrong that still produces a number.
+# ---------------------------------------------------------------------------
+
+
+def median_model(landing: Path, **overrides) -> Model:
+    settings = dict(
+        name="mid_value",
+        aggregates={"mid_value": "median(value)", "n": "count(*)"},
+        # Keyed on the window alone, so one hour is one row and a test can talk
+        # about "the window" without picking a sensor out of three.
+        key=["window_ts"],
+        strategy="recompute_window",
+        memory_profile="materialising",
+        sink=TableSink("marts.mid_value", mode="update"),
+    )
+    settings.update(overrides)
+    return counts_model(landing, **settings)
+
+
+def test_a_recompute_reads_files_from_earlier_batches_not_just_its_own(tmp_path, landing):
+    """The property the whole file index exists to serve.
+
+    Batch two lands in the *same hour* as batch one. If the recompute read only
+    its own files, the mart would hold the median of batch two alone -- which is
+    ``CONTEXT.md`` section 4's FFT mart, and it does not fail, it just disagrees
+    with a full recompute.
+
+    ``drop_batch`` puts row *i* at 10:00 + i minutes with value *i*, so both
+    batches have to stay under 60 to share the hour. Batch one is values 0..3
+    and batch two is 50..53: the median of all eight is **26.5**, and the median
+    of the second batch alone is **51.5**. Neither can be mistaken for the
+    other, which is what makes the assertion mean something.
+    """
+    drop_batch(landing, "b1", 4)
+    engine = open_engine(tmp_path)
+    engine.add(median_model(landing))
+    engine.run()
+    assert engine.con.execute(
+        "SELECT n FROM marts.mid_value"
+    ).fetchone()[0] == 4
+
+    drop_batch(landing, "b2", 4, first=50)
+    engine.run()
+
+    rows = engine.con.execute(
+        "SELECT window_ts, n, mid_value FROM marts.mid_value ORDER BY window_ts"
+    ).fetchall()
+    assert len(rows) == 1, f"both batches are in one hour, got {rows}"
+    _window, n, mid = rows[0]
+    assert n == 8, f"the window holds {n} rows; a batch-only recompute gives 4"
+    assert mid == pytest.approx(26.5), (
+        f"median came out {mid}; reading only the second batch gives 51.5"
+    )
+    engine.con.close()
+
+
+def test_the_index_records_bounds_only_for_a_model_that_recomputes(tmp_path, landing):
+    """The scan costs 1.4-6.7 ms a batch (``CONTEXT.md`` 1.18) and only tier
+    three reads it, so a tier-one model must not be paying for it.
+
+    A model that is promoted to tier three later therefore has unmeasured rows
+    behind it -- which is safe, not merely tolerable, because the sentinel range
+    means those files are read by *every* recompute rather than by none.
+    """
+    drop_batch(landing, "b1", 4)
+
+    folding = open_engine(tmp_path)
+    folding.add(counts_model(landing))
+    folding.run()
+    stored = folding.con.execute(
+        f"SELECT DISTINCT min_ts, max_ts, n_rows "
+        f"FROM {folding.state.consumed_files_table} WHERE model_name = ?",
+        ["hourly_counts"],
+    ).fetchall()
+    assert stored == [(dt.datetime.min, dt.datetime.max, None)], (
+        "an additive model paid for a hint nothing will read"
+    )
+    folding.con.close()
+
+    recomputing = open_engine(tmp_path)
+    recomputing.add(median_model(landing))
+    recomputing.run()
+    measured = recomputing.con.execute(
+        f"SELECT min_ts, max_ts, n_rows "
+        f"FROM {recomputing.state.consumed_files_table} WHERE model_name = ?",
+        ["mid_value"],
+    ).fetchall()
+    assert len(measured) == 1
+    low, high, rows = measured[0]
+    assert rows == 4
+    assert low == dt.datetime(2026, 8, 22, 10, 0)
+    assert high == dt.datetime(2026, 8, 22, 10, 3)
+    recomputing.con.close()
+
+
+def temp_views(con) -> list[str]:
+    """duckstream's own temp views. Not every temp view -- DuckDB's information
+    schema is a few dozen of them, and counting those would swamp the signal.
+    """
+    return sorted(
+        row[0]
+        for row in con.execute(
+            "SELECT view_name FROM duckdb_views() "
+            "WHERE temporary AND view_name LIKE 'duckstream%'"
+        ).fetchall()
+    )
+
+
+def test_a_recompute_leaves_no_temp_views_behind(tmp_path, landing):
+    """Two views per chunk, and none of them may outlive the batch.
+
+    A recompute binds a view over the files a chunk selected and a second one
+    narrowing it to the range, so a model with several chunks creates several
+    pairs per trigger. On a long-running connection an undropped pair per chunk
+    per trigger accumulates for the life of the process.
+    """
+    drop_batch(landing, "b1", 4)
+    drop_batch(landing, "b2", 4, first=50)
+    engine = open_engine(tmp_path)
+    before = temp_views(engine.con)
+    engine.add(median_model(landing, limits=BatchLimits(max_rows_per_trigger=2)))
+    engine.run()
+    assert engine.con.execute("SELECT count(*) FROM marts.mid_value").fetchone()[0]
+    assert temp_views(engine.con) == before
+    engine.con.close()
+
+
+def land_two_hours(landing: Path, name: str) -> None:
+    """One file spanning two hours, so one batch touches two windows.
+
+    A file is never split across batches, so this arrives whole however tight
+    ``max_rows_per_trigger`` is -- which is what lets the recompute be chunked
+    while the batch is not.
+    """
+    directory = landing / name
+    directory.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    try:
+        con.execute(
+            "COPY (SELECT TIMESTAMP '2026-08-22 10:00:00' + INTERVAL (i * 40) MINUTE "
+            "        AS event_ts, 'sensor0' AS sensor_id, i::DOUBLE AS value "
+            "FROM range(0, 4) t(i)) "
+            f"TO '{(directory / 'part.parquet').as_posix()}' (FORMAT PARQUET)"
+        )
+    finally:
+        con.close()
+    (directory / "_READY").write_text("", encoding="utf-8")
+
+
+def test_a_failing_chunk_still_drops_the_views_made_before_it(tmp_path, landing):
+    """The half that only fails on the unhappy path, so it needs its own test.
+
+    Registering the view names on the way *out* of the recompute looks
+    equivalent and is not: a chunk that raises would strand every view its
+    predecessors created, and a model that keeps failing would strand another
+    set on every retry.
+
+    One file, two hours, a chunk budget of one row: one batch, several chunks,
+    and the second one raises.
+    """
+    land_two_hours(landing, "wide")
+    engine = open_engine(tmp_path)
+    model = median_model(landing, limits=BatchLimits(max_rows_per_trigger=1))
+
+    calls = {"n": 0}
+    real_write = model.sink.write
+
+    def explode(con, batch_view, m, ctx):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise DuckstreamError("the second chunk fails")
+        return real_write(con, batch_view, m, ctx)
+
+    model.sink.write = explode
+    engine.add(model)
+    before = temp_views(engine.con)
+    with pytest.raises(DuckstreamError):
+        engine.run()
+    assert calls["n"] >= 2, "the test never reached a second chunk"
+    assert temp_views(engine.con) == before, "a failed chunk stranded its views"
+    engine.con.close()
+
+
+def test_a_source_that_cannot_resolve_its_paths_is_refused_not_guessed(tmp_path, landing):
+    """A guessed path is worse than an error: it may open and hold wrong rows.
+
+    Consumed-file paths are stored relative to the source's own root, so only
+    the source can turn them back. A source keeping a consumed set but unable to
+    resolve it cannot be recomputed, and the engine has to say so.
+    """
+    drop_batch(landing, "b1", 4)
+
+    class Unresolvable(FileSource):
+        """A file source with the resolution hook taken away."""
+
+        absolute_paths = None
+
+    model = median_model(landing)
+    model.source = Unresolvable(Path(landing).as_posix(), marker="_READY")
+
+    engine = open_engine(tmp_path)
+    engine.add(model)
+    with pytest.raises(DuckstreamError) as caught:
+        engine.run()
+    message = str(caught.value)
+    assert "absolute_paths" in message
+    assert "mid_value" in message
+    # Nothing committed: refusing and writing anyway would be the worst outcome.
+    assert engine.state.load_offset(engine.con, "mid_value") is None
+    engine.con.close()
+
+
+def land_mixed_dates(landing: Path, name: str) -> None:
+    """Two dated rows in one hour, and one row with no event time at all."""
+    directory = landing / name
+    directory.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    try:
+        con.execute(
+            "COPY (SELECT * FROM (VALUES "
+            "  (TIMESTAMP '2026-08-22 10:00:00', 'sensor0', 1.0),"
+            "  (TIMESTAMP '2026-08-22 10:01:00', 'sensor0', 3.0),"
+            "  (CAST(NULL AS TIMESTAMP), 'sensor0', 99.0)"
+            ") t(event_ts, sensor_id, value)) "
+            f"TO '{(directory / 'part.parquet').as_posix()}' (FORMAT PARQUET)"
+        )
+    finally:
+        con.close()
+    (directory / "_READY").write_text("", encoding="utf-8")
+
+
+def test_an_undated_row_touches_no_window_and_is_counted(tmp_path, landing):
+    """A row with no event time belongs to no window, so it is recomputed by none.
+
+    **No lateness horizon here, and that is the whole point.** With a horizon the
+    engine filters undated rows out upstream, so the recompute planner never sees
+    one and this path is not exercised at all -- which is how the first version
+    of this test managed to pass while a mutation deleting the guard survived.
+
+    Two claims, and the second only exists because the first is a silent
+    divergence from a full recompute:
+
+    * the NULL window is **not** recomputed. A recompute is scoped by a window
+      range and no ``[lo, hi)`` contains NULL, so a row belonging to no window
+      cannot be re-derived from one. A tier-one model folds these into a NULL
+      window because it never re-reads anything; tier three cannot.
+    * so they are **counted**, durably, in ``duckstream.batches``.
+      ``CONTEXT.md``'s ratified rule is "dropped *and counted*, never silently
+      absorbed", and before this the count was ``None`` -- the drop happened and
+      nothing recorded it.
+    """
+    land_mixed_dates(landing, "mixed")
+    engine = open_engine(tmp_path)
+    engine.add(median_model(landing))
+    report = engine.run()
+
+    rows = engine.con.execute(
+        "SELECT window_ts, n, mid_value FROM marts.mid_value ORDER BY window_ts"
+    ).fetchall()
+    assert [r[0] for r in rows] == [dt.datetime(2026, 8, 22, 10, 0)], (
+        f"a NULL window reached the mart: {rows}"
+    )
+    assert rows[0][1] == 2, "the undated row was folded into a real window"
+
+    assert [b.rows_undated for b in report] == [1], (
+        "the row was dropped without being counted"
+    )
+    assert engine.state.batch_history(engine.con, "mid_value")[0]["rows_undated"] == 1, (
+        "the count did not become durable, so status cannot report it later"
+    )
+    engine.con.close()
+
+
+def test_a_horizon_still_filters_undated_rows_before_the_recompute(tmp_path, landing):
+    """The other route to the same answer, and it must agree.
+
+    With a horizon the watermark policy removes undated rows and counts them
+    before the planner runs. Both paths must produce the same mart and the same
+    counter, or the counter would mean two different things depending on whether
+    a horizon was declared.
+    """
+    land_mixed_dates(landing, "mixed")
+    engine = open_engine(tmp_path)
+    engine.add(median_model(landing, lateness="10 minutes"))
+    report = engine.run()
+
+    rows = engine.con.execute(
+        "SELECT window_ts, n FROM marts.mid_value ORDER BY window_ts"
+    ).fetchall()
+    assert rows == [(dt.datetime(2026, 8, 22, 10, 0), 2)]
+    assert [b.rows_undated for b in report] == [1]
     engine.con.close()

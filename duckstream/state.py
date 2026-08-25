@@ -45,9 +45,15 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from duckstream.consumed import CONSUMED_TABLE, ConsumedFiles
+from duckstream.consumed import (
+    CONSUMED_TABLE,
+    UNKNOWN_MAX,
+    UNKNOWN_MIN,
+    ConsumedFiles,
+)
 from duckstream.errors import DuckstreamError
 from duckstream.lake import _quote_identifier
+from duckstream.sql import quote_literal
 
 __all__ = [
     "CONSUMED_TABLE",
@@ -435,13 +441,48 @@ class _StateStoreBase:
         per process, and adds no snapshot when there is nothing to add -- a
         fresh catalog gets these columns from the ``CREATE`` above and never
         reaches the ``ALTER``.
+
+        **A new column is not always safe left at NULL, and one here is not.**
+        The file -> time-range index phase 3 added to ``consumed_files`` is
+        selected with ``max_ts >= lo AND min_ts < hi``, and NULL fails that
+        test -- so an upgraded catalog whose existing rows kept NULL would stop
+        selecting files it had already consumed, and a tier-three recompute
+        would quietly produce a window built from part of its data. That is the
+        silent-wrong-answer class in ``CONTEXT.md`` section 4, arriving as an
+        upgrade note, and it is the same shape as the v2-offset hazard phase 4
+        refused. So those two columns are **backfilled to the sentinel range**
+        in the same transaction that adds them, which says the only true thing
+        about a file nobody has measured: it may contain a row at any time.
+
+        ``ALTER TABLE ... ADD COLUMN ... DEFAULT TIMESTAMP '-infinity'`` would
+        be the tidier way to say that and DuckLake refuses it -- *"we cannot add
+        a column with a non-literal default value"* -- so it is an explicit
+        ``UPDATE``, measured at 44 ms over 1,000 rows and 109 ms over 100,000.
+        That cost is paid **once per catalog**, because it runs only on the pass
+        that actually adds the column; every later ``ensure`` sees the column
+        present and issues nothing at all.
         """
-        for table, qualified, columns in (
-            ("batches", self.batches_table, {"rows_late": "BIGINT", "rows_undated": "BIGINT"}),
+        for table, qualified, columns, backfill in (
+            (
+                "batches",
+                self.batches_table,
+                {"rows_late": "BIGINT", "rows_undated": "BIGINT"},
+                {},
+            ),
             (
                 "offsets",
                 self.offsets_table,
                 {"attempt": "BIGINT", "failed_at": "TIMESTAMP", "error": "VARCHAR"},
+                {},
+            ),
+            (
+                CONSUMED_TABLE,
+                self.consumed_files_table,
+                dict(ConsumedFiles.INDEX_COLUMNS),
+                # n_rows is deliberately absent: it sizes a chunk and never
+                # decides whether a file is read, so "not known" is a real and
+                # harmless answer for it. See `duckstream.recompute`.
+                {"min_ts": UNKNOWN_MIN, "max_ts": UNKNOWN_MAX},
             ),
         ):
             existing = {
@@ -455,12 +496,22 @@ class _StateStoreBase:
             }
             if not existing:  # pragma: no cover - the DDL above just created it
                 continue
-            for column, kind in columns.items():
-                if column not in existing:
-                    con.execute(
-                        f"ALTER TABLE {qualified} ADD COLUMN IF NOT EXISTS "
-                        f"{_quote_identifier(column)} {kind}"
-                    )
+            added = [column for column in columns if column not in existing]
+            for column in added:
+                con.execute(
+                    f"ALTER TABLE {qualified} ADD COLUMN IF NOT EXISTS "
+                    f"{_quote_identifier(column)} {columns[column]}"
+                )
+            filling = {c: v for c, v in backfill.items() if c in added}
+            if filling:
+                assignments = ", ".join(
+                    f"{_quote_identifier(column)} = {quote_literal(value)}"
+                    for column, value in filling.items()
+                )
+                condition = " OR ".join(
+                    f"{_quote_identifier(column)} IS NULL" for column in filling
+                )
+                con.execute(f"UPDATE {qualified} SET {assignments} WHERE {condition}")
 
     # -- transaction control --------------------------------------------
 

@@ -85,14 +85,29 @@ def main() -> None:
     )
     tail = (result.stdout or "").strip().splitlines()
     failing = [line for line in tail if line.startswith("FAILED")]
+    went_red = result.returncode != 0
+
+    # A mutation that must NOT turn the suite red. Rare, and worth having: the
+    # tier-three file index is a *hint*, so widening it has to leave every
+    # answer unchanged. A red there would not be coverage, it would be proof
+    # that the suite had started depending on the hint for correctness rather
+    # than for cost -- exactly the property CONTEXT.md 1.13 says must never be
+    # depended on. Reported under its own verdicts so it can never be counted
+    # as an ordinary survivor.
+    if spec.get("expect_survives"):
+        verdict = "held" if not went_red else "HINT-BECAME-TRUTH"
+    else:
+        verdict = "red" if went_red else "SURVIVED"
+
     print(json.dumps({
         "index": index,
         "name": spec["name"],
         "suite": spec.get("suite", "fast"),
-        "verdict": "red" if result.returncode != 0 else "SURVIVED",
+        "verdict": verdict,
         "returncode": result.returncode,
         "first_failures": failing[:4],
         "summary": tail[-1] if tail else "",
+        **({"why": spec["expect_survives"]} if spec.get("expect_survives") else {}),
     }))
 
 

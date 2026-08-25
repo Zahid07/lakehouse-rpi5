@@ -101,6 +101,27 @@ class BatchContext:
     anything, which is the correct behaviour for a sink that does not window.
     """
 
+    window_range: "tuple[datetime, datetime] | None" = None
+    """Half-open ``[lo, hi)`` this view holds **every** source row for, or
+    ``None`` for an ordinary incremental batch.
+
+    Set only by a tier-three recompute, and it is a claim rather than a hint:
+    the view was built by reading back every consumed file that can contain a
+    row in the range, so the rows in it are the whole truth for that range and
+    the sink may replace what it holds there outright.
+
+    A sink must therefore refuse to recompute *without* it rather than assuming
+    it. The difference is the entire tier-three bug class: handed a plain batch
+    view, a sink that replaced the window anyway would overwrite the window with
+    only the newest batch's rows -- which is ``CONTEXT.md`` section 4's FFT mart
+    exactly, holding a spectrum over half a window and 51 bins where the truth
+    was 201. The engine is the only thing that can honestly set this, because
+    the engine is what selected the files.
+
+    Keyword-defaulted for the same reason ``watermark`` is: ``BatchContext`` is
+    a frozen interface, and phase 2 ratified extending it this way.
+    """
+
 
 @runtime_checkable
 class Source(Protocol):

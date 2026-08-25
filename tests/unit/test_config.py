@@ -750,6 +750,10 @@ def test_udfs_are_recorded_but_never_imported():
         aggregates={"spectrum": "arrow_fft(list(v ORDER BY t))"},
         udfs=["definitely_not_installed_pkg.signal:arrow_fft"],
         time_column="event_ts",
+        # A UDF over a list is tier three, so the model is recomputed window by
+        # window and has to say how wide a window is.
+        grain="hour",
+        key=["window_ts", "sensor_id"],
         memory_profile="materialising",
     )
     document = parse_yaml(text, source="models.yaml", env={})

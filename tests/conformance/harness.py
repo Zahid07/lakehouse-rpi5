@@ -292,6 +292,13 @@ class Scenario:
     table: str = "marts.out"
     strategy: str | None = None
     memory_profile: str | None = None
+    udfs: tuple[str, ...] = ()
+    """Dotted paths the engine registers before planning.
+
+    Needed by tier three and by nothing else so far: a UDF over a whole window
+    is the aggregate ``CONTEXT.md`` section 4's FFT mart got wrong, and it
+    cannot be expressed at all without one.
+    """
     max_files_per_trigger: int | None = None
     max_rows_per_trigger: int | None = None
     on_failure: str = "quarantine"
@@ -357,6 +364,7 @@ def build_model(scenario: Scenario, landing: Landing | Path) -> Model:
         lateness=scenario.lateness,
         strategy=scenario.strategy,
         memory_profile=scenario.memory_profile,
+        udfs=list(scenario.udfs),
         on_failure=scenario.on_failure,
         max_attempts=scenario.max_attempts,
     )
@@ -808,6 +816,23 @@ def _offset_at(con: Any, store: DuckLakeStateStore, model: str, sid: int) -> lis
     return sorted(row[0] for row in rows)
 
 
+def _register_udfs(con: Any, scenario: Scenario) -> None:
+    """Put the scenario's UDFs on a ground-truth connection.
+
+    The ground truth stays hand-written SQL; only the *functions* it calls are
+    shared with the model, and they have to be -- ``ds_spread`` is the user's
+    own code, not duckstream's, so a second implementation of it here would be
+    testing numpy rather than the engine. What is being compared is which rows
+    reached the function, which is exactly the thing tier three can get wrong.
+    """
+    from duckstream.registry import resolve
+
+    for path in scenario.udfs:
+        registrar = resolve(path, "udf")
+        register = getattr(registrar, "register", None)
+        (register or registrar)(con)
+
+
 def _recompute(
     con: Any,
     scenario: Scenario,
@@ -815,6 +840,7 @@ def _recompute(
     files: Sequence[str] | None = None,
 ) -> list[tuple]:
     source = landing.source_expression(files)
+    _register_udfs(con, scenario)
     return con.execute(scenario.recompute_sql.format(source=source)).fetchall()
 
 
@@ -1109,8 +1135,14 @@ def _interval(grain: str) -> dt.timedelta:
 def spawn(args: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
     """Run the venv interpreter with ``args``, from the repository root."""
     env = dict(os.environ)
+    # This directory as well as the repo root, so a scenario's `udfs` can name a
+    # registrar in `_udfs.py`. The YAML door resolves dotted paths in *this*
+    # child process, so a UDF the parent can import and the child cannot would
+    # make a tier-three scenario pass through one door and fail through the
+    # other -- which is the drift the parity guarantee exists to catch, arriving
+    # as a test-harness artefact rather than as a real difference.
     env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT), env.get("PYTHONPATH", "")]
+        [str(REPO_ROOT), str(CONFORMANCE_DIR), env.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
     env.pop("PYTHONWARNINGS", None)
     return subprocess.run(

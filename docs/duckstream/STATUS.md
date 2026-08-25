@@ -1,31 +1,40 @@
 # duckstream — status and handover
 
 **Start here if you are a new session.** This file says where the work stands, what
-is proven, what is not, and what to do next. It is current as of **2026-08-24**.
+is proven, what is not, and what to do next. It is current as of **2026-08-25**.
 
 Read in this order:
 
 1. **this file** — where things are
-2. `CONTEXT.md` — measured constraints and settled decisions. **Sixteen** measured
-   constraints; §1.8, §1.9 and §1.10 were measured during the phase-1 build,
-   §1.11 during phase 2, §1.12 during the phase-2b cleanup and §1.16 during
-   phase 4, and none of them is derivable from anything else. §1.10, §1.11 and
-   §1.12 are the *same* constraint met three times in three disguises — read
-   them together, and read §1.16 as the fourth. **§1.16 also corrects two
-   numbers in §1.15**, which had been derived rather than measured
+2. `CONTEXT.md` — measured constraints and settled decisions. **Twenty**
+   measured constraints; §1.8, §1.9 and §1.10 were measured during the phase-1
+   build, §1.11 during phase 2, §1.12 during the phase-2b cleanup, §1.16 during
+   phase 4, §1.17–§1.19 during tier three and §1.20 during phase 4's scan work,
+   and none of them is derivable from anything else. **§1.20's first draft was
+   withdrawn** — read it for what a non-interleaved measurement on this box is
+   worth. §1.10, §1.11 and §1.12 are the *same* constraint met three
+   times in three disguises — read them together, read §1.16 as the fourth and
+   **§1.17 as the fifth**. §1.16 also corrects two numbers in §1.15, which had
+   been derived rather than measured
 3. `PLAN.md` — the specification: what to build, phase by phase
 4. `BUILD_GRAPH.md` — the decision record: frozen interfaces, every ratified
    decision with its reasoning, and the notes each task left for the next
 
-**Phases 1, 2 and 2b are complete. Phase 3 is half done. Phase 4's first item is
-done.** Phases 5–6 are not started.
+**Phases 1, 2, 2b and 3 are complete. Phase 4 is under way**: its first item
+(the consumed set as rows) is done, and the landing-tree scan is now 3–9x
+cheaper. Phases 5–6 are not started.
 
-Phase 3 is foldability. **Tier two executes** — `avg`, `stddev`, `var`,
-population and sample — maintained through sufficient statistics and proved
-against the production bug in `CONTEXT.md` §4. **`udf.py` is written**, so tier
-three has its tooling. **Tier three itself does not execute yet**: a
-`recompute_window` model is still refused, loudly, with a message that says it
-is not built rather than that it cannot be done.
+**Phase 3 is finished: all three tiers execute.** Tier two is maintained through
+sufficient statistics — `(n, mean, M2)`, not `(sum, sum_sq, count)` — and proved
+against the production bug in `CONTEXT.md` §4. **Tier three now executes too**: a
+`recompute_window` model re-derives every window a batch touched, reading back
+exactly the consumed files that can hold a row in it, in chunks sized from an
+estimated row count. That was the last of the differentiator and the reason to
+build this rather than adopt Arroyo.
+
+Two of tier three's design points were settled by measurements taken while
+building it, and both corrected what this file previously told the next session
+to do — see §1.17, §1.18 and "What measurement changed" below.
 
 Phase 4's first item — the one `PLAN.md` says outranks compaction — is complete:
 **the file source's consumed set is rows, not a JSON cell.** §1.16 measured
@@ -41,39 +50,45 @@ what happens when the *data* will not process.
 
 ## Where to start
 
-**Tier three (`recompute_window`), and it is now the cheaper job it should
-always have been.** Finishing phase 3 is the last of the differentiator and the
-reason to build this rather than adopt Arroyo. Its design is settled by
-measurement, so this is implementation rather than research:
+**Retention at the source — the rest of phase 4.** Nothing is half-built; the
+scan work below is finished and audited.
 
-- Re-derive a window from source. The rows are in files consumed long ago —
-  still on disk and still identifiable, because the position records every file
-  consumed rather than a high-water mark. It is now a **table** you can query,
-  which is the part that changed.
-- **Do not hand DuckDB the whole file list with a time predicate.** §1.13
-  measured ~0.1 ms per file listed *whether or not it is skipped*: statistics
-  pruning skips data pages, never the file open. 1.7 ms against 217 ms at 2,160
-  files, and on a Pi that constant multiplies.
-- So build a **file → time-range index, as a hint and never as truth**: it only
-  narrows, never removes entries, and falls back to the whole list when unsure.
-  Over-selecting reads extra files and is still right; under-selecting is
-  silently wrong. Close to free — the watermark scan already reads each batch
-  once, so grouping it by `read_parquet`'s `filename` yields per-file bounds.
-- **That index is now two columns on `duckstream.consumed_files`.** Add `min_ts`
-  and `max_ts` beside `relpath`, and file selection becomes
-  `WHERE max_ts >= lo AND min_ts < hi` — a query against a table that already
-  exists, with the same anti-join machinery and the same tests. This is why
-  phase 4's first item was done first: measured, putting that index in the old
-  JSON offset took the *encoded* offset from 45.1 MB to 71.2 MB — **1.58x worse
-  on the project's worst number**, and §1.16 is careful to keep encoded size and
-  bytes-on-disk apart — and the alternative was building a separate table
-  that this change would then have had to fold back in.
-- `udf.py` is done and is what tier three's aggregates call.
-- Window-range chunking sized from estimated rows comes with it (§1.1: memory is
-  bounded by rows in flight, never by making the UDF faster).
+**The scan is already 3–9x cheaper, and that is a constant factor, not the
+fix.** §1.20 profiled `latest_offset()` and found it was never I/O-bound: 81% of
+it was Python path manipulation above a 4.7 µs `stat`, with `normcase` called
+160,000 times for 2,000 files and every directory `scandir`-ed twice. That is
+fixed, with no semantic change. But the scan is **still linear in ready files**
+and still paid on every trigger including idle ones, so bounding the number of
+files is still the structural answer.
 
-The rest of phase 4 is unchanged and still waiting. Retention at the source
-moved *down* that list rather than off it — see "Known open items".
+Two things put retention ahead of compaction, and the second is new:
+
+- §1.16 left it a *cost* problem rather than a card-wear one, which moved it
+  down the list. Tier three moves it back up, and §1.19 is the number: a
+  recompute costs **~17.5 ms plus ~0.14 ms per file in the window**, so a window
+  fed by a hundred small files costs nearly twice one fed by ten. Meanwhile
+  `latest_offset()` still walks the whole landing tree every trigger at §1.13's
+  ~0.1 ms per file. Fewer files is the only lever that helps both, and it is now
+  the difference between a recompute that is affordable and one that is not.
+- Compaction of the *sink* is still wanted for the reason it always was —
+  inlining is off, so every trigger writes a parquet file — and `PLAN.md` phase
+  4 also names partitioning sink tables by time grain, which is what makes a
+  recomputed window range prune to a few files instead of scanning the mart.
+  That one is worth more now than when it was written, because tier three's
+  clear-then-insert touches the mart by window range on every trigger.
+
+`PLAN.md` phase 4 additionally names scheduling `prune()`, a migration path for
+a renamed aggregate, and compaction of the open-window accumulator. **`prune`
+must never be pointed at `consumed_files`** — trap 19, and now doubly so: those
+rows are the position *and* they carry the time-range index tier three selects
+files with.
+
+One thing to know before touching maintenance: `duckstream.consumed_files` now
+carries `min_ts`, `max_ts` and `n_rows`, and anything that rewrites those rows
+must carry them across. Losing them is not a correctness failure — an unmeasured
+file is stored at the widest range, so it is read by *every* recompute rather
+than by none — but it would quietly turn each recompute back into a full scan,
+which is §1.13's cost arriving through the maintenance meant to reduce it.
 
 Everything deferred out of the phase-2b sweep was written **explicitly into the
 phase that owns it** rather than left as a note here: `PLAN.md` phase 4 now names
@@ -85,9 +100,9 @@ two unmeasured numbers, and release discipline.
 
 ```bash
 cd d:\lakehouse-rpi5
-.venv\Scripts\python.exe -m pytest -q                        # 1162 passed, 2 skipped, ~5m
-.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 1035 passed, 2 skipped, ~70s
-.venv\Scripts\python.exe -m pytest -q -m conformance         # 126 passed, 1 skipped, ~4m
+.venv\Scripts\python.exe -m pytest -q                        # 1211 passed, 3 skipped, ~6m
+.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 1077 passed, 3 skipped, ~60s
+.venv\Scripts\python.exe -m pytest -q -m conformance         # 133 passed, 1 skipped, ~5m
 .venv\Scripts\duckstream.exe --help                          # the console script is installed
 ```
 
@@ -104,10 +119,13 @@ constraints §1.5 and §1.7 are version-sensitive and the aggregate classifier r
 DuckDB's AST format. The package is installed editable (`pip install -e .`), which
 is what makes the console script exist; without it one conformance test skips.
 
-The expected skips are correct and there are now **two**, which is one test in
+The expected skips are correct and there are now **three**. Two are one test in
 two parametrisations: Windows cannot hold two filenames differing only by case,
-so the POSIX half of a case-sensitivity pair cannot run here, and that test now
-runs against both consumed-set shapes. A filtered run (`-m conformance`) skips a
+so the POSIX half of a case-sensitivity pair cannot run here, and that test runs
+against both consumed-set shapes. The third is new and has the same shape for a
+different reason — the scan's symlink test needs a **directory symlink**, which
+Windows will not create without a privilege this box does not hold. Both gaps
+are declared in the mutation audit too, so neither reports as missing coverage. A filtered run (`-m conformance`) skips a
 third — the front-door exemption audit, which needs an unfiltered collection to
 mean anything and says so.
 
@@ -126,7 +144,11 @@ f8c6e1c  feat(duckstream): Arrow-mode UDF registrars for tier three
 23c53b4  fix(tools): keep the mutation audit's worktrees out of the repository
 ```
 
-**The working tree is clean at `23c53b4`.** Nothing is uncommitted.
+**Tier three is uncommitted in the working tree** as of this handover; the last
+commit is `67b852c`. What is new or changed is listed under "How tier three was
+built" and in `BUILD_GRAPH.md`. The full suite is green (1,206 passed, 2 skipped)
+and the mutation audit is 39/39 red with one `held` and one not auditable on
+Windows, so it is committable as it stands.
 
 **The defect that was in `143e43b` is gone.** That commit was taken while a
 mutation audit had `engine.py` mutated and captured a batch judging its own rows
@@ -254,7 +276,287 @@ so the migration and claims lenses never reported — and it still found the
 `status` calls `ensure()`, which *creates* the empty table, so the "table does
 not exist" fallback that would have saved it never fires.
 
-## Phase 3 so far: tier two, and the tooling for tier three
+## Phase 4, the landing-tree scan: 3–9x, and a withdrawn measurement
+
+`latest_offset()` walks the whole landing tree on every trigger, including idle
+ones, and `PLAN.md` said §1.13's ~0.1 ms per file applied to that walk. It does
+not. §1.13 measured **DuckDB opening a parquet footer**; this is `os.walk` plus
+a `stat` plus a glob match, and carrying one constant across to the other is the
+derived-figure mistake §1.15 made, in a new place.
+
+**Profiled instead of assumed, and the walk was never I/O-bound.** At 2,000
+files a bare `os.stat()` loop is 4.7 µs a file and `latest_offset()` is 24.3 µs
+— **81% of it above the syscall**. The offenders were `ntpath.normcase`,
+**160,000 calls for 2,000 files**, reached from `FileOffset.relative_path` once
+per file; and `nt.scandir` called **twice per directory**, once inside `os.walk`
+and again to list the files it had just read.
+
+| Files | Per directory | Before | After | |
+|---|---|---|---|---|
+| 2,000 | 100 | 59.5 ms | 7.0 ms | **8.5x** |
+| 2,000 | 1 *(duckstream's real shape)* | 220.2 ms | 72.1 ms | **3.0x** |
+| 5,000 | 50 | 147.7 ms | 16.3 ms | **9.0x** |
+
+One `scandir` per directory, the relative prefix carried down the walk instead
+of recomputed per file, size and mtime read off the `DirEntry` the walk already
+fetched, and the marker's stat taken from that same listing. **No semantic
+change**, which is the entire design constraint — so the tests defend that it
+stayed one: the prefix join is asserted equal to `FileOffset.relative_path` on a
+nested tree, `DirEntry.stat()` equal to `Path.stat()`, and marker gating,
+non-recursive mode and symlink handling unchanged.
+
+It is a **constant factor, not a fix.** The scan is still linear in ready files.
+Retention is still the structural lever.
+
+### A measurement was published and then withdrawn
+
+The first version of §1.20 reported per-file constants across five tree sizes
+and concluded "minutes per trigger". **Those numbers are gone.** They were taken
+one configuration after another rather than interleaved, and a later run
+disagreed with them by **7x on the same tree and the same shape** — one pass
+said tree shape barely mattered, the next said it mattered enormously, and the
+second was right.
+
+§1.11 already says to interleave anything on this box that takes minutes. The
+lesson that is *new* is which kinds of number survive that mistake: **a profile
+is a ratio measured within one run, so drift cannot flatter it**, and the 81%
+and the 160,000 calls stood while every absolute figure around them fell over.
+When this box is noisy, measure ratios and measure interleaved — or measure
+nothing.
+
+There is a pleasant corollary. This is CPU, not I/O, so it transfers to a Pi
+*better* than a DuckDB measurement would: a Pi's cores are slower, so Python
+path manipulation costs it more, while `stat` on local storage is comparable.
+That is the opposite of this project's usual caveat.
+
+## Phase 3, tier three: the recompute
+
+`PLAN.md` gives tier three one sentence — *"recompute the affected window from
+source; no shortcut exists"* — and that sentence is the design. A median, an
+exact `count(distinct …)`, an order-dependent aggregate or a UDF over a whole
+window has **no decomposition**: there is no pair of partial answers that
+combine into the true one. So the windows a batch touched are read again, in
+full, out of the files they came from.
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| Tier three executes | met | seven conformance scenarios, both doors, diffed against a full recompute after every drain |
+| **§4's FFT bug is impossible** | **met** | one hour over four batches gives `n=16`, `spread=100.0`, `gap=43.0`; a batch-wise fold gives 4, 3.0 and 3.0 |
+| A window already written is corrected | met | a later batch replaces its window's row; untouched windows are left byte-identical |
+| **Chunked equals unchunked** | **met** | budgets of 1, 2, 3 and unbounded compared against each other, not just against ground truth |
+| Window-range chunking sized from estimated rows | met | `recompute.py`; a saturated hour takes a chunk of its own while quiet hours pack together |
+| The file → time-range index | met | `min_ts`/`max_ts`/`n_rows` on `consumed_files`; §1.17 |
+| …and it is a hint, never truth | met | a mutation that *widens* it must not turn the suite red, and is audited for that |
+| A window is never split across chunks | met | chunk bounds are window bounds, asserted |
+| One trigger, one snapshot | met | the recompute's clear-and-insert is inside the engine's existing transaction |
+
+### How it runs, per trigger
+
+1. the bound batch is scanned for the **distinct windows it touched** — undated
+   rows belong to no window and touch none, so they are excluded rather than
+   grouped into a NULL window;
+2. those windows are packed into **chunks** sized from an estimated row count,
+   bounded by `max_rows_per_trigger`;
+3. per chunk, `consumed_files` is asked **which files can hold a row in
+   `[lo, hi)`** — plus this batch's own files, unioned in Python;
+4. the source binds a view over exactly those files, narrowed to the range by
+   two inlined literals, and the sink **clears the range and re-inserts it**.
+
+All of step 4 is inside the engine's one transaction, so a trigger is still one
+snapshot and no reader ever sees the range empty.
+
+### What measurement changed
+
+**Two things this file and `PLAN.md` both told the next session are wrong**, and
+both were found by measuring rather than by review.
+
+*"Close to free — the watermark scan already reads each batch once."* It is a
+**second** scan, and it costs 1.4 ms on a one-file batch and 6.7 ms at forty
+(§1.18). The watermark scan cannot supply per-file bounds: it runs only for a
+model with a lateness horizon, and it reads a view with no `filename` column.
+So the bounds are a separate grouped scan, charged only to models that will be
+recomputed. Parquet footer statistics are 1.6x cheaper and were rejected — they
+come back as **VARCHAR**, and a timestamp re-parsed from DuckDB's rendering of a
+logical type is a plausible wrong number that would be wrong in the direction
+that *narrows*.
+
+*"Falls back to the whole list when unsure."* That is the right rule and the
+obvious encoding of it is the expensive one. Written as
+`min_ts IS NULL OR max_ts IS NULL OR (…)`, the disjunction defeats DuckLake's
+file pruning outright — and because inlining is off, this table is one small
+parquet file per trigger, so selection becomes **O(files ever consumed)**:
+117.5 ms against 2,160 files and climbing, against 12.1 ms flat (§1.17). That is
+§1.13's cost reappearing *inside* the index built to remove it. An unmeasured
+file is stored at `[-infinity, +infinity]` instead, which is a true statement
+about a file nobody has measured rather than a workaround, and needs no
+disjunction at all.
+
+**§1.17 is §1.10's rule in a fifth disguise**, and this file said to assume there
+would be one.
+
+### Four decisions worth keeping
+
+**The sink clears the window range; it does not merge into it.** A recompute
+produces the complete truth for `[lo, hi)`, so a key that no longer has source
+rows must go with them. A `MERGE` updates the keys the recompute found and
+leaves every other key exactly as it was — a mart row nothing supports, still
+looking current. The `DELETE` costs a tombstone (§1.10) and fires per window
+range recomputed rather than per trigger, which is the trade sealed `append`
+already makes for its eviction.
+
+**`BatchContext.window_range` is required, not inferred.** The sink cannot tell
+a view holding one batch from a view holding a whole window by looking, and
+replacing a window with a batch is §4's FFT mart exactly. So the engine — the
+only thing that selected the files — states the claim, and a sink handed a plain
+batch view refuses. Keyword-defaulted on a frozen interface, which is the
+extension phase 2 ratified for `watermark`.
+
+**The batch's own files are supplied from Python, not read back.** They are
+recorded in the same transaction as the write, so whether the index can see them
+yet is a question about DuckLake read-your-own-writes that nothing here should
+depend on. Doing it in Python makes the recompute correct on a first run and on
+a replay after a crash, where those rows do not exist at all.
+
+**And they go to the chunk *planner*, not into its answer.** Merging them into
+the selected file list afterwards reads as equivalent and is not: their rows
+would then be missing from every estimate, so the row budget would silently
+exempt exactly the data being added. That was a real defect, found by a test
+that could not construct a second chunk. Files a bounds scan could not place
+still take the sentinel range, so they are read by every chunk and never
+narrowed away.
+
+### The suite was audited by mutation, and it found four things
+
+**47 deliberate defects, 45 auditable on this platform, and every one of them
+lands where it should.** 43 turn the suite red, **two must not and do not**, and
+two cannot be tested here for two different declared reasons. Fifteen are tier
+three's and six are the landing-tree scan's.
+
+```bash
+.venv/Scripts/python.exe tools/mutation/run_audit.py          # all of them
+.venv/Scripts/python.exe tools/mutation/run_audit.py 26 27    # by index
+```
+
+The two that must not turn it red are worth their own paragraph, because they
+are a new kind of assertion here. *"The overlap test is closed at the top, so a
+window steals the next one's file"* **widens** the tier-three index — and the
+index is a hint, so widening it must change nothing. A red there would not be
+coverage; it would be proof that the suite had started depending on the hint for
+correctness rather than for cost, which is the one thing §1.13 says must never
+happen. *"The scan stops sorting"* is the same shape: planning re-sorts
+candidates by `(mtime, relpath)`, so scan order is not load-bearing and
+reversing it must change no answer. The audit reports both as `held`, apart from
+red and from SURVIVED, so they can never be miscounted as either.
+
+**And two are excused for two different reasons, which the audit now keeps
+apart.** One is *inert* here — it changes a branch Windows does not take. The
+other is *live* here and its **fixture** cannot be built, because Windows will
+not create a directory symlink without a privilege this box lacks; the test that
+would catch it skips for the same reason. That one reported SURVIVED first,
+which is a false hole, and declaring it is the honest alternative to leaving a
+survivor that reads as missing coverage.
+
+**Four mutations survived the first run, and only one was a hole in the suite.**
+Reading each twice is what the README asks for, and all four readings were
+different:
+
+*A genuine hole.* "A model may recompute windows without declaring a grain"
+survived because I added that requirement and never asserted it — I only
+adjusted the existing fixtures to satisfy it, which is exactly how a rule gets
+added and then quietly deleted later. Three tests now pin it, including the
+`append` exemption.
+
+*Two were the wrong **suite**, which reads exactly like a hole.* A defect in the
+unmeasured-file path is inert under conformance, because every file in a
+conformance scenario has a real time column and is therefore measured. A defect
+in chunk *sizing* is inert under conformance **by design** — the suite asserts
+chunked equals unchunked, so how chunks are sized is precisely what it must not
+be able to see. Both are caught by unit tests that already existed. The README's
+"pick the cheapest suite that should catch it" cuts both ways: too cheap reports
+a false green, and too expensive reports a false hole.
+
+*One mutation tested nothing.* "Touched windows include undated rows" removed a
+SQL `IS NOT NULL` that has a redundant twin in the Python comprehension below
+it, so the behaviour survived intact. Mutating one half of a belt-and-braces
+pair proves nothing — and removing **both** then exposed a real defect
+underneath, which is the second reading a survivor is supposed to get. That is
+the undated-row finding below.
+
+**And it happened a second time, to a mutation I wrote for a defect I had just
+fixed.** "A recompute's temp views are only dropped when every chunk succeeds"
+survived, because as first written it still registered each chunk's views
+immediately after creating them — it differed from the real code only if
+`_range_view` itself raised. The behavioural version defers the whole list to
+the end of the loop, and that one is red. Phase 2b recorded exactly this failure
+mode and it is worth restating: **the second question about a survivor is
+whether the mutation does what its name says**, and writing the mutation right
+after fixing the bug is when you are least likely to check.
+
+**And two defects were found by writing the tests rather than by running them.**
+A test that could not construct a second chunk turned out to be right: the
+batch's own files were absent from the row estimate, so the budget silently
+ignored exactly the rows guaranteed to be read. A test for view cleanup found
+that a chunk raising part-way stranded every view its predecessors had made.
+Both now have mutations of their own.
+
+### Four things the build surfaced that were on no list
+
+**A tier-three model was silently dropping undated rows.** Found by the mutation
+audit, on its second reading of a survivor. A row with no event time belongs to
+no window, and a recompute is scoped by a window range — no `[lo, hi)` contains
+NULL — so it cannot be re-derived from one. Tier one folds such rows into a NULL
+window because it never re-reads anything; tier three cannot, and that is a real
+divergence from a full recompute. It was also **invisible**: with no lateness
+horizon there is no watermark policy, so `rows_undated` was `None` and nothing
+recorded that anything had been dropped. `CONTEXT.md`'s ratified rule is
+"dropped **and counted**, never silently absorbed", and "a count that lives only
+in a return value or a rotated log has not been counted". It is now counted in
+the same single scan as `rows_in` (§1.11: ~0.26 ms for extra aggregates over one
+pass), lands in `duckstream.batches`, and both routes to it — with a horizon and
+without — are asserted to agree.
+
+**An upgraded catalog would have silently narrowed every recompute.** Adding
+`min_ts`/`max_ts` with `ALTER TABLE` leaves existing rows NULL, and NULL fails
+the range test — so every file consumed before the upgrade would have stopped
+being selected, and each window would have been rebuilt from part of its data
+without failing. `ADD COLUMN … DEFAULT TIMESTAMP '-infinity'` is refused by
+DuckLake, so the two bound columns are backfilled with an explicit `UPDATE` on
+the pass that adds them: 44 ms over 1,000 rows, 109 ms over 100,000, once per
+catalog. Found while writing the migration comment — the comment as first
+drafted claimed the opposite and was wrong.
+
+**Unwindowed `append` had to be exempted from everything.** It is the
+tier-agnostic escape hatch — no grain, no fold, no revision — so a tier-three
+model in that shape must not be made to declare a grain and must not take the
+recompute path. Requiring the grain unconditionally broke exactly the test that
+exists for that shape, which is the test doing its job.
+
+**The engine was reaching into `FileSource._absolute`.** Consumed-file paths are
+stored relative to the source's root, so only the source can resolve them. A
+private-attribute reach with a `return relpath` fallback would have made a
+third-party source read *plausible wrong files* rather than fail — the worst
+outcome available. It is now a public `absolute_paths`, duck-typed like
+`time_bounds`, and a source without it is refused by name.
+
+**The row budget was not bounding the batch's own rows.** Found by a test that
+could not build a second chunk however tight the budget was set. The chunk
+planner sized itself from `consumed_files`, and this batch's files are written
+in the same transaction as the output — so on a first batch, and on every replay
+after a crash, the index knows nothing about them. The estimate came out zero
+and the planner returned one unbounded chunk for exactly the rows guaranteed to
+be read. §1.1 says memory is bounded by rows in flight and by nothing else, so a
+budget that silently exempts the new data is not a budget. The batch's own files
+now go to the planner as index entries in their own right, at their measured
+bounds or at the sentinel.
+
+**A failing chunk stranded its temp views.** Each chunk binds two — one over the
+files it selected, one narrowing to the range — and they were handed to the
+caller for dropping only when the *whole* recompute returned. A chunk that raised
+left its predecessors' views behind, and a model failing repeatedly stranded
+another set on every retry, for the life of the connection. They are now
+registered as they are created.
+
+## Phase 3: tier two, and the tooling for tier three
 
 ### What executes now
 
@@ -528,9 +830,23 @@ lock makes an overlap *diagnosable* but is advisory: the guarantee still rests o
 DuckDB's catalog file lock, and no test runs two engines concurrently against one
 catalog from two processes.
 
-**Neither** — tier three still does not execute; it is refused with a clear
-message saying so. "Chunked equals unchunked for every `non_foldable` model"
-therefore remains asserted on the foldable tiers only.
+Tier three adds: a window fed by four batches recomputed to the same numbers a
+full recompute of the whole landing tree gives, through both doors; a window
+written two drains ago corrected by a later batch while an untouched window is
+left byte-identical; **chunked equals unchunked** for a `non_foldable` model, at
+budgets of 1, 2, 3 and unbounded, compared against *each other* as well as
+against ground truth; and a recompute reading files from earlier batches rather
+than only its own, proved with values that make the two answers impossible to
+confuse.
+
+**Implemented but not demonstrated**, newly: the file → time-range index is
+demonstrated to *narrow* correctly and never to exclude, but the **scale** at
+which it pays is measured (§1.17) rather than exercised — the conformance suite
+runs tens of files, not 525,600. Nothing about correctness depends on that, by
+construction, because the index only narrows; what is unproven is the saving.
+
+**Neither** — no tier-three model has been run against a corpus large enough for
+the index to matter, and no recompute has been run on a Pi.
 
 **And one number is demonstrated on a dev box, not on a Pi.** §1.16's 1,665x is
 measured with `threads=2` against local SSD. The direction is not in doubt — it
@@ -554,12 +870,17 @@ still owed.
 | A window whose key stops reporting seals only on someone else's timestamp | `watermark.py` | The watermark is per model, not per key, so a sensor that goes silent leaves its last window open until any later-timestamped row arrives for that model. Standard for event-time engines, but it surprises people, so it is documented in the README's limits. |
 | Two memoised values ride on single-writer | `engine.py` | The batch id (§1.10) and the committed watermark (§1.11). They expire together. |
 | The run lock is advisory | `lock.py` | Safety still comes from DuckDB's catalog file lock. The advisory lock exists to say *what happened* in words. Never promote it to the guarantee without a filesystem story. |
+| A tier-three recompute costs a whole window, whatever the batch | `recompute.py` | Inherent, not a defect: a one-row batch landing in a busy hour re-derives that hour. The lever is a finer `grain`, never a smaller batch. Worth saying because the obvious reaction — turn `max_files_per_trigger` down — makes it *worse* by recomputing the same window more often. |
+| A recompute writes a tombstone per window range | `sinks/table.py` | §1.10's ~26 ms `DELETE`, bought deliberately: the range is cleared so a key whose source rows are gone disappears with them. Partitioning sink tables by grain (phase 4) is what would make it cheap. |
+| The index is not rebuilt for a model promoted to tier three | `engine.py` | Bounds are measured only for models that already recompute, so files consumed while a model was tier one carry the sentinel range and are read by every recompute. Correct, and slower than it needs to be. A backfill would be a maintenance task, not a fix. |
+| Nothing removes a `consumed_files` row for a file that no longer exists | `consumed.py` | Unchanged from phase 4, and tier three makes it visible: a recompute selects the file, `read_parquet` does not find it, and the batch fails rather than silently skipping. That is the right way round, but the message comes from DuckDB rather than from duckstream. |
 
 ## Measured this session
 
-Constraints §1.11 through §1.16 were measured during phases 2, 2b, 3 and 4, and
-**six** of the rows below overturned something that was already written down —
-including, now, two of `CONTEXT.md`'s own numbers:
+Constraints §1.11 through §1.20 were measured during phases 2, 2b, 3 and 4, and
+**ten** of the rows below overturned something that was already written down —
+including two of `CONTEXT.md`'s own numbers and, now, two instructions this very
+file gave the session that followed it:
 
 | | Finding | What it overturned |
 |---|---|---|
@@ -571,13 +892,31 @@ including, now, two of `CONTEXT.md`'s own numbers:
 | §1.16 | as rows: **4.9 KB a trigger against 7.97 MB**, 1,665x, and flat in files consumed | — |
 | §1.16 | the offset reaches the disk as parquet: **11.2 GB/day, not 65** | **§1.15's own arithmetic**, derived rather than measured |
 | §1.16 | zlib saves 2.38x *on the disk*, not 7.4x | **§1.15's second number**, same cause |
+| §1.17 | a NULL "unknown" defeats file pruning: **117.5 ms against 12.1 ms** at 2,160 consumed files | **this file's own "falls back to the whole list"**, which is the right rule written the expensive way |
+| §1.18 | per-file bounds are a second scan at 1.4–6.7 ms, not free | **this file's own "close to free — the watermark scan already reads each batch once"** |
+| §1.18 | parquet footer statistics come back as **VARCHAR** | the obvious cheaper source for the index |
+| §1.19 | a recompute is ~17.5 ms plus **~0.14 ms per file** in the window | — |
+| §1.20 | the landing-tree scan was **81% Python path manipulation**, not I/O; now 3–9x faster | **`PLAN.md`'s "§1.13's ~0.1 ms applies to this walk"** |
+| §1.20 | …and its own first draft, whose figures drifted **7x** between runs | **§1.20's own numbers**, taken without interleaving |
 | §2.5 | contention is *not* structurally impossible; the catalog file lock is what saves you | **`CONTEXT.md` §2.5's own claim** |
 | §1.2 | the enum is `duckdb.func`, not `duckdb.functional` | **§1.2's own code sample**, which had never been executed |
+| §1.9 | temp views, temp tables and `DROP VIEW` all work **inside** a DuckLake transaction | **`engine.py`'s own claim** that binding inside would raise, which had never been executed |
 
 §1.10, §1.11 and §1.12 are the same constraint met three times in three
 disguises — do not read state you just wrote, and do not move state to the
-arithmetic when the arithmetic can go to the state. §1.16 is the fourth, and it
-was the most expensive of them. Assume there is a fifth.
+arithmetic when the arithmetic can go to the state. §1.16 was the fourth and the
+most expensive of them. **§1.17 is the fifth**, which the previous version of
+this paragraph said to assume: a predicate that cannot be pruned drags the whole
+table back through Python's side of the fence, and it arrived disguised as a
+null-safety check. Assume there is a sixth.
+
+**And a second rule this round earns: a handover instruction is an argument, not
+a measurement, exactly like a derived number.** Two of the bullets this file gave
+the next session were wrong — "close to free" and "falls back to the whole list"
+— and both were wrong in the same way, by describing a plan that had never been
+run. They were written next to measured constraints and inherited their tone.
+Treat "the design is settled, this is implementation rather than research" as
+the claim it is.
 
 **And a rule the §1.15 correction earns its own line for: a derived number is an
 argument, not a measurement.** 65 GB/day was 45.7 MB times a cadence, and it
@@ -592,8 +931,15 @@ Two are from `PLAN.md`'s performance list, one from its phase 6, and one from
 section attributed all four to §6, and a session that went looking for them
 there found something else entirely:
 
-- **memory ratio per tier** (`PLAN.md`)  — bisect `memory_limit` against `max_rows_per_trigger`
-  and publish the ratio so users can size the knob
+- **memory ratio per tier** (`PLAN.md`) — bisect `memory_limit` against
+  `max_rows_per_trigger` and publish the ratio so users can size the knob.
+  **Partially measured while building tier three, and deliberately not promoted
+  to a constraint**: the same `LIST`-based recompute over 2.4 M rows needs
+  128 MB in one execution and fits in 64 MB at 400,000 rows a chunk, which
+  confirms §1.1's *direction* — the ceiling moves with rows in flight, not with
+  window count — but 64 MB is the floor of the bisection grid, so the low end is
+  clamped and the ratio is not established. Publishing a number from that would
+  be exactly the derived-figure mistake §1.15 made
 - **UDF parallelism penalty** (`PLAN.md`) — quantify the single-thread cost
   (§2.1) so the docs can say when to split across processes
 - **accumulator size under a real workload** (`PLAN.md` phase 6, and §1.3's own
@@ -617,6 +963,8 @@ phases 3–6.
 | **a lateness horizon, on top of the same trigger without one** | **~+5 ms** |
 | **…when it actually drops rows, so a filter view is built** | **~+6 ms** |
 | **sealed `append`: accumulator merge, emit and evict** | **~+20 ms** |
+| **a tier-three recompute step, window of 1 file** | **~17.5 ms** |
+| **…window of 100 files (20,000 rows)** | **~31.3 ms** |
 
 So **seconds, not sub-second, is still the sensible cron unit**, and event time
 does not change that. The horizon's ~5 ms is one extra state append and is
@@ -624,10 +972,26 @@ irreducible: the watermark has to become durable in the same transaction as the
 offset. The extra *scan* is free — reading the newest event time and both drop
 counts alongside the row count costs 0.26 ms more than the `count(*)` it replaced.
 
+The recompute row is **~17.5 ms of intercept and ~0.14 ms per file** (§1.19).
+The intercept is the same commit floor everything else pays; the slope is
+§1.13's per-file open, met again three phases later by a different method. What
+it means operationally is the one thing to remember about this tier: **cost is a
+function of the window, not of the batch.** A one-row batch landing in an hour
+fed by a hundred files pays for a hundred files.
+
 **Measure interleaved on this box.** A first attempt at these numbers ran the
 variants one after another and gave a baseline of 100.8 ms on one run and 67.8 ms
 on the next; machine drift over a two-minute run swamped the effect. Running one
 trigger of each variant in turn made the deltas reproducible to ~1 ms.
+
+**And interleaving is not sufficient on its own.** A first attempt at the
+tier-three row timed whole `engine.run()` calls, interleaved and 40 deep, and
+every variant landed between 130 and 165 ms with tier three sometimes measuring
+*faster* than tier one. The trigger's own fixed costs swamped the difference, so
+the numbers were real and meaningless. They are not in the table: what is
+reported is the recompute step in isolation, which is the part that varies. **A
+number measured through too much machinery is as unpublishable as a derived
+one.**
 
 ## Traps waiting for whoever is next
 
@@ -735,6 +1099,90 @@ And five that phase 4 added:
     reader of that table has to ask the source whether the position has moved
     yet — `metrics._consumed_index` is the pattern.
 
+And five that tier three added:
+
+21. **Do not encode "unknown" as NULL in the file → time-range index.** It is
+    the obvious way to write it and §1.17 measured what it costs: `min_ts IS
+    NULL OR max_ts IS NULL OR (…)` cannot be pruned, so with inlining off and
+    one small parquet file per trigger the selection goes **O(files ever
+    consumed)** — 117.5 ms against 2,160 files and climbing, against 12.1 ms
+    flat. That is precisely the cost class §1.13 says the index exists to
+    remove, reintroduced inside the index. An unmeasured file is stored at
+    `[-infinity, +infinity]`, which is *true* rather than a workaround, and
+    needs no disjunction.
+
+22. **A new column on `consumed_files` is not safe left NULL.** NULL fails
+    `max_ts >= lo AND min_ts < hi`, so an upgraded catalog whose rows kept NULL
+    would silently stop selecting files it had already consumed and every
+    recompute would build its windows out of part of the data. The two bound
+    columns are backfilled to the sentinel in the same transaction that adds
+    them. `ADD COLUMN … DEFAULT TIMESTAMP '-infinity'` is refused by DuckLake
+    (*"we cannot add a column with a non-literal default value"*), so it is an
+    explicit `UPDATE`, paid once per catalog.
+
+23. **A sink must never replace a window from a view it was merely handed.**
+    `BatchContext.window_range` is the engine's claim that the view holds
+    *every* source row for that range, and the sink refuses to recompute
+    without it. Inferring it instead would let a plain batch view overwrite a
+    window with whichever rows arrived last — `CONTEXT.md` section 4's FFT mart
+    exactly, 51 spectrum bins where the truth was 201, and it never fails.
+
+24. **A recompute clears its range; it does not merge into it.** A `MERGE`
+    updates the keys the recompute found and leaves every other key looking
+    current, so a key whose source rows have gone survives as a plausible wrong
+    row. The `DELETE` costs a tombstone (§1.10) and fires per window range
+    recomputed, not per trigger — the same trade sealed `append` already makes.
+
+25. **Unwindowed `append` is exempt from everything tier three requires.** It
+    is the tier-agnostic escape hatch: no grain, no fold, no revision, so a
+    tier-three model in that shape must *not* be given a grain requirement and
+    must *not* take the recompute path. Both the validator and the engine check
+    `grain is not None` as well as the strategy, and a model reaching the
+    recompute planner with no grain would be asked for the windows of something
+    that has none.
+
+26. **A tier-three model drops undated rows; a tier-one model folds them into a
+    NULL window.** The tiers genuinely differ here and it is not a bug: a
+    recompute is scoped by `[lo, hi)` and no range contains NULL, so a row
+    belonging to no window cannot be re-derived from one. The rule is that the
+    difference must be *counted* rather than silent — `rows_undated` is now
+    populated for a recomputing model even when it declares no horizon. Anything
+    that adds a tier-three code path has to keep that true, and note that a
+    model *with* a horizon never reaches it, because undated rows are filtered
+    upstream. That asymmetry is what let a mutation survive here.
+
+And two that phase 4's scan work added:
+
+27. **`FileSource._walk` is a pure optimisation and every part of it is load
+    bearing.** It reproduces `os.walk`'s behaviour deliberately, not
+    incidentally: `is_dir(follow_symlinks=False)` for descending and plain
+    `is_file()` for files, so a symlink *to* a file still counts and a symlinked
+    *directory* is still not descended into. Get that backwards and a symlink
+    pointing up its own tree makes every file consumed twice under two
+    different relative paths — which the anti-join cannot catch, because the
+    paths really are different. The test for it **skips on Windows**, which
+    cannot create a directory symlink without a privilege, and the matching
+    mutation is declared skipped for the same reason rather than left looking
+    like a hole.
+
+28. **Do not reintroduce `relative_path` per file.** It is called once per
+    *directory* and the prefix is carried down the walk. Per file it reaches
+    `os.path.relpath`, which is sixteen `normcase` calls each — §1.20 measured
+    160,000 of them for 2,000 files, and 81% of the whole scan sitting above a
+    4.7 µs `stat`. It reads like the more correct way to build a path and it is
+    the same string.
+
+29. **Retention cannot delete a file a tier-three model may still recompute
+    from.** This trap is written *ahead* of the code, because the code is the
+    next thing anyone builds. A `recompute_window` model reads consumed files
+    back out of the landing tree, so "every model has consumed it" is no longer
+    sufficient grounds to remove one. The extra condition — no tier-three model
+    can still be asked to recompute a window the file feeds — is only knowable
+    past a **lateness horizon**, because without one any row can arrive for any
+    window at any time. Delete anyway and nothing fails: the recompute reads
+    what is left and writes a window built from part of its data. `PLAN.md`
+    phase 4 states it in full.
+
 One phase-1 invariant that phase 2 **deliberately breaks**, so do not restore it:
 **"chunked equals unchunked" no longer holds once a horizon exists.** The
 watermark is a function of what has been observed, so a batch boundary between
@@ -754,6 +1202,7 @@ anything.
 | `windows.py` | tumbling-window arithmetic: the boundary, in one place |
 | `watermark.py` | lateness parsing, the watermark, what falls outside the horizon |
 | `udf.py` | Arrow-mode UDF registrars — the shape §1.2 measured at 2x native |
+| `recompute.py` | tier three's planner: touched windows, chunk sizing, file selection |
 | `metrics.py` | the three lags, per-model status, the health verdict |
 | `lock.py` | one writer per catalog, and a sentence when there is not |
 | `protocols.py` | `Source`, `Sink`, `StateStore`, `BatchPlan`, `BatchLimits`, `BatchContext` |
@@ -762,7 +1211,7 @@ anything.
 | `state.py` | append-only offsets/watermarks/batches; DuckLake and in-memory stores |
 | `lake.py` | attach, settings, inlining enforcement, snapshot introspection |
 | `offsets.py` | offset encoding, and both file-offset shapes — v2 counts, v1 carried a map |
-| `consumed.py` | the consumed-file set as rows: the table, the anti-join, and the two index shapes |
+| `consumed.py` | the consumed-file set as rows: the table, the anti-join, the two index shapes, and the file → time-range index |
 | `sources/files.py` | directory tailing with completion markers |
 | `sinks/table.py` | append, update-by-merge, and sealed windowed append |
 | `sql.py` | identifier and literal quoting |
@@ -771,6 +1220,34 @@ anything.
 | `cli.py` | `run`, `validate`, `status`, `models` |
 
 Not yet written, and named in `PLAN.md`: `sources/mqtt.py` (phase 5).
+
+## How tier three was built
+
+One work unit, for the third time and for the same reason. The file index, the
+chunk planner and the sink's write path are one decision wearing three hats:
+what the index selects decides what a chunk reads, and what a chunk reads
+decides whether the sink may replace a range or must merge into it. There was no
+interface to negotiate between agents.
+
+**Measurement came before code, and it changed the design twice.** Six
+measurement scripts ran before the first line of `recompute.py`: where per-file
+bounds can come from and what they cost, whether the index actually beats the
+whole-list scan, why the first answer to that was *"barely"*, whether the
+sentinel round-trips through three different writers, whether `filename=true`
+works on all three formats, and whether chunking really bounds memory. The
+second of those returned 1.6x where §1.13 predicted ~100x, and chasing that
+number is what produced §1.17 — the single most valuable hour of the build, and
+it would not have happened if the index had been written first and measured
+afterwards.
+
+**The audit was run twice, and the first run was thrown away.** Partway through
+it, reviewing my own diff, I found the engine reaching into
+`FileSource._absolute` with a `return relpath` fallback — a private-attribute
+reach that would make a third-party source read *plausible wrong files* rather
+than fail. Auditing code that is about to change proves nothing about the code
+that ships, so the run was stopped, the fix made, and the audit restarted
+against the settled tree. Nothing was lost but time, because the audit runs in
+throwaway worktrees and touches nothing.
 
 ## How the phase-4 build was run
 

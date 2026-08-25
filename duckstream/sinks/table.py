@@ -44,6 +44,7 @@ import re
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from duckstream.aggregates import (
+    RECOMPUTE_WINDOW,
     Tier,
     classify_expression,
     fold_expression,
@@ -617,6 +618,73 @@ class TableSink:
             f"WHERE {quote_ident(WINDOW_COLUMN)} <= {quote_literal(cutoff)}"
         )
 
+    # -- recompute ----------------------------------------------------------
+
+    def clear_range_sql(self, lo: Any, hi: Any) -> str:
+        """Drop every row whose window falls in ``[lo, hi)``.
+
+        The first half of a tier-three write, and the reason it is a clear
+        rather than a merge. A recompute produces the **complete** truth for its
+        range, so a key that used to have rows there and now has none must
+        disappear -- and a ``MERGE`` cannot express that. It updates the keys
+        the recompute found and silently leaves every other key exactly as it
+        was, so a mart would keep a row no source data supports any more and
+        keep it looking current. That is a plausible wrong number, which is the
+        one failure this framework exists to remove; ``CONTEXT.md`` section 4 is
+        what it costs when nobody notices.
+
+        Bounds are inlined as literals, never computed in SQL: ``CONTEXT.md``
+        1.5, and it also lets DuckLake prune data files on the ``window_ts``
+        statistics it already keeps.
+
+        This is the second deliberate ``DELETE`` on duckstream's write path, and
+        it is deliberate the same way the sealed-append eviction is. 1.10
+        measured a matching DuckLake ``DELETE`` at ~26 ms because it writes a
+        tombstone, which is why *per-trigger* state is append-only -- but this
+        is not per-trigger state, it fires once per window range actually
+        recomputed, and the alternative is not a cheaper write but a wrong one.
+        """
+        return (
+            f"DELETE FROM {self.qualified_name} "
+            f"WHERE {quote_ident(WINDOW_COLUMN)} >= {quote_literal(lo)} "
+            f"  AND {quote_ident(WINDOW_COLUMN)} < {quote_literal(hi)}"
+        )
+
+    def _write_recomputed(
+        self, con: Any, batch_view: str, model: "Model", ctx: "BatchContext"
+    ) -> int | None:
+        """Replace one window range with the aggregate of every row in it.
+
+        Clear then insert, both inside the engine's one transaction, so the two
+        are one DuckLake snapshot and no reader ever sees the range empty.
+
+        ``ctx.window_range`` is required rather than inferred, and refusing
+        without it is the point -- see :attr:`BatchContext.window_range`. A
+        view that does not hold every source row for its range cannot be used
+        to replace that range, and the sink has no way to tell one from the
+        other by looking. Only the engine knows, because only the engine
+        selected the files.
+        """
+        window_range = getattr(ctx, "window_range", None)
+        if window_range is None:
+            raise DuckstreamError(
+                f"TableSink cannot write model {model.name!r} at strategy "
+                f"{model.resolved_strategy!r} from a plain batch view. A tier "
+                f"{str(model.tier)!r} aggregate has no decomposition, so its "
+                f"window has to be re-derived from **every** row in it — and "
+                f"this view carries one batch, which is a fraction of one. "
+                f"Writing it anyway would replace each window with an aggregate "
+                f"over whichever rows happened to arrive last, without failing: "
+                f"CONTEXT.md section 4 records an FFT mart doing exactly that, "
+                f"holding 51 spectrum bins where the truth was 201. The engine "
+                f"sets BatchContext.window_range when it has read a whole range "
+                f"back from source; nothing else may."
+            )
+        lo, hi = window_range
+        self._prepare_table(con, batch_view, model)
+        con.execute(self.clear_range_sql(lo, hi))
+        return _affected(con.execute(self.insert_sql(batch_view, model)))
+
     # -- foldability guard --------------------------------------------------
 
     def _require_additive(self, model: "Model") -> None:
@@ -830,7 +898,14 @@ class TableSink:
                 model writes, naming the columns rather than leaving the
                 operator to diff two schemas by eye.
         """
-        if self.mode == "update" or self.windowed_append(model):
+        # `recompute_window` in update mode is not a fold and is not refused
+        # here: it is written by clearing the range and re-inserting it, so
+        # nothing about it has to decompose. Every other strategy reaching an
+        # update or a windowed-append target does have to, and still must say so
+        # before any DDL runs.
+        if (self.mode == "update" or self.windowed_append(model)) and not (
+            self.mode == "update" and model.resolved_strategy == RECOMPUTE_WINDOW
+        ):
             self._require_additive(model)
         self.output_columns(model)
         con.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.schema)}")
@@ -915,6 +990,8 @@ class TableSink:
         otherwise accepted for the protocol and unused, because idempotency
         comes from the merge key rather than from the batch id.
         """
+        if self.mode == "update" and model.resolved_strategy == RECOMPUTE_WINDOW:
+            return self._write_recomputed(con, batch_view, model, ctx)
         if self.windowed_append(model):
             return self._write_sealed(con, batch_view, model, ctx)
         if self.mode == "update":
