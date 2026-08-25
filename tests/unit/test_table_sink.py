@@ -411,11 +411,14 @@ def make_sealing_model(sink, **overrides) -> Model:
     return make_model(sink, **defaults)
 
 
-def make_ctx(model: Model, batch_id: int, watermark=None) -> BatchContext:
+def make_ctx(
+    model: Model, batch_id: int, watermark=None, window_range=None
+) -> BatchContext:
     return BatchContext(
         model_name=model.name,
         batch_id=batch_id,
         watermark=watermark,
+        window_range=window_range,
         plan=BatchPlan(
             start=None,
             end={"batch": batch_id},
@@ -1465,38 +1468,45 @@ def _non_foldable_model(sink):
     )
 
 
-def test_update_mode_refuses_a_model_that_cannot_be_merged_at_all(lake):
+def test_no_merge_is_ever_built_for_a_model_that_cannot_be_folded(lake):
     """A median has no decomposition, so no merge can stand in for a recompute.
 
-    Refused at three separate doors, because a refusal that only fires on one
-    of them is a refusal something can get past.
+    Tier three now *executes* -- by clearing a window range and re-inserting it
+    from source -- but that changes nothing about the fold: there is still no
+    pair of partial answers that combine, so ``merge_sql`` must still refuse to
+    emit one. This is the assertion that survived tier three being built, and it
+    is the one that matters, because a merge is what silently produces the wrong
+    number.
     """
     sink = TableSink("marts.refused")
     model = _non_foldable_model(sink)
-    model.validate()  # a perfectly valid model; the sink simply cannot fold it
+    model.validate()  # a perfectly valid model; it simply cannot be folded
     assert model.tier == "non_foldable"
 
-    for call in (
-        lambda: sink.ensure(lake, model),
-        lambda: sink.write(
-            lake, make_view(lake, BATCHES[0]), model, make_ctx(model, 1)
-        ),
-        lambda: sink.merge_sql("v", model),
-    ):
-        with pytest.raises(DuckstreamError) as excinfo:
-            call()
-        message = str(excinfo.value)
-        assert "non_foldable" in message
-        assert "recomputed from source" in message
+    with pytest.raises(DuckstreamError) as excinfo:
+        sink.merge_sql("v", model)
+    message = str(excinfo.value)
+    assert "non_foldable" in message
+    assert "recomputed from source" in message
 
-    # Nothing was written. Refusing loudly and writing wrong numbers anyway
-    # would be worse than not refusing at all.
+    # And nothing was written on the way to refusing.
     assert sink.existing_columns(lake) == []
 
 
-def test_the_refusal_explains_why_rather_than_just_failing(lake):
-    # A refusal is only useful if the operator can act on it, so the message has
-    # to name the model, the tier, the strategy, and what to do instead.
+def test_a_recompute_model_refuses_a_plain_batch_view(lake):
+    """The refusal that replaced the old one, and it is the more important one.
+
+    Tier three re-derives a whole window. Handed a view holding one *batch* --
+    a fraction of a window -- the sink must refuse rather than replace the
+    window with an aggregate over whichever rows arrived last. That is
+    ``CONTEXT.md`` section 4's FFT mart exactly: it transformed only the current
+    batch and held 51 spectrum bins where the truth was 201, without ever
+    failing.
+
+    ``BatchContext.window_range`` is how the engine says "this view really does
+    hold every source row for this range". Its absence is what is refused here,
+    so a library user driving the sink by hand cannot reproduce that bug.
+    """
     sink = TableSink("marts.refused")
     model = _non_foldable_model(sink)
     with pytest.raises(DuckstreamError) as excinfo:
@@ -1506,18 +1516,27 @@ def test_the_refusal_explains_why_rather_than_just_failing(lake):
         "hourly_median",
         "non_foldable",
         "recompute_window",
-        "append",
+        "window_range",
+        "51 spectrum bins",
     ):
         assert fragment in message, f"{fragment!r} missing from: {message}"
 
+    # Refusing and writing anyway would be worse than not refusing at all.
+    assert sink.existing_columns(lake) == []
 
-def test_a_declared_stronger_strategy_over_additive_aggregates_is_also_refused(lake):
-    # recompute_window over count/sum is correct but is not what this sink
-    # implements, so it must say so rather than quietly folding instead.
+
+def test_a_declared_stronger_strategy_over_additive_aggregates_also_recomputes(lake):
+    """``recompute_window`` over count/sum is correct, just slower.
+
+    It takes the recompute path like any other model declaring it -- the sink
+    branches on the resolved strategy, not on the tier -- so it needs the same
+    window range and is refused without one.
+    """
     sink = TableSink("marts.refused")
     model = make_model(sink, strategy="recompute_window")
     model.validate()
-    with pytest.raises(DuckstreamError, match="cannot be expressed as a merge"):
+    assert model.tier == "additive"
+    with pytest.raises(DuckstreamError, match="window_range"):
         sink.write(lake, make_view(lake, BATCHES[0]), model, make_ctx(model, 1))
 
 

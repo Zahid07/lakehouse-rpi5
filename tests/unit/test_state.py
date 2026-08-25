@@ -24,6 +24,8 @@ unit-level shadow of W4's fault injection) and
 
 from __future__ import annotations
 
+import datetime as dt
+
 from datetime import datetime, timezone
 
 import duckdb
@@ -733,6 +735,57 @@ def test_ensure_adds_the_event_time_counters_to_a_pre_phase_two_catalog(lake_con
     store.record_batch_end(lake_con, "new", 2, rows_in=3, rows_late=1, rows_undated=0)
     store.commit(lake_con, {"new": OFFSET_A}, {})
     assert store.batch_history(lake_con, "new")[0]["rows_late"] == 1
+
+
+def test_a_catalog_without_the_time_range_index_is_backfilled_not_left_null(lake_con):
+    """The upgrade hazard, and it is the silent kind.
+
+    ``consumed_files`` rows written before phase 3 have no ``min_ts``/``max_ts``.
+    A tier-three recompute selects files with ``max_ts >= lo AND min_ts < hi``,
+    and **NULL fails that test** -- so rows left NULL by the ``ALTER`` would
+    silently stop being read, and a recompute would build each window out of
+    part of its data without failing. That is ``CONTEXT.md`` section 4's bug
+    class arriving as an upgrade note, which is exactly the shape phase 4
+    refused for the v2 offset.
+
+    So the columns are backfilled to the sentinel range, which says the only
+    true thing about a file nobody measured: it may hold a row at any time.
+    ``ADD COLUMN ... DEFAULT TIMESTAMP '-infinity'`` would be tidier and
+    DuckLake refuses it (1.17), so it is an explicit ``UPDATE``.
+    """
+    store = DuckLakeStateStore(catalog=DEFAULT_ALIAS)
+    lake_con.execute(f"CREATE SCHEMA IF NOT EXISTS {DEFAULT_ALIAS}.duckstream")
+    lake_con.execute(
+        f"CREATE TABLE {DEFAULT_ALIAS}.duckstream.consumed_files ("
+        f"model_name VARCHAR, relpath VARCHAR, relpath_fold VARCHAR, "
+        f'"size" BIGINT, mtime_ns BIGINT, batch_id BIGINT, consumed_at TIMESTAMP)'
+    )
+    # Two rows, not one: with a single row a range test cannot be told apart
+    # from an equality (trap 16).
+    lake_con.execute(
+        f"INSERT INTO {DEFAULT_ALIAS}.duckstream.consumed_files VALUES "
+        f"('old', 'a.parquet', 'a.parquet', 1, 10, 1, NULL), "
+        f"('old', 'b.parquet', 'b.parquet', 2, 20, 1, NULL)"
+    )
+
+    store.ensure(lake_con)
+
+    left_null = lake_con.execute(
+        f"SELECT count(*) FROM {store.consumed_files_table} "
+        f"WHERE min_ts IS NULL OR max_ts IS NULL"
+    ).fetchone()[0]
+    assert left_null == 0, "an upgraded row that keeps NULL is never selected again"
+
+    # And they really are selected, by a window chosen at random in time.
+    index = store.consumed_files.index_for(lake_con, "old")
+    picked = index.overlapping(
+        dt.datetime(2026, 6, 1, 5), dt.datetime(2026, 6, 1, 6)
+    )
+    assert sorted(f.relpath for f in picked) == ["a.parquet", "b.parquet"]
+
+    # n_rows is *not* backfilled: it sizes a chunk and never decides whether a
+    # file is read, so "not known" is a real and harmless answer for it.
+    assert all(f.n_rows is None for f in picked)
 
 
 def test_ensure_is_still_idempotent_after_migrating(lake_con):

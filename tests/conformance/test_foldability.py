@@ -119,24 +119,44 @@ def test_engine_add_refuses_the_same_declaration(tmp_path, label):
         con.close()
 
 
-def test_an_additive_model_asking_for_recompute_window_is_also_refused():
-    """The check is keyed off the resolved strategy, not only the tier.
+def test_an_additive_model_asking_for_recompute_window_is_honoured_not_folded():
+    """The strategy is keyed off the declaration, not only off the tier.
 
-    A ``count(*)`` model that explicitly declares ``recompute_window`` is not
-    silently folded as additive: phase 1 implements one strategy and says so.
-    Without this the "declared strategy is honoured" property would hold in one
-    direction only.
+    A ``count(*)`` model that explicitly declares ``recompute_window`` must not
+    be silently folded as additive just because it *could* be. Without this the
+    "declared strategy is honoured" property would hold in one direction only:
+    duckstream would refuse a strategy weaker than the tier and quietly ignore
+    one stronger, which is the half a reconciliation run depends on.
+
+    This test used to assert a refusal, because phase 1 implemented one
+    strategy. Tier three now executes, so the assertion moved to what it always
+    meant to check -- that the model takes the recompute path -- and it is a
+    stronger claim than the refusal was.
     """
     model = _model("count(*)", strategy="recompute_window")
     model.validate()  # the declaration itself is coherent
     assert model.resolved_strategy == "recompute_window"
 
     sink = TableSink("marts.rejected", mode="update")
-    with pytest.raises(Exception) as excinfo:
-        sink.ensure(_FailingConnection(), model)
-    message = str(excinfo.value)
-    assert "recompute_window" in message
-    assert "cannot be expressed as a merge" in message
+    # No merge is built for it: a fold would be correct here and is still not
+    # what was asked for.
+    with pytest.raises(Exception, match="window_range"):
+        sink.write(
+            _FailingConnection(), "v", model, _ctx(model)
+        )
+
+
+def _ctx(model):
+    """A context with no window range -- an ordinary incremental batch."""
+    from duckstream.protocols import BatchContext, BatchPlan
+
+    return BatchContext(
+        model_name=model.name,
+        batch_id=1,
+        plan=BatchPlan(
+            start=None, end={}, payload={}, is_empty=False, has_more=False
+        ),
+    )
 
 
 class _FailingConnection:

@@ -108,9 +108,18 @@ def main() -> None:
     red = [r for r in results if r["verdict"] == "red"]
     excused = [r for r in results
                if r["verdict"] in ("skipped", "not-auditable-here")]
+    # A "held" mutation is one that had to survive, and did -- see
+    # `expect_survives` in audit.py. It is a passing assertion, not a defect and
+    # not a red, so it gets its own line rather than either denominator.
+    held = [r for r in results if r["verdict"] == "held"]
     bad = [r for r in results
-           if r["verdict"] not in ("red", "skipped", "not-auditable-here")]
-    print(f"\n{len(red)}/{len(results) - len(excused)} turned the suite red")
+           if r["verdict"] not in ("red", "held", "skipped", "not-auditable-here")]
+    denominator = len(results) - len(excused) - len(held)
+    print(f"\n{len(red)}/{denominator} turned the suite red")
+    if held:
+        print(f"  {len(held)} had to survive, and did (the hint stayed a hint):")
+        for r in held:
+            print(f"    held: {r['name']}")
     for r in excused:
         print(f"  not tested here: {r['name']} -- {r.get('why', '')}")
     for r in bad:

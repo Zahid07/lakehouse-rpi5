@@ -39,6 +39,7 @@ from duckstream.errors import ModelValidationError
 __all__ = [
     "Tier",
     "FunctionRef",
+    "RECOMPUTE_WINDOW",
     "STRATEGY_FOR_TIER",
     "STRATEGIES",
     "ADDITIVE_FUNCTIONS",
@@ -85,10 +86,16 @@ _TIER_SEVERITY: dict[Tier, int] = {
 }
 
 
+#: The tier-three strategy, named once. Three modules branch on it -- the
+#: model's validation, the sink's write path and the engine's batch lifecycle --
+#: and a strategy name that exists as a bare string in three places is one typo
+#: away from a model silently taking the fold path it must never take.
+RECOMPUTE_WINDOW = "recompute_window"
+
 STRATEGY_FOR_TIER: dict[Tier, str] = {
     Tier.ADDITIVE: "delta_merge",
     Tier.SUFFICIENT_STATISTICS: "sufficient_statistics",
-    Tier.NON_FOLDABLE: "recompute_window",
+    Tier.NON_FOLDABLE: RECOMPUTE_WINDOW,
 }
 
 #: Every strategy name the framework accepts, in increasing order of cost.

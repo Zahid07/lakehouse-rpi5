@@ -75,6 +75,55 @@ preserves size and mtime, so the folded join still finds the file consumed.
 itself. Dropping a row makes duckstream read that file again and fold its rows
 into the mart a second time. Bounding it is a *retention* question -- fewer
 files -- not a pruning one.
+
+The file -> time-range index
+----------------------------
+
+``min_ts``, ``max_ts`` and ``n_rows`` sit beside ``relpath`` and are what makes
+a tier-three ``recompute_window`` affordable. ``CONTEXT.md`` 1.13 measured the
+problem: statistics pruning skips data pages but never the **file open**, at a
+flat ~0.1 ms per file listed whether it is read or not -- so handing DuckDB a
+year of consumed files and a time predicate costs ~52 seconds a recompute on a
+dev box, and more on a Pi, where the cost is small random I/O. Asking the table
+which files can possibly contain a window turns that back into a lookup.
+
+It is a **hint and never truth**: it only ever narrows, and a file it cannot
+place is a file it must return. Over-selecting reads extra files and still
+gives the right answer; under-selecting is silently wrong, which is the one
+outcome this framework refuses. Correctness therefore never depends on these
+three columns and only cost does -- which is what makes it safe for them to be
+absent on a catalog written before they existed, on a source that cannot
+supply them, and on every model that is not tier three.
+
+Unknown bounds are the widest bounds
+------------------------------------
+
+A file whose range is not known is stored as ``[-infinity, +infinity]``, not as
+NULL, and ``CONTEXT.md`` 1.17 is why. Both encodings express the same rule --
+*if you cannot place it, always select it* -- but only one of them is a plain
+conjunctive range, and only a plain conjunctive range can be pruned. Written
+the obvious way::
+
+    WHERE min_ts IS NULL OR max_ts IS NULL OR (max_ts >= lo AND min_ts < hi)
+
+the disjunction defeats DuckLake's data-file pruning outright. Inlining is off
+(1.7), so this table is one small parquet file per trigger, and selection then
+goes **O(files ever consumed)** -- measured at 118 ms against 2,160 consumed
+files and climbing, which is exactly the cost class 1.13 says the index exists
+to remove. With the sentinel the same rule is::
+
+    WHERE max_ts >= lo AND min_ts < hi
+
+which prunes, and measures flat. The sentinel is not a trick standing in for
+NULL: *this file may contain a row at any time* is a true statement about a
+file nobody has measured, and stating it that way makes the widest answer fall
+out of the ordinary comparison instead of needing a special case that a reader
+of the SQL can forget to write.
+
+One consequence worth naming: a genuine event timestamp of exactly
+``datetime.max`` is indistinguishable from "unknown", so its file is selected by
+every range. That is over-selection, which the contract above already calls
+harmless.
 """
 
 from __future__ import annotations
@@ -84,14 +133,20 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Iterator, Mapping, Sequence
 
+from dataclasses import dataclass
+
 from duckstream.errors import DuckstreamError
 from duckstream.offsets import CASE_INSENSITIVE_PATHS, FileEntry, FileOffset
 from duckstream.protocols import Offset
+from duckstream.sql import quote_literal
 
 __all__ = [
     "CONSUMED_TABLE",
     "ENTRIES_KEY",
+    "UNKNOWN_MIN",
+    "UNKNOWN_MAX",
     "ConsumedFiles",
+    "FileBounds",
     "entries_in",
     "MapIndex",
     "TableIndex",
@@ -114,9 +169,49 @@ ENTRIES_KEY = "entries"
 #: suffix is not decoration: two indexes may share one connection.
 _REL_PREFIX = "duckstream_consumed_"
 
+#: The time range recorded for a file whose bounds are not known. **Not NULL**,
+#: and that is a measured decision rather than a stylistic one -- see the
+#: "Unknown bounds are the widest bounds" section of the module docstring.
+#: ``datetime.min`` and ``datetime.max`` are what DuckDB's ``TIMESTAMP
+#: '-infinity'`` and ``TIMESTAMP 'infinity'`` read back as, so a row written by
+#: SQL, by a bound parameter or through pyarrow lands on the same two values.
+UNKNOWN_MIN = datetime.min
+UNKNOWN_MAX = datetime.max
+
+#: ``{relpath: (min_ts, max_ts, n_rows)}``. ``None`` in any position means "not
+#: known", and every writer here turns that into the widest possible answer
+#: rather than into a NULL.
+FileBounds = Mapping[str, "tuple[datetime | None, datetime | None, int | None]"]
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+@dataclass(frozen=True)
+class ConsumedFile:
+    """One consumed file as the time-range index knows it.
+
+    ``min_ts``/``max_ts`` are never ``None`` when they come out of the table --
+    an unmeasured file is stored at the sentinel bounds, not at NULL. They are
+    typed optional anyway because a catalog written before these columns existed
+    has NULL in them until the row is replaced, and a reader that assumed
+    otherwise would fail on exactly the upgrade this design is meant to survive.
+    """
+
+    relpath: str
+    min_ts: datetime | None = None
+    max_ts: datetime | None = None
+    n_rows: int | None = None
+
+    @property
+    def bounded(self) -> bool:
+        """Is this file's range actually known, or is it the widest answer?"""
+        return (
+            self.min_ts is not None
+            and self.max_ts is not None
+            and (self.min_ts, self.max_ts) != (UNKNOWN_MIN, UNKNOWN_MAX)
+        )
 
 
 def entries_in(payload: Any) -> dict[str, FileEntry]:
@@ -193,13 +288,32 @@ class MapIndex:
         *,
         start: Offset | None = None,
         end: Offset | None = None,
+        bounds: "FileBounds | None" = None,
     ) -> int:
         """Nothing to write: this shape records the set in the offset itself.
 
         And nothing to verify either — the count and the set cannot disagree
         when they are the same object.
+
+        ``bounds`` is accepted and dropped. The v1 offset has nowhere to put a
+        time-range index, and giving it one was measured and rejected: it took
+        the encoded offset from 45.1 MB to 71.2 MB, 1.58x worse on the project's
+        worst number. That is the reason the index lives in the table, and the
+        reason this shape simply does without it -- a model still reading a v1
+        offset recomputes from the whole file list, which is slower and right.
         """
         return 0
+
+    def overlapping(self, lo: datetime, hi: datetime) -> list["ConsumedFile"]:
+        """Every consumed file, unbounded. The honest answer for this shape.
+
+        There is no time-range index in a v1 offset, so nothing here can narrow
+        anything -- and *narrowing is the only thing the index is allowed to
+        do*. Returning every consumed file at the sentinel range is therefore
+        not a degraded answer, it is the correct one: a recompute reads more
+        files than it needs and produces exactly the same numbers.
+        """
+        return [ConsumedFile(relpath=path) for path in self._consumed]
 
 
 class TableIndex:
@@ -260,6 +374,48 @@ class TableIndex:
             ).fetchall()
         return [row[0] for row in rows]
 
+    def overlapping(self, lo: datetime, hi: datetime) -> list["ConsumedFile"]:
+        """Every consumed file that can possibly hold a row in ``[lo, hi)``.
+
+        The hint, doing its one job. A row survives when ``max_ts >= lo AND
+        min_ts < hi``, which is the ordinary half-open overlap test -- and a
+        file whose range was never measured is stored as the widest possible
+        range, so it satisfies that test for every window and is returned. The
+        module docstring has the measurement behind writing it this way rather
+        than as an ``IS NULL OR ...`` disjunction; the short version is that the
+        disjunction cannot be pruned and turns this back into the O(n) scan the
+        index exists to remove.
+
+        The bounds reach SQL as inlined literals, never as a subquery
+        (``CONTEXT.md`` 1.5), which is also what lets DuckLake skip this table's
+        own data files on their ``min_ts``/``max_ts`` statistics.
+
+        ``DISTINCT`` on the path because one file can hold several rows: a file
+        rewritten in place is consumed again at its new identity, and the
+        recompute wants to read it once. The widest bounds and the largest row
+        count among those rows are the ones that survive, which keeps this an
+        over-estimate in both directions -- the safe one for a hint.
+        """
+        rows = self.con.execute(
+            f"SELECT relpath, min(min_ts), max(max_ts), max(n_rows) "
+            f"FROM {self.table} "
+            f"WHERE model_name = ? "
+            f"  AND max_ts >= {quote_literal(lo)} "
+            f"  AND min_ts < {quote_literal(hi)} "
+            f"GROUP BY relpath "
+            f"ORDER BY relpath",
+            [self.model_name],
+        ).fetchall()
+        return [
+            ConsumedFile(
+                relpath=row[0],
+                min_ts=row[1],
+                max_ts=row[2],
+                n_rows=None if row[3] is None else int(row[3]),
+            )
+            for row in rows
+        ]
+
     def count(self) -> int:
         """How many consumption records this model has.
 
@@ -296,6 +452,7 @@ class TableIndex:
         *,
         start: Offset | None = None,
         end: Offset | None = None,
+        bounds: "FileBounds | None" = None,
     ) -> int:
         """Append the consumption records a batch payload declares. How many.
 
@@ -312,8 +469,15 @@ class TableIndex:
         Given ``start`` and ``end``, it also checks that what was written is
         what the checkpoint claims. See :meth:`_verify` -- that check is not
         defensive tidiness, it closes a real hole.
+
+        ``bounds`` carries the file -> time-range index for the files being
+        recorded, and is optional in the strict sense: a caller that has not
+        measured them, or cannot, passes nothing and every row lands at the
+        sentinel range. Correctness does not depend on it -- see the module
+        docstring -- so it is never an error to omit, and a file it does not
+        mention is simply one no recompute can rule out.
         """
-        written = self.append(batch_id, entries_in(payload))
+        written = self.append(batch_id, entries_in(payload), bounds=bounds)
         if start is not None or end is not None:
             self._verify(written, start, end)
         return written
@@ -348,8 +512,20 @@ class TableIndex:
             f"declare every file it plans under the {ENTRIES_KEY!r} payload key."
         )
 
-    def append(self, batch_id: int, entries: Mapping[str, FileEntry]) -> int:
-        """Insert one row per entry. The write half of :meth:`unconsumed`."""
+    def append(
+        self,
+        batch_id: int,
+        entries: Mapping[str, FileEntry],
+        *,
+        bounds: "FileBounds | None" = None,
+    ) -> int:
+        """Insert one row per entry. The write half of :meth:`unconsumed`.
+
+        A file ``bounds`` says nothing about is written at the sentinel range,
+        so it is selected by every recompute rather than by none. That default
+        is the whole reason the index can be a hint: forgetting to measure a
+        file costs a read, never an answer.
+        """
         if not entries:
             return 0
         paths = list(entries)
@@ -357,13 +533,15 @@ class TableIndex:
             paths,
             [entries[path][FileOffset.SIZE_KEY] for path in paths],
             [entries[path][FileOffset.MTIME_KEY] for path in paths],
+            bounds=bounds,
         )
         with self._registered(probe) as name:
             self.con.execute(
                 f"INSERT INTO {self.table} "
                 f'(model_name, relpath, relpath_fold, "size", mtime_ns, '
-                f"batch_id, consumed_at) "
-                f'SELECT ?, s.relpath, s.relpath_fold, s."size", s.mtime_ns, ?, ? '
+                f"batch_id, consumed_at, min_ts, max_ts, n_rows) "
+                f'SELECT ?, s.relpath, s.relpath_fold, s."size", s.mtime_ns, ?, ?, '
+                f"       s.min_ts, s.max_ts, s.n_rows "
                 f'FROM "{name}" s',
                 [self.model_name, int(batch_id), _utcnow()],
             )
@@ -373,9 +551,26 @@ class TableIndex:
 
     @staticmethod
     def _arrow(
-        paths: Sequence[str], sizes: Sequence[int], mtimes: Sequence[int]
+        paths: Sequence[str],
+        sizes: Sequence[int],
+        mtimes: Sequence[int],
+        *,
+        bounds: "FileBounds | None" = None,
     ) -> Any:
         import pyarrow as pa
+
+        bounds = bounds or {}
+        lows: list[datetime] = []
+        highs: list[datetime] = []
+        counts: list[int | None] = []
+        for path in paths:
+            low, high, rows = bounds.get(path, (None, None, None))
+            # A half-known range is treated as unknown in the direction that is
+            # missing, never guessed from the other half: a file whose maximum
+            # is known and whose minimum is not could still begin anywhere.
+            lows.append(UNKNOWN_MIN if low is None else low)
+            highs.append(UNKNOWN_MAX if high is None else high)
+            counts.append(None if rows is None else int(rows))
 
         return pa.table(
             {
@@ -385,6 +580,9 @@ class TableIndex:
                 ),
                 "size": pa.array([int(v) for v in sizes], type=pa.int64()),
                 "mtime_ns": pa.array([int(v) for v in mtimes], type=pa.int64()),
+                "min_ts": pa.array(lows, type=pa.timestamp("us")),
+                "max_ts": pa.array(highs, type=pa.timestamp("us")),
+                "n_rows": pa.array(counts, type=pa.int64()),
             }
         )
 
@@ -415,6 +613,16 @@ class ConsumedFiles:
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return f"ConsumedFiles({self.table!r})"
 
+    #: Columns carrying the file -> time-range index, and their types. Named
+    #: here rather than only in the ``CREATE`` because the state store's
+    #: migration adds them to a catalog written before they existed, and two
+    #: lists that have to agree should be one list.
+    INDEX_COLUMNS: ClassVar[dict[str, str]] = {
+        "min_ts": "TIMESTAMP",
+        "max_ts": "TIMESTAMP",
+        "n_rows": "BIGINT",
+    }
+
     def ddl(self) -> str:
         return (
             f"CREATE TABLE IF NOT EXISTS {self.table} (\n"
@@ -424,7 +632,10 @@ class ConsumedFiles:
             f'    "size" BIGINT,\n'
             f"    mtime_ns BIGINT,\n"
             f"    batch_id BIGINT,\n"
-            f"    consumed_at TIMESTAMP\n"
+            f"    consumed_at TIMESTAMP,\n"
+            f"    min_ts TIMESTAMP,\n"
+            f"    max_ts TIMESTAMP,\n"
+            f"    n_rows BIGINT\n"
             f")"
         )
 

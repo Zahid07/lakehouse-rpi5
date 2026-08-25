@@ -1238,3 +1238,171 @@ def test_a_malformed_glob_is_refused_at_construction():
     with pytest.raises(ConfigError) as excinfo:
         FileSource("landing", pattern="f[z-a].parquet")
     assert "glob" in str(excinfo.value)
+
+
+# ==========================================================================
+# The scan's fast path
+#
+# `_scan` builds each relative path by joining a prefix carried down the walk,
+# instead of calling `FileOffset.relative_path` per file, and reads size and
+# mtime off the `DirEntry` the walk already fetched. `CONTEXT.md` 1.20 has the
+# measurement: 8.5x where a directory holds several files, 3x at one file per
+# directory, which is duckstream's real shape.
+#
+# All of that is a pure optimisation, so what these tests defend is that it
+# stayed one. The risk is not that it is slow, it is that it quietly disagrees
+# with the general implementation on some path shape nobody thought about.
+# ==========================================================================
+
+
+def test_the_scan_builds_the_same_relative_paths_as_the_general_implementation(tmp_path):
+    """The prefix join must equal `FileOffset.relative_path`, path for path.
+
+    Asserted against a nested tree rather than a flat one, because a flat tree
+    is the case where a prefix cannot be wrong -- it is empty.
+    """
+    root = tmp_path / "landing"
+    for relative in ("a", "a/b", "a/b/c", "d"):
+        directory = root / relative
+        directory.mkdir(parents=True)
+        (directory / "part.parquet").write_bytes(b"x")
+        (directory / "_READY").write_text("", encoding="utf-8")
+    (root).mkdir(exist_ok=True)
+    (root / "top.parquet").write_bytes(b"x")
+    (root / "_READY").write_text("", encoding="utf-8")
+
+    source = FileSource(root.as_posix(), marker="_READY")
+    scanned = source._scan()
+
+    expected = {
+        FileOffset.relative_path(root, path)
+        for path in root.rglob("*.parquet")
+    }
+    assert set(scanned) == expected
+    assert "top.parquet" in scanned, "a file in the root gets no leading slash"
+    assert "a/b/c/part.parquet" in scanned, "a nested file keeps its whole prefix"
+    assert not any(p.startswith("/") or p.startswith("./") for p in scanned)
+
+
+def test_the_scan_reports_the_same_size_and_mtime_as_a_direct_stat(tmp_path):
+    """`DirEntry.stat()` must agree with `Path.stat()`.
+
+    File identity is `(path, size, mtime)`, so a `DirEntry` whose cached stat
+    disagreed with a fresh one would make duckstream re-read consumed files or
+    skip new ones -- and it would do it silently.
+    """
+    root = tmp_path / "landing"
+    directory = root / "b1"
+    directory.mkdir(parents=True)
+    for index in range(3):
+        (directory / f"p{index}.parquet").write_bytes(b"x" * (index + 1))
+    (directory / "_READY").write_text("", encoding="utf-8")
+
+    source = FileSource(root.as_posix(), marker="_READY")
+    for relpath, entry in source._scan().items():
+        stat = (root / relpath).stat()
+        assert entry[FileOffset.SIZE_KEY] == stat.st_size, relpath
+        assert entry[FileOffset.MTIME_KEY] == stat.st_mtime_ns, relpath
+
+
+def test_readiness_is_the_same_answer_with_or_without_the_walk_s_entries(tmp_path):
+    """`_is_ready` has two paths now; they must not disagree.
+
+    The entry-based one saves a stat per directory. A directory is ready, not
+    ready, or has no marker at all, and both paths have to say the same thing
+    about each.
+    """
+    root = tmp_path / "landing"
+    ready = root / "ready"
+    ready.mkdir(parents=True)
+    (ready / "p.parquet").write_bytes(b"x")
+    (ready / "_READY").write_text("", encoding="utf-8")
+    unmarked = root / "unmarked"
+    unmarked.mkdir()
+    (unmarked / "p.parquet").write_bytes(b"x")
+
+    source = FileSource(root.as_posix(), marker="_READY")
+    now = 10**19  # far in the future, so a settle delay would never pass
+    for prefix, directory, entries in source._walk(root):
+        with_entries = source._is_ready(directory, now, entries)
+        without = source._is_ready(directory, now)
+        assert with_entries == without, directory
+
+    assert set(source._scan()) == {"ready/p.parquet"}
+
+
+def test_an_unmarked_directory_still_gates_only_its_own_files(tmp_path):
+    """The walk changed; the gating rule did not.
+
+    A file is eligible when the marker sits beside it, never because an
+    ancestor is marked -- so a marked parent must not drag an unmarked child in.
+    """
+    root = tmp_path / "landing"
+    parent = root / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (parent / "p.parquet").write_bytes(b"x")
+    (parent / "_READY").write_text("", encoding="utf-8")
+    (child / "c.parquet").write_bytes(b"x")   # no marker of its own
+
+    source = FileSource(root.as_posix(), marker="_READY")
+    assert set(source._scan()) == {"parent/p.parquet"}
+
+
+def test_a_non_recursive_source_reads_only_the_root(tmp_path):
+    root = tmp_path / "landing"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (root / "top.parquet").write_bytes(b"x")
+    (root / "_READY").write_text("", encoding="utf-8")
+    (nested / "deep.parquet").write_bytes(b"x")
+    (nested / "_READY").write_text("", encoding="utf-8")
+
+    source = FileSource(root.as_posix(), marker="_READY", recursive=False)
+    assert set(source._scan()) == {"top.parquet"}
+
+
+def _can_symlink_directories(tmp: Path) -> bool:
+    """Windows refuses directory symlinks without a privilege most boxes lack."""
+    probe = tmp / "_symlink_probe"
+    probe.mkdir()
+    try:
+        os.symlink(probe, tmp / "_symlink_link", target_is_directory=True)
+        return True
+    except (OSError, NotImplementedError, AttributeError):
+        return False
+
+
+def test_the_walk_does_not_descend_into_symlinked_directories(tmp_path):
+    """``os.walk`` does not follow directory symlinks, and neither may ``_walk``.
+
+    This is the one semantic the hand-rolled walk could plausibly have lost, and
+    losing it is not a crash: a symlink pointing back up its own tree makes the
+    scan read the same files under a second set of paths, so every one of them
+    is consumed twice under two different relative names. The anti-join cannot
+    save that -- the paths genuinely differ.
+
+    Skipped where a directory symlink cannot be created, which on Windows needs
+    a privilege most boxes do not grant. The mutation audit carries a matching
+    entry excused for the same reason, so this gap is declared rather than
+    silent.
+    """
+    if not _can_symlink_directories(tmp_path):
+        pytest.skip("creating a directory symlink needs a privilege this box lacks")
+
+    root = tmp_path / "landing"
+    real = root / "real"
+    real.mkdir(parents=True)
+    (real / "part.parquet").write_bytes(b"x")
+    (real / "_READY").write_text("", encoding="utf-8")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "other.parquet").write_bytes(b"x")
+    (outside / "_READY").write_text("", encoding="utf-8")
+    os.symlink(outside, root / "linked", target_is_directory=True)
+
+    source = FileSource(root.as_posix(), marker="_READY")
+    assert set(source._scan()) == {"real/part.parquet"}, (
+        "the walk followed a directory symlink; os.walk does not"
+    )

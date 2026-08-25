@@ -1,4 +1,4 @@
-"""Deliberate defects for the phase-4 consumed-file change.
+"""Deliberate defects: phase 4's consumed-file change, and phase 3's tier three.
 
 Each entry is a plausible wrong decision somebody could actually make, not a
 syntax error. `find` must appear exactly once in `file`; it is replaced by
@@ -8,8 +8,16 @@ syntax error. `find` must appear exactly once in `file`; it is replaced by
   "fast"   -- pytest -m "not conformance"
   "conf"   -- pytest -m conformance
   "all"    -- everything
-Choosing too cheap a suite is a way to report a false green, so anything about
-snapshot atomicity or DuckLake behaviour is on a conformance run.
+
+Choosing too cheap a suite reports a false green, so anything about snapshot
+atomicity or DuckLake behaviour is on a conformance run. Choosing too
+*expensive* a one reports a false hole that looks exactly like a real one -- see
+the README, which records the two structural reasons a conformance run can be
+blind to a defect on purpose.
+
+`expect_survives` marks the rare mutation that must **not** turn the suite red,
+with a sentence saying why. There is one: widening the tier-three file index.
+The index is a hint, so making it select more files must change no answer.
 """
 
 MUTATIONS = [
@@ -122,6 +130,7 @@ MUTATIONS = [
                             plan.payload,
                             start=plan.start,
                             end=plan.end,
+                            bounds=bounds,
                         )""",
             repl="                    recorded = 0 if index is None else -1",
         ),
@@ -238,6 +247,283 @@ MUTATIONS = [
         file="duckstream/engine.py",
         find='        parameter = signature.parameters.get("consumed")\n        if parameter is not None:\n            return parameter.kind is not parameter.POSITIONAL_ONLY',
         repl='        parameter = signature.parameters.get("consumed")\n        if parameter is None:\n            return True\n        if parameter is not None:\n            return parameter.kind is not parameter.POSITIONAL_ONLY',
+        suite="fast",
+    ),
+    # -- phase 3, tier three: recompute_window ------------------------------
+    #
+    # The tier with no decomposition, so every defect here is a *silent* wrong
+    # answer rather than a failure. CONTEXT.md section 4's FFT mart is the
+    # reference: it held 51 spectrum bins where the truth was 201, and nothing
+    # about it failed.
+    dict(
+        # THE tier-three bug, exactly as production produced it.
+        name="the recompute aggregates the batch instead of the whole window",
+        file="duckstream/engine.py",
+        find="""            files_for=lambda lo, hi: (
+                [] if index is None else index.overlapping(lo, hi)
+            ),""",
+        repl="""            files_for=lambda lo, hi: [],""",
+        suite="conf",
+        note="reads only the files this batch consumed -- section 4's mart",
+    ),
+    dict(
+        name="the recompute merges into the target instead of replacing the range",
+        file="duckstream/sinks/table.py",
+        find="""        con.execute(self.clear_range_sql(lo, hi))
+        return _affected(con.execute(self.insert_sql(batch_view, model)))""",
+        repl="""        return _affected(con.execute(self.insert_sql(batch_view, model)))""",
+        suite="conf",
+        note="every recompute appends a second row for the window",
+    ),
+    dict(
+        name="a chunk is not narrowed to its window range, so rows are counted twice",
+        file="duckstream/engine.py",
+        find="""            f"WHERE {column} >= {quote_literal(chunk.lo)} "
+            f"  AND {column} < {quote_literal(chunk.hi)}\"""",
+        repl="""            f"WHERE {column} >= {quote_literal(chunk.lo)} "
+            f"  AND {column} < {quote_literal(chunk.hi)} OR TRUE\"""",
+        suite="conf",
+        note="only visible when chunking actually splits the touched span",
+    ),
+    dict(
+        # The measured decision in CONTEXT.md 1.17, from the other side: an
+        # unmeasured file must be selected by every range, never by none.
+        name="an unmeasured file is stored at NULL bounds instead of the widest",
+        file="duckstream/consumed.py",
+        find="""            lows.append(UNKNOWN_MIN if low is None else low)
+            highs.append(UNKNOWN_MAX if high is None else high)""",
+        repl="""            lows.append(low)
+            highs.append(high)""",
+        suite="fast",
+        note=(
+            "NULL fails the range test, so the file is silently never re-read. "
+            "`fast`, not `conf`: every file in a conformance scenario has a real "
+            "time column, so none of them is ever unmeasured and the mutation is "
+            "inert there. Ran as `conf` first and survived for exactly that "
+            "reason -- the suite was fine, the suite *choice* was not."
+        ),
+    ),
+    dict(
+        name="the file index is treated as truth, so the batch's own files are dropped",
+        file="duckstream/engine.py",
+        find="            own=self._own_files(plan, bounds),",
+        repl="            own=[],",
+        suite="conf",
+        note=(
+            "Correct only if the index can already see this batch's rows, and it "
+            "cannot -- they are written in the same transaction. Drops them from "
+            "the read *and* from the row estimate, which is how the second half "
+            "of this was found: a test that could not construct a second chunk."
+        ),
+    ),
+    dict(
+        name="the overlap test is closed at the top, so a window steals the next one's file",
+        file="duckstream/consumed.py",
+        find="            f\"  AND min_ts < {quote_literal(hi)} \"",
+        repl="            f\"  AND min_ts <= {quote_literal(hi)} \"",
+        suite="conf",
+        note="over-selection, so it must NOT change any answer -- see below",
+        expect_survives=(
+            "The index only narrows. A wider overlap test reads more files and "
+            "gets the same numbers, so a red here would mean the suite had "
+            "started depending on the hint for correctness rather than for cost."
+        ),
+    ),
+    dict(
+        name="touched windows include undated rows, so a NULL window is recomputed",
+        file="duckstream/recompute.py",
+        find="f\"FROM {quote_ident(view)} WHERE {column} IS NOT NULL ORDER BY w\"",
+        repl="f\"FROM {quote_ident(view)} ORDER BY w\"",
+        suite="fast",
+        note=(
+            "Both halves, deliberately. Removing only the SQL filter survives, "
+            "and reading that survivor twice is what the README asks for: the "
+            "suite is not holed, the guard is simply belt-and-braces and the "
+            "Python comprehension still drops the NULL. A mutation of one half "
+            "of a redundant pair tests nothing, so this one removes both."
+        ),
+        also=dict(
+            file="duckstream/recompute.py",
+            find="    return [row[0] for row in rows if row[0] is not None]",
+            repl="    return [row[0] for row in rows]",
+        ),
+    ),
+    dict(
+        name="chunks are sized by window count rather than by estimated rows",
+        file="duckstream/recompute.py",
+        find="        if pending and (estimate is None or estimate > max_rows):",
+        repl="        if pending and len(trial) > max_rows:",
+        suite="fast",
+        note=(
+            "PLAN.md: window density varies, so a window count is no memory "
+            "bound. `fast`, not `conf`, and the reason is worth keeping: "
+            "conformance asserts chunked *equals* unchunked, so a change to how "
+            "chunks are sized is precisely what it must NOT be able to see. Only "
+            "a unit test on the planner can catch this. Ran as `conf` first and "
+            "survived for that reason."
+        ),
+    ),
+    dict(
+        name="an unknown row estimate is treated as zero rather than as unbounded",
+        file="duckstream/recompute.py",
+        find="""    total = 0
+    for candidate in selected:
+        if candidate.n_rows is None:
+            return None""",
+        repl="""    total = 0
+    for candidate in selected:
+        if candidate.n_rows is None:
+            continue""",
+        suite="fast",
+        note="under-estimating is the direction that OOMs",
+    ),
+    dict(
+        name="a plain batch view is accepted as a whole window",
+        file="duckstream/sinks/table.py",
+        find="""        window_range = getattr(ctx, "window_range", None)
+        if window_range is None:""",
+        repl="""        window_range = getattr(ctx, "window_range", None)
+        if False:""",
+        suite="fast",
+    ),
+    dict(
+        name="an upgraded catalog keeps NULL bounds, so consumed files stop being read",
+        file="duckstream/state.py",
+        find="""            filling = {c: v for c, v in backfill.items() if c in added}""",
+        repl="""            filling = {}""",
+        suite="fast",
+        note="the migration hazard: silently narrows every recompute after upgrade",
+    ),
+    dict(
+        name="a recompute's temp views are only dropped when every chunk succeeds",
+        file="duckstream/engine.py",
+        find="""        written = 0
+        for chunk in chunks:""",
+        repl="""        written = 0
+        _deferred = []
+        for chunk in chunks:""",
+        suite="fast",
+        note=(
+            "Equivalent on the happy path and not on the unhappy one: a chunk "
+            "that raises strands every view its predecessors made, and a model "
+            "that keeps failing strands another set per retry. Written this way "
+            "on the second attempt. The first collected into a local list and "
+            "extended `extra` immediately afterwards, which differs only if "
+            "`_range_view` itself raises -- so it survived while testing "
+            "nothing. A mutation that does not implement its own name is the "
+            "other thing a survivor can mean, and this is the second time that "
+            "has happened in this project."
+        ),
+        also=dict(
+            file="duckstream/engine.py",
+            find="            scoped = self._range_view(model, plan, relpaths, chunk, extra)",
+            repl="            scoped = self._range_view(model, plan, relpaths, chunk, _deferred)",
+        ),
+    ),
+    dict(
+        name="a source that cannot resolve its paths gets a guessed relative path",
+        file="duckstream/engine.py",
+        find='''        resolve = getattr(source, "absolute_paths", None)
+        if not callable(resolve):''',
+        repl='''        resolve = getattr(source, "absolute_paths", None)
+        if False:''',
+        suite="fast",
+        note="a guessed path may open cleanly and hold the wrong rows",
+    ),
+    dict(
+        name="undated rows are dropped by a recompute without being counted",
+        file="duckstream/engine.py",
+        find="""            if _recomputes(model):
+                return self._observe_undated(model, view)""",
+        repl="""            if False:
+                return self._observe_undated(model, view)""",
+        suite="fast",
+        note="CONTEXT.md: dropped *and counted*, never silently absorbed",
+    ),
+    # -- phase 4: the landing-tree scan ------------------------------------
+    #
+    # CONTEXT.md 1.20 made this a pure optimisation, so every mutation here is
+    # about it having quietly stopped being one. A scan that returns a slightly
+    # different set of paths, or slightly different identities, does not fail --
+    # it re-reads files or skips them, silently.
+    dict(
+        name="the scan's prefix keeps a leading './' so no path ever matches",
+        file="duckstream/sources/files.py",
+        find='        stack: list[tuple[str, Path]] = [("", root)]',
+        repl='        stack: list[tuple[str, Path]] = [("./", root)]',
+        suite="fast",
+    ),
+    dict(
+        name="the walk drops the prefix, so nested files collide on their bare name",
+        file="duckstream/sources/files.py",
+        find='                stack.append((f"{prefix}{entry.name}/", Path(entry.path)))',
+        repl='                stack.append(("", Path(entry.path)))',
+        suite="fast",
+        note="two directories holding part.parquet become one entry",
+    ),
+    dict(
+        name="the walk descends into symlinked directories, unlike os.walk",
+        file="duckstream/sources/files.py",
+        find="                        if entry.is_dir(follow_symlinks=False):",
+        repl="                        if entry.is_dir():",
+        suite="fast",
+        # Not inert here -- the branch really does differ -- but the *fixture*
+        # cannot be built on this box: Windows refuses to create a directory
+        # symlink without a privilege it does not grant, so the test that would
+        # catch this skips. It ran as SURVIVED once for exactly that reason,
+        # which is a false hole; declaring it is the honest alternative to
+        # leaving a survivor that looks like missing coverage.
+        # `test_the_walk_does_not_descend_into_symlinked_directories` is red on
+        # any platform that can make one.
+        skip=(
+            "needs a directory symlink, which this platform will not create "
+            "without a privilege; the matching test skips for the same reason"
+        ),
+    ),
+    dict(
+        name="a non-recursive source walks the whole tree anyway",
+        file="duckstream/sources/files.py",
+        find="""            if not self.recursive:
+                return""",
+        repl="""            if False:
+                return""",
+        suite="fast",
+    ),
+    dict(
+        name="the scan stops sorting, so a replayed batch need not match",
+        file="duckstream/sources/files.py",
+        find="            files.sort(key=lambda entry: entry.name)",
+        repl="            files.sort(key=lambda entry: entry.name, reverse=True)",
+        suite="fast",
+        note=(
+            "Ordering is re-imposed when the batch is planned, so this may well "
+            "be a `held` rather than a red -- read the verdict before deciding "
+            "which. It is here because 'the scan order does not matter' is a "
+            "claim worth having checked rather than assumed."
+        ),
+        expect_survives=(
+            "Planning sorts candidates by (mtime, relpath), so scan order is "
+            "not load-bearing and reversing it must change no answer. A red "
+            "here would mean something downstream had come to depend on it."
+        ),
+    ),
+    dict(
+        name="_is_ready ignores the walk's entries and reports every directory ready",
+        file="duckstream/sources/files.py",
+        find="""            else:
+                return False""",
+        repl="""            else:
+                return True""",
+        suite="fast",
+        note="an unmarked directory would be read as if it were complete",
+    ),
+    dict(
+        name="a model may recompute windows without declaring a grain",
+        file="duckstream/model.py",
+        find="""        if recomputing and not self.grain:
+            missing.append("grain")""",
+        repl="""        if False:
+            missing.append("grain")""",
         suite="fast",
     ),
 ]

@@ -91,9 +91,32 @@ def make_model(**overrides: Any) -> Model:
     return Model(**kwargs)
 
 
+def make_windowed_model(**overrides: Any) -> Model:
+    """``make_model``, windowed -- the fixture every tier-three test needs.
+
+    ``recompute_window`` re-derives *windows*, so a model resolving to it must
+    declare a ``grain``, and a windowed model must carry ``window_ts`` in its
+    key (rule 4). Neither is what any test below is about, so both are set here
+    rather than repeated: the point of ``make_model`` is that a test perturbs
+    exactly one thing, and without this a tier-three fixture perturbs three.
+    """
+    kwargs: dict[str, Any] = {"grain": "hour", "key": [WINDOW_COLUMN, "sensor_id"]}
+    kwargs.update(overrides)
+    return make_model(**kwargs)
+
+
 def test_the_baseline_model_is_valid() -> None:
     """If this ever fails, every other test in the file is testing the wrong thing."""
     make_model().validate()
+
+
+def test_the_windowed_baseline_model_is_valid() -> None:
+    """Same guard for the tier-three fixture, which carries more defaults."""
+    make_windowed_model(
+        aggregates={"p50": "median(value)"},
+        time_column="event_ts",
+        memory_profile="materialising",
+    ).validate()
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +203,13 @@ def test_sufficient_statistics_strategy_over_a_non_foldable_model_is_refused() -
 
 
 def test_a_stronger_strategy_than_needed_is_accepted_silently() -> None:
-    """recompute_window over an additive model is correct, just slower."""
-    make_model(
+    """recompute_window over an additive model is correct, just slower.
+
+    It needs a grain, though, because "recompute the affected window" has no
+    meaning without windows -- so this asks for the strategy over a *windowed*
+    additive model, which is the only coherent way to ask for it.
+    """
+    make_windowed_model(
         strategy="recompute_window", time_column="event_ts"
     ).validate()
     make_model(strategy="sufficient_statistics").validate()
@@ -291,7 +319,7 @@ def test_a_malformed_key_column_is_rejected() -> None:
 def test_every_declared_strategy_name_is_accepted_over_a_compatible_model(
     strategy: str,
 ) -> None:
-    make_model(strategy=strategy, time_column="event_ts").validate()
+    make_windowed_model(strategy=strategy, time_column="event_ts").validate()
 
 
 @pytest.mark.parametrize("strategy", ["merge", "DELTA_MERGE", "fold", ""])
@@ -307,6 +335,8 @@ def test_an_unknown_strategy_name_is_rejected(strategy: str) -> None:
 
 
 def test_a_non_foldable_model_missing_both_requirements_names_both() -> None:
+    # Not windowed: rule 3 refuses a grain declared without a time_column, and
+    # this model has neither. `grain` is named in the message too, last.
     model = make_model(aggregates={"p50": "median(value)"})
     with pytest.raises(ModelValidationError) as excinfo:
         model.validate()
@@ -318,7 +348,9 @@ def test_a_non_foldable_model_missing_both_requirements_names_both() -> None:
 
 
 def test_a_non_foldable_model_missing_only_the_memory_profile() -> None:
-    model = make_model(aggregates={"p50": "median(value)"}, time_column="event_ts")
+    model = make_windowed_model(
+        aggregates={"p50": "median(value)"}, time_column="event_ts"
+    )
     with pytest.raises(ModelValidationError) as excinfo:
         model.validate()
     assert "memory_profile" in str(excinfo.value)
@@ -334,8 +366,68 @@ def test_a_non_foldable_model_missing_only_the_time_column() -> None:
     assert excinfo.value.field == "time_column"
 
 
-def test_a_fully_declared_non_foldable_model_is_valid() -> None:
+def test_a_model_that_recomputes_windows_must_declare_a_grain() -> None:
+    """"Recompute the affected window" has no meaning without windows.
+
+    Found by mutation audit, not by review: the requirement was added and never
+    asserted, so deleting it left the whole suite green. The only other
+    consistent reading of a grainless `recompute_window` is re-deriving the
+    entire history on every trigger, which works on the first day and is
+    discovered in a cron log some months later.
+
+    `time_column` is supplied so this fixture is missing exactly one thing --
+    rule 3 refuses a grain declared without one, and the tier-three requirements
+    are reported before the grain for that reason.
+    """
+    model = make_model(
+        aggregates={"p50": "median(value)"},
+        time_column="event_ts",
+        memory_profile="materialising",
+    )
+    assert model.resolved_strategy == "recompute_window"
+    with pytest.raises(ModelValidationError) as excinfo:
+        model.validate()
+    assert excinfo.value.field == "grain"
+    assert "grain" in str(excinfo.value)
+    assert "grain='hour'" in excinfo.value.remedy
+
+
+def test_a_declared_recompute_strategy_needs_a_grain_even_over_additive_aggregates() -> None:
+    """The requirement follows the strategy, not the tier.
+
+    `recompute_window` over `count`/`sum` is legal and slower, and it still
+    recomputes windows -- so it still needs to know how wide one is. Without
+    this the rule would hold only for models that reached tier three on their
+    own, and a declared strategy would quietly get a weaker check than an
+    inferred one.
+    """
+    model = make_model(strategy="recompute_window", time_column="event_ts")
+    assert model.tier is Tier.ADDITIVE
+    with pytest.raises(ModelValidationError) as excinfo:
+        model.validate()
+    assert excinfo.value.field == "grain"
+    assert "recompute_window" in str(excinfo.value)
+
+
+def test_unwindowed_append_may_be_tier_three_without_a_grain() -> None:
+    """The escape hatch, and it must stay open.
+
+    `append` with no grain never folds and never revises a row, so each batch's
+    rows are written as they are and there is nothing to recompute. Requiring a
+    grain here would close the one route a tier-three aggregate has that does
+    not need windows at all.
+    """
     make_model(
+        aggregates={"p50": "median(value)"},
+        sink=FakeSink(mode="append"),
+        time_column="event_ts",
+        memory_profile="materialising",
+        grain=None,
+    ).validate()
+
+
+def test_a_fully_declared_non_foldable_model_is_valid() -> None:
+    make_windowed_model(
         aggregates={"spectrum": "arrow_fft(list(value ORDER BY event_ts))"},
         time_column="event_ts",
         grain="minute",
@@ -359,7 +451,7 @@ def test_a_wrapped_aggregate_is_non_foldable_and_inherits_its_requirements() -> 
         bare.validate()
     assert "non_foldable" in str(excinfo.value)
 
-    make_model(
+    make_windowed_model(
         aggregates={"ratio": "sum(a)/count(*)"},
         time_column="event_ts",
         memory_profile="streaming",
@@ -367,7 +459,7 @@ def test_a_wrapped_aggregate_is_non_foldable_and_inherits_its_requirements() -> 
 
 
 def test_declaring_delta_merge_over_a_wrapped_additive_expression_is_refused() -> None:
-    model = make_model(
+    model = make_windowed_model(
         aggregates={"ratio": "sum(a)/count(*)"},
         strategy="delta_merge",
         time_column="event_ts",
@@ -507,7 +599,7 @@ def test_an_undeclared_udf_is_refused_at_load_time() -> None:
     passed at deploy time and the Catalog Error arrived at 03:00 in a cron log
     -- exactly the sequence `validate` exists to prevent.
     """
-    model = make_model(
+    model = make_windowed_model(
         aggregates={"spectrum": "arrow_fft(list(value ORDER BY event_ts))"},
         time_column="event_ts",
         memory_profile="materialising",
@@ -532,7 +624,7 @@ def test_declaring_any_udf_accepts_the_model() -> None:
     registers the udfs before planning and can re-check against the live
     catalog once they exist.
     """
-    make_model(
+    make_windowed_model(
         aggregates={"spectrum": "arrow_fft(list(value ORDER BY event_ts))"},
         time_column="event_ts",
         memory_profile="materialising",
@@ -540,7 +632,7 @@ def test_declaring_any_udf_accepts_the_model() -> None:
     ).validate()
 
     # even a path that plainly does not name this function is accepted
-    make_model(
+    make_windowed_model(
         aggregates={"spectrum": "arrow_fft(list(value ORDER BY event_ts))"},
         time_column="event_ts",
         memory_profile="materialising",
@@ -550,8 +642,11 @@ def test_declaring_any_udf_accepts_the_model() -> None:
 
 def test_a_misspelled_builtin_is_caught_by_the_same_rule() -> None:
     """The common case is a typo, not a UDF."""
-    model = make_model(aggregates={"total": "sumn(value)"}, time_column="event_ts",
-                       memory_profile="streaming")
+    model = make_windowed_model(
+        aggregates={"total": "sumn(value)"},
+        time_column="event_ts",
+        memory_profile="streaming",
+    )
     with pytest.raises(ModelValidationError) as excinfo:
         model.validate()
     assert "sumn" in str(excinfo.value)
@@ -559,7 +654,7 @@ def test_a_misspelled_builtin_is_caught_by_the_same_rule() -> None:
 
 
 def test_every_unknown_function_is_named_not_just_the_first() -> None:
-    model = make_model(
+    model = make_windowed_model(
         aggregates={
             "a": "my_first(list(value))",
             "b": "my_second(list(value))",

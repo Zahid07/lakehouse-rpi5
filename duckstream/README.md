@@ -42,7 +42,7 @@ expression in a model, derives the tier, and picks the strategy from it:
 | Tier | Aggregates | Strategy | What it does |
 |---|---|---|---|
 | `additive` | `count`, `sum`, `min`, `max` | `delta_merge` | Fold the batch's value into the stored value. No rescan. The only tier for which a naive delta merge is safe. |
-| `sufficient_statistics` | a bare `avg`, `stddev*`, `var*`, `variance`, `corr`, `covar*` | `sufficient_statistics` | Persist `sum`, `sum_sq`, `count`; derive the result on read. Exact, still no rescan. |
+| `sufficient_statistics` | a bare `avg`, `stddev*`, `var*`, `variance`, `corr`, `covar*` | `sufficient_statistics` | Persist a mergeable `(n, mean, M2)` per statistic argument; derive the result from it. Exact, still no rescan. **Not `(sum, sum_sq, count)`** — that form returns 524 for a true variance of 0.25 at Unix-timestamp magnitudes, and exactly 0.0 at 1e8 with a small spread. |
 | `non_foldable` | median and exact quantiles, exact `count(distinct …)`, order-dependent aggregates, any UDF over a whole window (FFT, DTW, entropy) — and anything wrapped in a scalar expression, such as `sum(a)/count(*)` | `recompute_window` | Recompute the affected windows from source. No shortcut exists. |
 
 ### This is not theoretical
@@ -112,7 +112,9 @@ Two further invariants are enforced the same way: the sink merge key must
 contain the window column, or a re-run silently overwrites a different window's
 row; and a `non_foldable` model must declare its source time column and a memory
 profile, because recomputing a window needs to know which windows a batch
-touched and how much memory that is allowed to cost.
+touched and how much memory that is allowed to cost. A model that resolves to
+`recompute_window` must also declare a `grain` — there is no window to recompute
+without one.
 
 ## Quickstart: the Python door
 
@@ -360,6 +362,69 @@ Units are `second`, `minute`, `hour` and `day`, singular or plural
 door and is stored in the canonical string form, so the same model built either
 way — or loaded from YAML — compares equal.
 
+## Tier three: recomputing a window from source
+
+Some aggregates cannot be folded at all. A median, an exact `count(distinct …)`,
+anything order-dependent, and any UDF over a whole window — there is no pair of
+partial answers that combine into the true one. For these duckstream re-derives
+the affected windows from source, which is the only correct strategy and is what
+`recompute_window` means.
+
+```python
+Model(
+    name="minute_spectrum",
+    source=FileSource("landing/", marker="_READY"),
+    time_column="event_ts",
+    grain="minute",
+    key=["window_ts", "sensor_id"],
+    strategy="recompute_window",          # inferred from the tier anyway
+    memory_profile="materialising",
+    udfs=["my_pkg.signal:spectrum"],
+    aggregates={"bins": "spectrum(list(value ORDER BY event_ts))"},
+    sink=TableSink("marts.minute_spectrum", mode="update"),
+    limits=BatchLimits(max_rows_per_trigger=200_000),
+)
+```
+
+What happens on each trigger:
+
+1. the batch is read to find **which windows it touched** — untouched history is
+   never re-read;
+2. those windows are grouped into **chunks** sized from an estimated row count,
+   bounded by `max_rows_per_trigger`;
+3. for each chunk, duckstream asks the catalog **which consumed files can hold a
+   row in that range**, reads exactly those, and aggregates them;
+4. the chunk's window range in the sink is **cleared and re-inserted**, inside
+   the same transaction as the offset — so a reader never sees it empty, and a
+   key whose source rows have gone disappears with them.
+
+Three consequences worth planning for.
+
+**Cost scales with the window, not the batch.** A one-row batch landing in a
+busy hour recomputes that whole hour. Measured on a dev box at `threads=2`, the
+recompute step is ~17.5 ms for a window held in one file and ~31.3 ms for one
+held in a hundred — an intercept of about 17 ms, which every write pays, plus
+about **0.14 ms per file in the window**.
+
+If that is too expensive the lever is a finer `grain`, or fewer files per window
+(retention and compaction). It is emphatically **not** a smaller
+`max_files_per_trigger`: that makes it worse, by recomputing the same window
+more often.
+
+**`max_rows_per_trigger` is the memory knob and it bounds both halves** — the
+batch the source plans *and* the rows one recompute holds. Memory is governed by
+DuckDB's buffer manager materialising `LIST(...)`, so bounding rows in flight is
+the only control that works; a faster UDF buys no headroom at all.
+
+**File selection is a hint, never truth.** `duckstream.consumed_files` carries
+`min_ts`/`max_ts`/`n_rows` per consumed file, and the recompute uses them to
+avoid opening files it cannot need — which matters because opening a file costs
+~0.1 ms whether or not its contents are read, and a year at one file a minute is
+525,000 of them. A file the index cannot place is **read**, never skipped, so a
+missing or stale entry costs time and never an answer. Files consumed before the
+index existed, or by a model that was not tier three at the time, carry no
+bounds and are read by every recompute.
+
 ## When the data will not process
 
 Exactly-once says what happens when the *process* dies. It says nothing about
@@ -597,17 +662,35 @@ keeps one tick from outrunning the next when catching up.
 - **One horizon per model, and no per-source horizons.** A model with several
   sources would need a watermark per source and a rule for combining them; v1
   has one source per model, so it has one watermark.
-- **Only the additive tier executes.** Tiers two and three are classified,
-  reported by `duckstream models`, and then **refused rather than executed**
-  wherever a fold is involved — `mode="update"`, and windowed `append`, which
-  folds into its accumulator. The `sufficient_statistics` and
-  `recompute_window` strategies arrive in phase 3. Until then a tier-two or
-  tier-three model either drops its `grain` and uses `mode="append"` (which
-  never folds, so any tier is fine) or is reduced to
-  `count`/`sum`/`min`/`max`.
-- **Single writer.** One process, models run sequentially, no locking — under a
-  drain-and-exit trigger contention is structurally impossible rather than
-  merely unlikely. A portable lock arrives with a long-running trigger.
+- **All three tiers execute, and tier three costs what it costs.** A
+  `recompute_window` model re-reads every consumed file that can hold a row in
+  the windows a batch touched, so its per-trigger cost scales with the *window*
+  rather than with the batch. That is not an implementation detail to be tuned
+  away — a median or an FFT has no decomposition, so there is no cheaper correct
+  answer. Keep tier three off the hot path where a foldable tier will do, and
+  note that a query containing a Python UDF is forced onto a single thread.
+- **`recompute_window` needs a `grain`.** "Recompute the affected window" has no
+  meaning without windows, and the only other consistent reading is re-deriving
+  the whole history on every trigger. Unwindowed `append` is exempt: it never
+  folds and never revises a row, so any tier is fine there.
+- **Windowed `append` is still additive-only.** It folds into an accumulator
+  while a window is open, and tiers two and three do not fold. Use
+  `mode="update"` for those, which recomputes or maintains state as the tier
+  requires.
+- **A recomputed window replaces what was there.** The range is cleared and
+  re-inserted, so a key whose source rows have gone disappears with them. That
+  is the correct behaviour and it does mean a recompute writes a tombstone per
+  window range — deliberate, and the reason chunking is sized rather than
+  per-window.
+- **The file → time-range index is a hint.** It only narrows which files a
+  recompute opens; a file it cannot place is read rather than skipped, so a
+  wrong or missing entry costs time and never an answer. Rows written before
+  the index existed, and by models that were not tier three at the time, carry
+  no bounds and are therefore read by every recompute.
+- **Single writer.** One process, models run sequentially. An advisory lock
+  (`duckstream/lock.py`) reports an overlapping run in words, but the actual
+  safety comes from DuckDB's own lock on the catalog file — never promote the
+  advisory one to the guarantee.
 - **One parquet file per trigger.** Data inlining is disabled unconditionally,
   because it defaults to capturing any write under 10 rows into the code path
   carrying DuckLake's open correctness bugs — which would make behaviour depend

@@ -13,11 +13,19 @@ Every test that means anything about growth runs at least two batches, per
 
 from __future__ import annotations
 
+import datetime as dt
+
 import duckdb
 import pytest
 
 from duckstream import consumed as consumed_module
-from duckstream.consumed import ENTRIES_KEY, MapIndex, entries_in
+from duckstream.consumed import (
+    ENTRIES_KEY,
+    UNKNOWN_MAX,
+    UNKNOWN_MIN,
+    MapIndex,
+    entries_in,
+)
 from duckstream.errors import DuckstreamError
 from duckstream.offsets import FileOffset
 from duckstream.state import MemoryStateStore
@@ -594,3 +602,160 @@ def test_the_engine_refuses_a_batch_that_recorded_nothing():
     Engine._require_recorded(model, 7, None, None)
     Engine._require_recorded(model, 7, object(), 0)
     Engine._require_recorded(model, 7, object(), 3)
+
+
+# --------------------------------------------------------------------------
+# The file -> time-range index
+#
+# A hint, never truth (`CONTEXT.md` 1.13). Everything below is about the one
+# direction that is allowed to be wrong: it may select a file a recompute did
+# not need, and it may never fail to select one it did. `CONTEXT.md` 1.17 is
+# why "unknown" is stored as the widest range rather than as NULL, and the
+# first two tests here are what stop that being tidied away.
+# --------------------------------------------------------------------------
+
+
+def bounds_of(con, state, model: str = "m") -> dict:
+    return {
+        row[0]: (row[1], row[2], row[3])
+        for row in con.execute(
+            f"SELECT relpath, min_ts, max_ts, n_rows "
+            f"FROM {state.consumed_files_table} WHERE model_name = ?",
+            [model],
+        ).fetchall()
+    }
+
+
+def test_a_file_with_no_measured_bounds_is_stored_at_the_widest_range(store):
+    """Not NULL. ``CONTEXT.md`` 1.17 measured what NULL costs.
+
+    NULL fails ``max_ts >= lo AND min_ts < hi``, so a row stored that way would
+    be silently dropped from every recompute — and expressing the fallback as
+    ``IS NULL OR ...`` instead puts back the O(files-ever-consumed) scan the
+    index exists to remove (117.5 ms against 2,160 files, versus 12.1 ms).
+    """
+    con, state = store
+    index = state.consumed_files.index_for(con, "m")
+    index.append(1, {"a.parquet": entry(1, 10)})
+
+    stored = bounds_of(con, state)["a.parquet"]
+    assert stored[0] == UNKNOWN_MIN
+    assert stored[1] == UNKNOWN_MAX
+    assert stored[2] is None, "an unknown row count is genuinely unknown"
+
+
+def test_an_unmeasured_file_is_selected_by_every_window(store):
+    """The hint contract, proved through the SQL rather than in Python."""
+    con, state = store
+    index = state.consumed_files.index_for(con, "m")
+    index.append(1, {"mystery.parquet": entry(1, 10)})
+
+    for lo in (dt.datetime(1999, 1, 1), dt.datetime(2026, 6, 1), dt.datetime(2200, 1, 1)):
+        picked = index.overlapping(lo, lo + dt.timedelta(hours=1))
+        assert [f.relpath for f in picked] == ["mystery.parquet"], lo
+
+
+def test_a_measured_file_is_selected_only_by_windows_it_can_hold_a_row_in(store):
+    con, state = store
+    index = state.consumed_files.index_for(con, "m")
+    index.append(
+        1,
+        {"a.parquet": entry(1, 10), "b.parquet": entry(2, 20)},
+        bounds={
+            "a.parquet": (dt.datetime(2026, 6, 1, 0), dt.datetime(2026, 6, 1, 0, 59), 50),
+            "b.parquet": (dt.datetime(2026, 6, 1, 5), dt.datetime(2026, 6, 1, 5, 59), 70),
+        },
+    )
+
+    first = index.overlapping(dt.datetime(2026, 6, 1, 0), dt.datetime(2026, 6, 1, 1))
+    assert [f.relpath for f in first] == ["a.parquet"]
+    assert first[0].n_rows == 50
+
+    sixth = index.overlapping(dt.datetime(2026, 6, 1, 5), dt.datetime(2026, 6, 1, 6))
+    assert [f.relpath for f in sixth] == ["b.parquet"]
+
+    between = index.overlapping(dt.datetime(2026, 6, 1, 3), dt.datetime(2026, 6, 1, 4))
+    assert between == [], "neither file can hold a row in an hour they both miss"
+
+
+def test_the_selection_is_half_open_at_the_top(store):
+    """``[lo, hi)``: a file starting exactly at ``hi`` belongs to the next window.
+
+    Two files, so this is not the degenerate single-row case that trap 16
+    warns about — with one row the boundary test cannot be told apart from an
+    equality.
+    """
+    con, state = store
+    index = state.consumed_files.index_for(con, "m")
+    index.append(
+        1,
+        {"ends.parquet": entry(1, 10), "starts.parquet": entry(2, 20)},
+        bounds={
+            "ends.parquet": (dt.datetime(2026, 6, 1, 4), dt.datetime(2026, 6, 1, 5), 1),
+            "starts.parquet": (dt.datetime(2026, 6, 1, 6), dt.datetime(2026, 6, 1, 7), 1),
+        },
+    )
+    picked = index.overlapping(dt.datetime(2026, 6, 1, 5), dt.datetime(2026, 6, 1, 6))
+    assert [f.relpath for f in picked] == ["ends.parquet"]
+
+
+def test_a_half_measured_file_is_widened_rather_than_guessed(store):
+    """A known maximum says nothing about where the file starts.
+
+    Filling the missing half from the half that is known would be inventing a
+    bound, and an invented bound can exclude.
+    """
+    con, state = store
+    index = state.consumed_files.index_for(con, "m")
+    index.append(
+        1,
+        {"half.parquet": entry(1, 10)},
+        bounds={"half.parquet": (None, dt.datetime(2026, 6, 1, 5), 3)},
+    )
+    stored = bounds_of(con, state)["half.parquet"]
+    assert stored[0] == UNKNOWN_MIN
+    assert stored[1] == dt.datetime(2026, 6, 1, 5)
+
+    # ...and it is still selected by an hour long before its known maximum.
+    picked = index.overlapping(dt.datetime(1999, 1, 1), dt.datetime(1999, 1, 1, 1))
+    assert [f.relpath for f in picked] == ["half.parquet"]
+
+
+def test_a_rewritten_file_is_selected_once_at_its_widest(store):
+    """Two rows, one path: the recompute reads the file once.
+
+    A file rewritten in place is consumed again at its new identity, so the
+    table holds both. The selection returns the widest bounds and the largest
+    row count among them, which keeps it an over-estimate in both directions --
+    the safe one for a hint.
+    """
+    con, state = store
+    index = state.consumed_files.index_for(con, "m")
+    index.append(
+        1,
+        {"same.parquet": entry(1, 10)},
+        bounds={"same.parquet": (dt.datetime(2026, 6, 1, 1), dt.datetime(2026, 6, 1, 2), 10)},
+    )
+    index.append(
+        2,
+        {"same.parquet": entry(2, 20)},
+        bounds={"same.parquet": (dt.datetime(2026, 6, 1, 3), dt.datetime(2026, 6, 1, 4), 90)},
+    )
+
+    picked = index.overlapping(dt.datetime(2026, 6, 1, 0), dt.datetime(2026, 6, 1, 9))
+    assert [f.relpath for f in picked] == ["same.parquet"], "read once, not twice"
+    assert picked[0].min_ts == dt.datetime(2026, 6, 1, 1)
+    assert picked[0].max_ts == dt.datetime(2026, 6, 1, 4)
+    assert picked[0].n_rows == 90
+
+
+def test_one_model_never_sees_another_model_s_index(store):
+    con, state = store
+    window = (dt.datetime(2026, 6, 1, 0), dt.datetime(2026, 6, 1, 1))
+    inside = {"x.parquet": (window[0], window[0] + dt.timedelta(minutes=1), 5)}
+
+    state.consumed_files.index_for(con, "m").append(
+        1, {"x.parquet": entry(1, 10)}, bounds=inside
+    )
+    other = state.consumed_files.index_for(con, "other")
+    assert other.overlapping(*window) == []
