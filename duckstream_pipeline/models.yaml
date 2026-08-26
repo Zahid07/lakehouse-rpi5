@@ -1,0 +1,174 @@
+# The accelerometer pipeline, on duckstream.
+#
+# Three models over one landing tree. Between them they replace steps 1, 4 and 5
+# of `run_pipeline.py` -- staging, the fact load, and both marts. Steps 2 and 3,
+# the SCD2 dimension, stay in `dimensions.py`: duckstream is an aggregation
+# engine and has no notion of a surrogate key, and it should not acquire one.
+#
+# `${VAR}` is substituted from the environment, so one document serves dev and
+# prod. `run.sh` exports the defaults.
+
+catalog: "ducklake:${DS_ROOT}/catalog.ducklake"
+data_path: "${DS_ROOT}/lake_data"
+
+settings:
+  # 1.7: inlining defaults to 10 rows and silently routes any smaller write
+  # into DuckLake's buggiest code path, which makes behaviour depend on batch
+  # size. The engine sets this itself; stating it is documentation.
+  ducklake_default_data_inlining_row_limit: 0
+  memory_limit: "${DS_MEMORY_LIMIT}"
+  threads: 4
+  # 1.24, measured on this Pi. Without it DuckDB spills to `.tmp` in the
+  # process's *current working directory* -- under a service manager, wherever
+  # that happens to be -- on the SD card, using up to 90% of the disk. A model
+  # over its memory limit then completes slowly instead of failing, which
+  # repeals 1.1's whole "memory is bounded by rows in flight" conclusion and
+  # spends the card endurance 1.15/1.16 spent a phase reclaiming.
+  temp_directory: ""
+
+models:
+  # =====================================================================
+  # curated.fact_accelerometer -- row level, no aggregation
+  # =====================================================================
+  # No grain and no fold -- a row-level load. Two decisions worth reading.
+  #
+  # **`mode: update`, keyed on the reading's own identity.** `append` is the
+  # obvious shape for a fact and it is the wrong one here, because MQTT is
+  # at-least-once: the broker redelivers anything it was not told about, so the
+  # same reading can land in two different files and duckstream does not
+  # de-duplicate that -- the files genuinely differ and nothing marks one as a
+  # repeat. Exactly-once is over *files*, not over readings. STATUS.md's answer
+  # is exactly this: "a model that cares needs a merge key and mode='update'",
+  # which converges to one row per reading however many times it arrives.
+  #
+  # The cost is stated rather than hidden: two genuinely distinct readings
+  # sharing a timestamp *and* a location would merge into one. At 100 Hz with
+  # microsecond timestamps that is a sensor emitting duplicates, which is a
+  # fault worth collapsing rather than a measurement worth keeping.
+  #
+  # **It carries `location`, the natural key, not `location_key`.** Not a
+  # limitation being worked around -- it is what keeps exactly-once formable. A
+  # surrogate assigned by a different process in a different transaction cannot
+  # participate in the one transaction that commits rows and offset together.
+  # `sql/marts/views.sql` joins the dimension at read time, which also fixes a
+  # staleness bug the old mart had; see that file.
+  - name: fact_accelerometer
+    source:
+      type: file
+      path: "${DS_LANDING}"
+      marker: _READY
+      max_files_per_trigger: 20
+    sink:
+      type: table
+      table: curated.fact_accelerometer
+      mode: update
+    # `timestamp` and `location` are the key, which is the grouping, so they
+    # must not appear below as well -- a column cannot be both grouped by and
+    # computed. They still reach the table; the key columns always do.
+    key: [timestamp, location]
+    aggregates:
+      # Every duckstream model is a GROUP BY over its key, so a row-level load
+      # is an aggregation with one row per group and these have to be aggregate
+      # functions. `min` rather than the more obvious `any_value`, and the
+      # classifier is what settled it: `any_value` is **non-deterministic**, so
+      # it classifies as `non_foldable` and duckstream refuses to fold it.
+      #
+      # That refusal is right, and the reason matters more than the workaround.
+      # This is an exactly-once framework: a replayed batch must reproduce the
+      # row it produced the first time, and `any_value` is free to pick
+      # differently on the replay. `min` is deterministic, additive (tier one),
+      # and over a single-row group it is simply the identity -- so it reads a
+      # little oddly and is the only one of the two that is actually correct
+      # under replay.
+      x: "min(x)"
+      y: "min(y)"
+      z: "min(z)"
+      # Derived once, here, so every consumer agrees on it. The staging step
+      # this replaces computed the same expression.
+      magnitude: "min(sqrt(x*x + y*y + z*z))"
+
+  # =====================================================================
+  # marts.accel_hourly_summary -- tiers 1 and 2, folds incrementally
+  # =====================================================================
+  # The old mart recomputed every touched hour in full, and its own comment
+  # says why: "incrementally merging an average cannot be done correctly
+  # without carrying the running sums". duckstream carries them -- `avg` and
+  # `stddev` are tier two, maintained as (n, mean, M2) -- so the hour is never
+  # re-read. With 30-second dumps an hour is touched ~120 times, so this is the
+  # single largest saving in the migration.
+  #
+  # **No `round()` here, and that is load-bearing.** Measured with
+  # `duckstream.aggregates.classify_model`: `round(avg(x), 4)` classifies as
+  # **non_foldable**, because the classifier only proves foldability for a
+  # *bare* aggregate and cannot see through the call. Wrapping these would
+  # silently demote the whole model to tier three and recompute every hour --
+  # the exact cost this model exists to remove. Rounding happens in
+  # `sql/marts/views.sql`, which is also where it belongs: tier two stores
+  # (n, mean, M2) and derives the column, so rounding the *stored* value would
+  # corrupt the state the next batch merges into.
+  - name: accel_hourly_summary
+    source:
+      type: file
+      path: "${DS_LANDING}"
+      marker: _READY
+      max_files_per_trigger: 20
+    time_column: timestamp
+    grain: hour
+    key: [window_ts, location]
+    aggregates:
+      sample_count:     "count(*)"
+      avg_x:            "avg(x)"
+      avg_y:            "avg(y)"
+      avg_z:            "avg(z)"
+      avg_magnitude:    "avg(sqrt(x*x + y*y + z*z))"
+      max_magnitude:    "max(sqrt(x*x + y*y + z*z))"
+      min_magnitude:    "min(sqrt(x*x + y*y + z*z))"
+      stddev_magnitude: "stddev_samp(sqrt(x*x + y*y + z*z))"
+    sink:
+      type: table
+      table: marts.accel_hourly_summary
+      mode: update
+
+  # =====================================================================
+  # marts.accel_minute_spectrum -- tier 3, recomputes the window
+  # =====================================================================
+  # `strategy: recompute_window` must be declared explicitly; duckstream will
+  # not infer tier three on your behalf. What it *will* do is refuse an
+  # additive strategy over these aggregates at load time, which is the whole
+  # reason the framework exists.
+  #
+  # Cost follows the **window**, not the batch (1.19). A one-row batch landing
+  # in a busy minute re-derives that whole minute, so turning
+  # `max_files_per_trigger` down makes this *worse* by recomputing the same
+  # window more often. `max_rows_per_trigger` is the memory lever; on this Pi
+  # the intercept is ~26 ms and the slope ~0.08 ms per file in the window.
+  #
+  # Only x, y, z and magnitude are transformed, matching the old mart. Every
+  # extra axis is a second `LIST` materialised per group (1.21) and a second
+  # pass through a UDF that costs 7.5x native (1.22).
+  - name: accel_minute_spectrum
+    source:
+      type: file
+      path: "${DS_LANDING}"
+      marker: _READY
+      max_files_per_trigger: 20
+      max_rows_per_trigger: 2000000
+    time_column: timestamp
+    grain: minute
+    key: [window_ts, location]
+    strategy: recompute_window
+    memory_profile: materialising
+    udfs:
+      - "duckstream_pipeline.udfs:fft_magnitude"
+      - "duckstream_pipeline.udfs:fft_freqs"
+    aggregates:
+      sample_count:  "count(*)"
+      freq_hz:       "fft_freqs(list(x ORDER BY timestamp))"
+      fft_x:         "fft_magnitude(list(x ORDER BY timestamp))"
+      fft_y:         "fft_magnitude(list(y ORDER BY timestamp))"
+      fft_z:         "fft_magnitude(list(z ORDER BY timestamp))"
+      fft_magnitude: "fft_magnitude(list(sqrt(x*x + y*y + z*z) ORDER BY timestamp))"
+    sink:
+      type: table
+      table: marts.accel_minute_spectrum
+      mode: update
