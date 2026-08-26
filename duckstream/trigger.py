@@ -22,8 +22,14 @@ committing trigger, which makes seconds the sensible scheduling unit and a
 sub-second in-process timer pointless. Cron, systemd or a supervisor owns the
 cadence; duckstream owns the batch.
 
-:class:`ProcessingTime` exists only to refuse. It is the trigger people reach
-for first, and a clear rejection is worth more than an ``AttributeError``.
+:class:`~duckstream.daemon.ProcessingTime` is the third thing people reach for,
+and it is deliberately **not** in this module: it is a *schedule*, not a
+trigger. The distinction is the one this file is built on — a trigger is asked
+"another batch right now?" only after a non-empty batch has committed, so it can
+never express "nothing is there, wait and look again". It lives in
+:mod:`duckstream.daemon`, drives its loop with :class:`AvailableNow`, and
+releases the catalog between cycles. A redirect at the bottom of this module
+keeps the old import path working.
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from duckstream.errors import DuckstreamError
 
-__all__ = ["Trigger", "AvailableNow", "Once", "ProcessingTime"]
+__all__ = ["Trigger", "AvailableNow", "Once"]
 
 
 @runtime_checkable
@@ -129,33 +135,20 @@ class Once:
         return "Once (exactly one batch per model)"
 
 
-class ProcessingTime:
-    """Post-v1. Refuses construction rather than pretending to schedule.
+def __getattr__(name: str) -> Any:
+    """``ProcessingTime`` used to live here, refusing. It now exists, elsewhere.
 
-    A fixed-interval trigger needs three things v1 deliberately does not have: a
-    long-lived process, a portable lock (never ``fcntl`` — it is POSIX-only and
-    breaks import on Windows, ``CONTEXT.md`` section 5), and a second writer to
-    reason about, which would invalidate the single-writer assumptions in
-    ``CONTEXT.md`` 2.5 and the memoised batch id in 1.10.
-
-    None of that is needed to run duckstream on a schedule today: cron or a
-    supervisor calls ``duckstream run`` and :class:`AvailableNow` drains what
-    has arrived. ``CONTEXT.md`` 1.8 measured the real floor under cron at about
-    0.3 s including interpreter start, so seconds is the meaningful unit anyway.
+    Kept as a redirect rather than deleted, because ``from duckstream.trigger
+    import ProcessingTime`` is what anyone who read the old docstring will
+    write. It moved to :mod:`duckstream.daemon` because it turned out **not to
+    be a trigger at all** — a trigger answers "another batch right now?" after
+    a non-empty batch commits, and a schedule answers "the source is empty,
+    when do I look again?". Expressing the second as the first would mean
+    blocking inside :meth:`Trigger.should_continue`, holding the catalog across
+    the wait, which is the one thing ``CONTEXT.md`` 1.6 and 1.25 say not to do.
     """
+    if name == "ProcessingTime":
+        from duckstream.daemon import ProcessingTime
 
-    type_name: ClassVar[str] = "processing_time"
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        del args, kwargs
-        raise DuckstreamError(
-            "ProcessingTime is post-v1: cron owns the loop. duckstream v1 has no "
-            "background thread and no timer — a process opens the catalog, "
-            "drains it with AvailableNow and exits, which is also what keeps the "
-            "warehouse readable (CONTEXT.md 1.6: while one process holds a "
-            "DuckDB file, nothing else can open it, not even read-only). "
-            "Schedule `duckstream run --config models.yaml` from cron or a "
-            "supervisor instead; CONTEXT.md 1.8 measured ~235 ms of process "
-            "start per tick, so seconds is the sensible interval. A daemon "
-            "trigger arrives with a portable lock, post-v1."
-        )
+        return ProcessingTime
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

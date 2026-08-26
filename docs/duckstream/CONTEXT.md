@@ -189,9 +189,18 @@ the user out of their own warehouse.
 
 **Consequence.** Two things follow. `AvailableNow` under cron is safe because the
 process opens, drains and closes, leaving the file free between runs. And it is an
-independent argument for DuckLake as the storage layer: the catalog is a separate
-database and the data is parquet, so readers attach freely while the engine
-writes. This is what makes a `ProcessingTime` daemon viable at all.
+independent argument for DuckLake as the storage layer: the **data** is parquet,
+readable by anything with no catalog at all, so a landing tree or a mart's files
+stay queryable while the engine writes.
+
+> **This section used to end "so readers attach freely while the engine writes",
+> and 1.25 measured that and found it false.** The `.ducklake` catalog *is* a
+> DuckDB database file, so this very constraint applies to it — and it applies
+> to **attaching**, not to writing: a second process is refused even
+> `READ_ONLY`, and even when the holder is idle. Free attachment would need a
+> SQLite or PostgreSQL catalog (2.5). What makes a `ProcessingTime` daemon
+> viable is not free attachment but that **`DETACH` releases the lock**, so a
+> loop can hand the catalog back between cycles — see 1.25.
 
 ### 1.7 DuckLake inlining silently captures small batches
 
@@ -1163,6 +1172,93 @@ path off the boot medium, or merely document it is a design decision for
 whoever owns phase-4 maintenance. What is not open is that it should be a
 *decision*: today it is a default nobody chose, and its failure mode is a
 pipeline that gets mysteriously slow rather than one that says what is wrong.
+
+### 1.25 The catalog lock is on **attach**, and `DETACH` releases it
+
+**Method.** `PLAN.md` and `STATUS.md` both stated that with DuckLake *"readers
+attach freely while the engine writes"*, and the `ProcessingTime` daemon was
+deferred partly on the opposite belief — that a long-lived process would lock
+everyone out. Both cannot be right, and neither had been executed. Two
+processes, a real DuckLake catalog on the Pi's SD card.
+
+| Second process attempts | Result |
+|---|---|
+| `ATTACH ... (READ_ONLY)` while the writer is **mid-transaction** | **fails** — file lock |
+| `ATTACH ... (READ_ONLY)` while the writer is merely **attached and idle** | **fails** — file lock |
+| `ATTACH` read-write, writer attached and idle | **fails** — file lock |
+| `read_parquet` over the data files, no catalog at all | **works** |
+
+```
+IO Error: Failed to attach DuckLake MetaData "__ducklake_metadata_lake"
+Could not set lock on file ".../catalog.ducklake"
+```
+
+**Conclusion, and it corrects two documents.** *"Readers attach freely"* is
+**false** for a DuckDB-file catalog. The `.ducklake` file *is* a DuckDB
+database, so 1.6 applies to it directly — and it applies to **attaching**, not
+to writing: a second process is refused even `READ_ONLY`, and even when the
+holder is doing nothing. That claim would only hold with a **SQLite or
+PostgreSQL** catalog, which 2.5 already names for multiple local processes and
+which nobody here has measured.
+
+What *is* true is the second row from the bottom: the **data** is plain parquet
+and readable with no catalog, which is what makes a landing tree queryable while
+the engine writes.
+
+**And `DETACH` releases the lock**, which is what makes a daemon viable at all:
+
+| | Measured |
+|---|---|
+| `ATTACH` + settings, **warm** process | **~11 ms** (1.8's ~78 ms was cold) |
+| whole cycle: attach, commit, detach | **~207 ms** |
+| …with an outside reader contending | ~260 ms |
+| fresh `Engine` per cycle, snapshots written | **3 on the first, 0 on every one after** |
+| outside reader attaching against a 2 s daemon | **33 of 38 attempts (86%)** |
+
+**Consequence — `ProcessingTime` is buildable, and this is the shape.** A daemon
+that attaches, drains with `AvailableNow`, **detaches**, and sleeps holds the
+catalog about 10% of the time at a two-second interval, against cron's ~1 s in
+60 with marts up to a minute stale. The two costs that would have made
+per-cycle release unaffordable do not exist: re-attaching a warm process is
+~11 ms rather than the ~235 ms of process start, and `ensure` is idempotent so
+the loop writes no extra snapshots — without that second property a two-second
+loop would add 43,200 snapshots a day.
+
+**Dropping the memos is correct rather than collateral.** 1.10 and 1.11 memoise
+the batch id and the committed watermark and both say to revisit "the moment a
+second writer exists". Detaching creates exactly that window, so the daemon
+builds a **fresh engine** each cycle and re-reads both — which is also why the
+snapshot measurement above had to be taken before the design was settled.
+
+### 1.26 `/tmp` is tmpfs on Raspberry Pi OS, and the test suite outgrows it
+
+**Method.** Noticed twice, the second time as a hard failure. `/` is an SD card;
+`/tmp` is **tmpfs**, capped at 2 GB of RAM; swap is `zram`, i.e. compressed RAM.
+Both the mutation audit's worktrees and every `tmp_path` the suite uses land in
+`/tmp`.
+
+| | Measured |
+|---|---|
+| one `all` suite's temp footprint | **~700 MB** |
+| two concurrent expensive suites | ~1.4 GB of a 2.0 GB cap |
+| full suite at 1,299 tests | **exceeded the cap** — `ENOSPC` |
+
+**Conclusion.** The full suite fitted at 1,257 tests and did not at 1,299. On
+the Windows dev box `%TEMP%` is on disk, so none of this exists there; it is a
+property of the target platform.
+
+**Consequence, and the failure mode is the point.** On the dev box a starved
+audit is killed at its budget and reported `ERROR` — visible, and the README
+says to re-run it. If tmpfs fills instead, tests fail with `ENOSPC`, the suite
+exits non-zero, and the mutation is recorded **red**. A false `ERROR` is loud
+and gets re-run; a false **red** is silent and inflates the count with coverage
+nobody demonstrated. Run anything expensive with temp on disk:
+
+```bash
+TMPDIR=/var/tmp/ds-tests .venv/bin/python -m pytest -q
+TMPDIR=/var/tmp/ds-audit  DUCKSTREAM_AUDIT_WORKERS=2 \
+    .venv/bin/python tools/mutation/run_audit.py
+```
 
 ---
 

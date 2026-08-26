@@ -70,13 +70,23 @@ Three verdicts, kept apart on purpose:
     A bare `skip="..."` still works, for anything genuinely un-auditable
     everywhere. Prefer `requires`.
 - **held** — a mutation that had to survive, and did. Set `expect_survives` to a
-  sentence saying why. There is one: widening the tier-three file index. The
-  index is a *hint* (`CONTEXT.md` 1.13), so making it select more files must
-  change no answer at all — a red there would prove the suite had started
-  depending on the hint for correctness rather than for cost, which is the one
-  thing that measurement says must never happen. It is reported apart from both
-  red and SURVIVED, and excluded from the denominator, so it can never be
-  miscounted as either. `HINT-BECAME-TRUTH` is the failure of that assertion.
+  sentence saying why. There are **two**:
+  - *widening the tier-three file index.* The index is a *hint*
+    (`CONTEXT.md` 1.13), so making it select more files must change no answer at
+    all — a red there would prove the suite had started depending on the hint
+    for correctness rather than for cost, which is the one thing that
+    measurement says must never happen.
+  - *reversing the landing scan's sort order.* Planning re-sorts candidates by
+    `(mtime, relpath)`, so scan order is not load-bearing and a red would mean
+    something downstream had quietly come to depend on it.
+
+  Both are reported apart from red and from SURVIVED, and excluded from the
+  denominator, so neither can be miscounted as either. `HINT-BECAME-TRUTH` is
+  the failure of that assertion.
+
+  **Note what this does to the arithmetic**, because a handover got it wrong
+  once: the runner prints `red / (total − excused − held)`. With 68 mutations,
+  0 excused and 2 held on Linux, a clean run reads **66/66**, not 68/68.
 
 `ERROR` and `TIMEOUT` are neither. A mutation that makes the engine loop for
 ever produces a timeout, and **a suite that hangs has not caught anything** —
@@ -182,3 +192,21 @@ DUCKSTREAM_AUDIT_WORKERS=1 .venv/bin/python tools/mutation/run_audit.py
 And on any Pi run, **verify the reds rather than counting them**: every result
 carries `first_failures`, so a red whose failing test has nothing to do with
 what the mutation changed is contention, not coverage.
+
+### The suite itself is marginal on tmpfs, not just the audit
+
+Recorded because it bit twice. The section above is about the *audit* filling
+`/tmp`; a plain `pytest -q` does it too. The full suite peaked past a 2 GB
+tmpfs on a Pi 5 once the daemon tests were added, and the failure arrives as
+`ENOSPC` on whatever happens to be writing at the time — which may be the test
+runner, or may be the harness capturing its output, so the message need not
+mention pytest at all.
+
+Run the expensive suites with temp on disk:
+
+```bash
+TMPDIR=/var/tmp/ds-tests .venv/bin/python -m pytest -q
+```
+
+On the Windows dev box `%TEMP%` is already on disk, so none of this appears
+there. It is a property of Raspberry Pi OS mounting `/tmp` as tmpfs.
