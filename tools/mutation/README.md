@@ -6,9 +6,17 @@ introduced one at a time, each a *plausible wrong decision* rather than a syntax
 error, and every one has to turn the suite red.
 
 ```bash
-.venv/Scripts/python.exe tools/mutation/run_audit.py            # all of them
-.venv/Scripts/python.exe tools/mutation/run_audit.py 3 11 14    # by index
+.venv/bin/python tools/mutation/run_audit.py            # all of them  (POSIX)
+.venv/bin/python tools/mutation/run_audit.py 3 11 14    # by index
+.venv\Scripts\python.exe tools\mutation\run_audit.py    # the same, on Windows
 ```
+
+The interpreter is now **resolved**, not assumed. It used to be hard-coded to
+`.venv/Scripts/python.exe`, which does not exist on Linux — so the first Pi run
+launched nothing at all and every mutation came back `ERROR`, which this file
+tells you to read as contention. A broken harness and a starved box are not
+distinguishable from the outside, so a missing interpreter is now one loud
+failure instead of fifty-nine quiet ones.
 
 Results stream as JSON, one line per mutation, and land in `audit_results.json`
 beside the scripts.
@@ -43,11 +51,24 @@ Three verdicts, kept apart on purpose:
   same thing:
   - `inert_on=("nt",)` — the mutation is **inert** here, because it changes a
     branch this OS does not take. It applies textually and behaves identically.
-  - `skip="..."` — the mutation is **live** here and the *fixture* cannot be
-    built. The symlink one is the example: Windows will not create a directory
-    symlink without a privilege most boxes lack, so the test that catches it
-    skips too. It reported SURVIVED once for exactly that reason, which is a
-    false hole — declaring it is the honest alternative.
+  - `requires="dirsymlink"` / `requires="paho"` — the mutation is **live** here
+    and the *fixture* may not be buildable. The capability is **probed at audit
+    time**, the same way the matching test probes it, so the same declaration
+    excuses the mutation on a box that cannot run it and audits it on a box
+    that can.
+
+    This used to be an unconditional `skip="..."` string, and the word doing
+    the work in its reason — "this platform will not create a directory
+    symlink" — was **here**, which the implementation never checked. Both
+    mutations carrying one were therefore excused on *every* platform for ever,
+    including the ones that could build the fixture. That is the same failure a
+    stale anchor produces: an audit reporting `skipped` for coverage it could
+    have had. When the probe was added and the two ran for the first time, one
+    of them (`manual_ack is never set`) **survived** — a real hole, in the one
+    line that carries the whole phase-5 acknowledgement guarantee.
+
+    A bare `skip="..."` still works, for anything genuinely un-auditable
+    everywhere. Prefer `requires`.
 - **held** — a mutation that had to survive, and did. Set `expect_survives` to a
   sentence saying why. There is one: widening the tier-three file index. The
   index is a *hint* (`CONTEXT.md` 1.13), so making it select more files must
@@ -133,3 +154,31 @@ on the `conf` and `all` suites, while every `fast` one finished cleanly.
 So: an `ERROR` on an expensive suite is contention until proven otherwise.
 Re-run those indices alone before recording anything about them —
 `run_audit.py` takes indices, so it is cheap to do.
+
+### On a Raspberry Pi, contention can produce a **false red**, which is worse
+
+`/tmp` on Raspberry Pi OS is **tmpfs**, capped at 2 GB of RAM. Both the audit's
+worktrees *and* every `tmp_path` the suite uses land there, so on a Pi the audit
+competes with the suite under test for memory — a hazard that does not exist on
+the Windows box, where `%TEMP%` is on disk. Measured during the first Pi run:
+**one `all` suite occupies ~700 MB of tmpfs**, so two concurrent expensive
+suites sit at ~1.4 GB of a 2.0 GB cap, with system RAM down to ~1.1 GB free.
+
+That matters because it changes the failure mode. On the dev box a starved
+suite is *killed at its budget* and reported `ERROR` — visible, and this file
+tells you to re-run it. If tmpfs fills instead, tests fail with `ENOSPC` or the
+allocator gives up, the suite exits non-zero, and the mutation is recorded
+**red**. A false `ERROR` is loud and gets re-run; a false **red** is silent and
+inflates the count with coverage nobody demonstrated.
+
+Two mitigations, either of which is enough:
+
+```bash
+TMPDIR=/var/tmp/duckstream-audit DUCKSTREAM_AUDIT_WORKERS=2 \
+    .venv/bin/python tools/mutation/run_audit.py     # temp on disk, not RAM
+DUCKSTREAM_AUDIT_WORKERS=1 .venv/bin/python tools/mutation/run_audit.py
+```
+
+And on any Pi run, **verify the reds rather than counting them**: every result
+carries `first_failures`, so a red whose failing test has nothing to do with
+what the mutation changed is contention, not coverage.

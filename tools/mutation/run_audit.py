@@ -25,7 +25,29 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-PYTHON = REPO / ".venv" / "Scripts" / "python.exe"
+
+
+def venv_python(repo: pathlib.Path) -> pathlib.Path:
+    """The venv interpreter, wherever this platform keeps it.
+
+    Hard-coding `.venv/Scripts/python.exe` cost the first Pi run of this audit:
+    the path does not exist on Linux, so every mutation failed to launch pytest
+    and came back `ERROR` -- which the README tells you to read as contention on
+    a busy box. A broken harness and a starved suite are not distinguishable
+    from the outside, so the path is resolved rather than assumed, and a missing
+    interpreter is a loud failure instead of 59 quiet ones.
+    """
+    for candidate in (repo / ".venv" / "bin" / "python",
+                      repo / ".venv" / "Scripts" / "python.exe"):
+        if candidate.exists():
+            return candidate
+    raise SystemExit(
+        f"no venv interpreter under {repo / '.venv'} -- looked for "
+        f"bin/python and Scripts/python.exe"
+    )
+
+
+PYTHON = venv_python(REPO)
 # Outside the repository, deliberately. A worktree under `tools/` shows up in
 # `git status` as untracked, which is the same "something the audit left in your
 # checkout" hazard this design exists to remove -- one `git add -A` away from
