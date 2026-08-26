@@ -1,0 +1,678 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Accelerometer Lakehouse</title>
+<style>
+  :root{
+    --ground:#F6F7F9; --surface:#FFFFFF; --surface-2:#EDF0F4;
+    --ink:#161B22; --ink-soft:#3A4553; --muted:#626E7E;
+    --rule:#DCE2EA; --rule-strong:#C3CCD8;
+    --accent:#0B6E78; --accent-soft:#E1EFF0;
+    --live:#3A6F4F; --live-soft:#E4EFE7;
+    --warn:#9A6414; --warn-soft:#F6EDDC;
+    --alert:#9B3F52; --alert-soft:#F7E7EA;
+    --shadow:0 1px 2px rgba(22,27,34,.05),0 6px 18px rgba(22,27,34,.05);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#10141A; --surface:#171C24; --surface-2:#1E242E;
+      --ink:#E6EAF0; --ink-soft:#BDC6D2; --muted:#8B97A6;
+      --rule:#2A323D; --rule-strong:#3B4451;
+      --accent:#48B7C1; --accent-soft:#15323A;
+      --live:#6FBF8D; --live-soft:#17301F;
+      --warn:#D7A34F; --warn-soft:#332715;
+      --alert:#DE8496; --alert-soft:#351C22;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.25);
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:0 1.25rem 4rem;background:var(--ground);color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1180px;margin:0 auto}
+  code,.mono{font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace}
+
+  header{display:flex;flex-wrap:wrap;gap:1rem;align-items:baseline;
+    justify-content:space-between;padding:1.8rem 0 1.1rem;
+    border-bottom:2px solid var(--ink);margin-bottom:1.5rem}
+  h1{font-size:1.45rem;font-weight:650;letter-spacing:-.015em;margin:0}
+  h1 span{color:var(--muted);font-weight:400}
+  .statusline{display:flex;align-items:center;gap:.55rem;font-size:.82rem;color:var(--muted)}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
+  .dot.live{background:var(--live);box-shadow:0 0 0 3px var(--live-soft)}
+  .dot.busy{background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
+  .dot.down{background:var(--alert);box-shadow:0 0 0 3px var(--alert-soft)}
+  @media (prefers-reduced-motion:no-preference){
+    .dot.live{animation:pulse 2.4s ease-in-out infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  }
+
+  .tiles{display:grid;gap:.85rem;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));
+    margin-bottom:1.6rem}
+  .tile{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+    padding:.85rem .95rem;box-shadow:var(--shadow)}
+  .tile .k{font-size:.66rem;font-weight:650;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--muted);margin-bottom:.35rem}
+  .tile .v{font-size:1.5rem;font-weight:600;letter-spacing:-.02em;
+    font-variant-numeric:tabular-nums;line-height:1.15}
+  .tile .sub{font-size:.72rem;color:var(--muted);margin-top:.2rem}
+  .tile.accent .v{color:var(--accent)}
+  .tile.warn{border-color:var(--warn)}
+  .tile.warn .v{color:var(--warn)}
+  .tile.warn .sub{color:var(--warn)}
+
+  section{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+    padding:1.1rem 1.2rem 1.3rem;margin-bottom:1.4rem;box-shadow:var(--shadow)}
+  section h2{font-size:.98rem;font-weight:650;margin:0 0 .2rem;letter-spacing:-.005em}
+  section .hint{font-size:.78rem;color:var(--muted);margin:0 0 .9rem}
+
+  .tablewrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:.83rem;
+    font-variant-numeric:tabular-nums}
+  th{text-align:left;font-size:.65rem;font-weight:650;letter-spacing:.08em;
+    text-transform:uppercase;color:var(--muted);padding:0 .7rem .5rem 0;
+    border-bottom:1.5px solid var(--rule-strong);white-space:nowrap}
+  td{padding:.5rem .7rem .5rem 0;border-bottom:1px solid var(--rule);
+    color:var(--ink-soft);white-space:nowrap}
+  td:first-child,th:first-child{color:var(--ink)}
+  tbody tr:hover td{background:var(--surface-2)}
+  .num{text-align:right}
+
+  /* One fixed height for every chart. Without an explicit CSS height the
+     browser derives display height from the canvas's backing-store aspect
+     ratio -- which `prep()` recomputes from the page width -- so the charts
+     grew taller on a wider window and ate the page. */
+  .chart{width:100%;height:200px;display:block;border-radius:6px;
+    background:var(--surface-2)}
+  @media (max-width:640px){ .chart{height:150px} }
+  .charthead{display:flex;flex-wrap:wrap;gap:.5rem;align-items:baseline;
+    justify-content:space-between;margin-bottom:.6rem}
+  .pill{display:inline-block;font-size:.68rem;font-weight:650;padding:.2em .6em;
+    border-radius:20px;background:var(--accent-soft);color:var(--accent)}
+  .legend{display:flex;flex-wrap:wrap;gap:.9rem;margin-top:.6rem;font-size:.74rem;
+    color:var(--muted)}
+  .legend i{display:inline-block;width:16px;height:3px;border-radius:2px;
+    margin-right:.35rem;vertical-align:middle}
+
+  .controls{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center;
+    margin-bottom:.9rem;font-size:.8rem;color:var(--muted)}
+  .controls label{display:inline-flex;align-items:center;gap:.35rem}
+  .controls select,.controls button{font:inherit;font-size:.8rem;
+    padding:.3em .6em;border-radius:5px;border:1px solid var(--rule-strong);
+    background:var(--surface);color:var(--ink);cursor:pointer}
+  .controls button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+  .controls button:disabled{opacity:.45;cursor:default}
+  .controls button.primary{background:var(--accent-soft);color:var(--accent);
+    border-color:var(--accent)}
+  .controls .range{margin-left:auto;font-variant-numeric:tabular-nums}
+  .empty{padding:1.6rem 0;text-align:center;color:var(--muted);font-size:.86rem}
+  .banner{border-radius:8px;padding:.8rem 1rem;margin-bottom:1.2rem;font-size:.85rem;
+    display:none}
+  .banner.show{display:block}
+  .banner.busy{background:var(--warn-soft);color:var(--warn);
+    border:1px solid var(--warn)}
+  .banner.down{background:var(--alert-soft);color:var(--alert);
+    border:1px solid var(--alert)}
+  footer{font-size:.75rem;color:var(--muted);text-align:center;margin-top:1.6rem}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Accelerometer <span>lakehouse</span></h1>
+  <div class="statusline">
+    <span class="dot" id="dot"></span>
+    <span id="state">connecting…</span>
+    <span aria-hidden="true">·</span>
+    <span id="clock">—</span>
+  </div>
+</header>
+
+<div class="banner" id="banner"></div>
+
+<div class="tiles" id="tiles"></div>
+
+<section>
+  <div class="charthead">
+    <div>
+      <h2>Vibration magnitude</h2>
+      <p class="hint">The most recent readings from the fact table, in g.</p>
+    </div>
+    <span class="pill" id="recentPill">—</span>
+  </div>
+  <canvas id="trace" class="chart"></canvas>
+  <div class="empty" id="traceEmpty">No readings yet.</div>
+</section>
+
+<section>
+  <div class="charthead">
+    <div>
+      <h2>Frequency spectrum</h2>
+      <p class="hint">One line per minute window — the FFT the pipeline recomputes for each. Low frequencies only.</p>
+    </div>
+    <span class="pill" id="specPill">—</span>
+  </div>
+  <canvas id="spectrum" class="chart"></canvas>
+  <div class="legend" id="specLegend"></div>
+  <div class="empty" id="specEmpty">No spectra yet.</div>
+</section>
+
+<section>
+  <div class="charthead">
+    <div>
+      <h2>Processing throughput</h2>
+      <p class="hint">One bar per recent committed batch, over time — height is how long it took, colour is which model. Every model reads every chunk, so a reading appears once per model; the totals count it once and state the multiplier. This is a moving window of recent batches, so it reads lower than the lifetime "Readings stored" above.</p>
+    </div>
+    <span class="pill" id="thruPill">—</span>
+  </div>
+  <canvas id="thru" class="chart"></canvas>
+  <div class="legend" id="thruLegend"></div>
+  <div class="empty" id="thruEmpty">No batches yet.</div>
+  <div class="tablewrap" style="margin-top:1rem">
+    <table id="thruTable">
+      <thead><tr>
+        <th>Committed</th><th>Model</th>
+        <th class="num">Chunks</th><th class="num">Size</th>
+        <th class="num">Rows in</th><th class="num">Rows out</th>
+        <th class="num">Took</th><th class="num">Rows/s</th><th class="num">MB/s</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>Hourly summary</h2>
+  <p class="hint">From <code>marts.v_accel_hourly_summary</code> — averages folded incrementally, surrogate key joined from the dimension.</p>
+  <div class="tablewrap">
+    <table id="hourly">
+      <thead><tr>
+        <th>Hour</th><th>Location</th><th>City</th>
+        <th class="num">Samples</th><th class="num">avg&nbsp;x</th><th class="num">avg&nbsp;y</th>
+        <th class="num">avg&nbsp;z</th><th class="num">avg&nbsp;mag</th>
+        <th class="num">min</th><th class="num">max</th><th class="num">std&nbsp;dev</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="empty" id="hourlyEmpty">No hours yet.</div>
+</section>
+
+<section>
+  <div class="charthead">
+    <div>
+      <h2>Raw readings</h2>
+      <p class="hint">Rows of <code>curated.fact_accelerometer</code> exactly as landed. Live by default; use the controls to page back through history.</p>
+    </div>
+    <span class="pill" id="factPill">—</span>
+  </div>
+
+  <div class="controls">
+    <label>Location
+      <select id="factLoc"><option value="">all</option></select>
+    </label>
+    <label>Rows
+      <select id="factLimit">
+        <option>25</option><option selected>50</option>
+        <option>100</option><option>250</option>
+      </select>
+    </label>
+    <button id="factOlder" type="button">← Older</button>
+    <button id="factNewer" type="button">Newer →</button>
+    <button id="factLive" type="button" class="primary">Live</button>
+    <span class="range" id="factRange"></span>
+  </div>
+
+  <div class="tablewrap">
+    <table id="fact">
+      <thead><tr>
+        <th>Timestamp</th><th>Location</th>
+        <th class="num">x</th><th class="num">y</th><th class="num">z</th>
+        <th class="num">magnitude</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="empty" id="factEmpty">No readings yet.</div>
+</section>
+
+<footer id="foot">read-only · attaches per request so the pipeline is never locked out</footer>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const REFRESH_MS = 3000;
+
+const fmt = {
+  int: (n) => (n === null || n === undefined) ? "—" : n.toLocaleString(),
+  num: (n, d = 4) => (n === null || n === undefined) ? "—" : Number(n).toFixed(d),
+  time: (s) => {
+    if (!s) return "—";
+    const d = new Date(s);
+    return isNaN(d) ? s : d.toISOString().replace("T", " ").slice(0, 19);
+  },
+  ago: (s) => {
+    if (!s) return "";
+    const secs = (Date.now() - new Date(s).getTime()) / 1000;
+    if (!isFinite(secs)) return "";
+    if (secs < 90) return Math.max(0, Math.round(secs)) + "s ago";
+    if (secs < 5400) return Math.round(secs / 60) + "m ago";
+    return Math.round(secs / 3600) + "h ago";
+  },
+};
+
+async function get(path) {
+  const res = await fetch(path, { cache: "no-store" });
+  if (res.status === 503) { const e = new Error("busy"); e.busy = true; throw e; }
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+function banner(kind, text) {
+  const el = $("banner");
+  if (!kind) { el.className = "banner"; return; }
+  el.className = "banner show " + kind;
+  el.textContent = text;
+}
+
+function setState(kind, text) {
+  $("dot").className = "dot " + kind;
+  $("state").textContent = text;
+}
+
+/* ---------- tiles ---------- */
+function renderTiles(s) {
+  const tiles = [
+    { k: "Readings stored", v: fmt.int(s.readings ?? 0), sub: "fact_accelerometer", accent: true },
+    { k: "Latest reading", v: fmt.ago(s.latest_reading) || "—", sub: fmt.time(s.latest_reading) },
+    { k: "Locations", v: fmt.int(s.locations ?? (s.dimension || []).length) , sub: "in the dimension" },
+    { k: "Hours", v: fmt.int(s.hours ?? 0), sub: "hourly summary rows" },
+    { k: "Minutes", v: fmt.int(s.minutes ?? 0), sub: "spectra computed" },
+    { k: "Chunks processed", v: fmt.int(s.chunks_processed ?? 0),
+      sub: `of ${fmt.int(s.chunks_total ?? 0)} landed` },
+    // The one number that says whether the pipeline is keeping up. It should
+    // sit at 0 or 1 in a healthy stream and climb only when ingest outpaces
+    // processing — unlike the count it replaced, which only ever went up
+    // because consumed chunks are never deleted.
+    { k: "Chunks remaining", v: fmt.int(s.chunks_remaining ?? 0),
+      sub: (s.chunks_remaining ?? 0) > 3 ? "falling behind" : "keeping up",
+      warn: (s.chunks_remaining ?? 0) > 3 },
+  ];
+  $("tiles").innerHTML = tiles.map((t) => `
+    <div class="tile${t.accent ? " accent" : ""}${t.warn ? " warn" : ""}">
+      <div class="k">${t.k}</div>
+      <div class="v">${t.v}</div>
+      <div class="sub">${t.sub}</div>
+    </div>`).join("");
+}
+
+/* ---------- canvas helpers ---------- */
+function prep(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  // Measured from the laid-out element, not from an attribute: the CSS height
+  // is now the single source of truth for how tall a chart is, and the
+  // backing store just follows it at device resolution.
+  const w = canvas.clientWidth || 600;
+  const h = canvas.clientHeight || 200;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { ctx, w, h };
+}
+const css = (n) => getComputedStyle(document.documentElement)
+  .getPropertyValue(n).trim();
+
+function grid(ctx, w, h, pad) {
+  ctx.strokeStyle = css("--rule");
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad + (h - pad * 2) * (i / 4);
+    ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(w - pad, y); ctx.stroke();
+  }
+}
+
+/* ---------- magnitude trace ---------- */
+function renderTrace(rows) {
+  const canvas = $("trace");
+  const has = rows && rows.length > 1;
+  canvas.style.display = has ? "block" : "none";
+  $("traceEmpty").style.display = has ? "none" : "block";
+  $("recentPill").textContent = has ? rows.length + " readings" : "—";
+  if (!has) return;
+
+  const { ctx, w, h } = prep(canvas);
+  const pad = 22;
+  const vals = rows.map((r) => r.magnitude).filter((v) => v !== null);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (hi - lo < 1e-6) { hi += 0.05; lo -= 0.05; }
+  const pd = (hi - lo) * 0.12; lo -= pd; hi += pd;
+
+  grid(ctx, w, h, pad);
+  const x = (i) => pad + (w - pad * 2) * (i / (rows.length - 1));
+  const y = (v) => h - pad - (h - pad * 2) * ((v - lo) / (hi - lo));
+
+  // area under the line, then the line — a filled trace reads as a signal
+  ctx.beginPath(); ctx.moveTo(x(0), h - pad);
+  rows.forEach((r, i) => ctx.lineTo(x(i), y(r.magnitude)));
+  ctx.lineTo(x(rows.length - 1), h - pad); ctx.closePath();
+  ctx.fillStyle = css("--accent-soft"); ctx.fill();
+
+  ctx.beginPath();
+  rows.forEach((r, i) => i ? ctx.lineTo(x(i), y(r.magnitude))
+                           : ctx.moveTo(x(i), y(r.magnitude)));
+  ctx.strokeStyle = css("--accent"); ctx.lineWidth = 1.6; ctx.stroke();
+
+  ctx.fillStyle = css("--muted");
+  ctx.font = "10px ui-monospace, monospace";
+  ctx.fillText(hi.toFixed(3) + " g", pad, pad - 7);
+  ctx.fillText(lo.toFixed(3) + " g", pad, h - pad + 13);
+}
+
+/* ---------- spectrum ---------- */
+const SERIES = ["--accent", "--live", "--warn", "--alert", "--ink-soft", "--muted"];
+
+function renderSpectrum(rows) {
+  const canvas = $("spectrum");
+  const usable = (rows || []).filter((r) => (r.mag || []).length > 1);
+  canvas.style.display = usable.length ? "block" : "none";
+  $("specEmpty").style.display = usable.length ? "none" : "block";
+  if (!usable.length) { $("specPill").textContent = "—"; $("specLegend").innerHTML = ""; return; }
+
+  const total = usable[0].total_bins, shown = usable[0].shown_bins;
+  $("specPill").textContent = `${usable.length} window${usable.length > 1 ? "s" : ""} · ${shown} of ${fmt.int(total)} bins`;
+
+  const { ctx, w, h } = prep(canvas);
+  const pad = 26;
+  // Bin 0 is the DC component — the mean — and is usually orders of magnitude
+  // larger than everything else. Plotting it flattens the rest to a line.
+  const series = usable.map((r) => r.mag.slice(1));
+  const hi = Math.max(...series.flat());
+  const maxFreq = usable[0].freq ? usable[0].freq[usable[0].freq.length - 1] : shown;
+
+  grid(ctx, w, h, pad);
+  series.forEach((mags, s) => {
+    ctx.beginPath();
+    mags.forEach((m, i) => {
+      const px = pad + (w - pad * 2) * (i / (mags.length - 1));
+      const py = h - pad - (h - pad * 2) * (m / hi);
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.strokeStyle = css(SERIES[s % SERIES.length]);
+    ctx.lineWidth = s === 0 ? 1.8 : 1;
+    ctx.globalAlpha = s === 0 ? 1 : 0.55;
+    ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = css("--muted");
+  ctx.font = "10px ui-monospace, monospace";
+  ctx.fillText("0 Hz", pad, h - pad + 14);
+  const label = (maxFreq || 0).toFixed(1) + " Hz";
+  ctx.fillText(label, w - pad - ctx.measureText(label).width, h - pad + 14);
+  ctx.fillText("magnitude", pad, pad - 8);
+
+  $("specLegend").innerHTML = usable.map((r, i) => `
+    <span><i style="background:${css(SERIES[i % SERIES.length])}"></i>${fmt.time(r.window_ts).slice(11, 16)} · ${r.location_name} · ${fmt.int(r.sample_count)} samples</span>
+  `).join("");
+}
+
+
+/* ---------- throughput ---------- */
+const MODEL_COLOURS = ["--accent", "--live", "--warn"];
+const modelIndex = {};
+function colourFor(name) {
+  if (!(name in modelIndex)) modelIndex[name] = Object.keys(modelIndex).length;
+  return MODEL_COLOURS[modelIndex[name] % MODEL_COLOURS.length];
+}
+
+function renderThroughput(rows) {
+  const canvas = $("thru");
+  const has = rows && rows.length;
+  canvas.style.display = has ? "block" : "none";
+  $("thruEmpty").style.display = has ? "none" : "block";
+  const body = document.querySelector("#thruTable tbody");
+  document.getElementById("thruTable").style.display = has ? "table" : "none";
+  if (!has) { $("thruPill").textContent = "—"; $("thruLegend").innerHTML = ""; body.innerHTML = ""; return; }
+
+  // Every model reads every chunk, so summing rows_in across models counts each
+  // reading once per model — three times here. That made this pill disagree
+  // with the "Readings stored" tile by exactly 3x. The readings and bytes are
+  // therefore the *largest single model's* totals, which is the real data
+  // volume, and the multiplier is stated rather than folded in.
+  const rowsBy = {}, bytesBy = {};
+  rows.forEach((r) => {
+    rowsBy[r.model_name]  = (rowsBy[r.model_name]  || 0) + (r.rows_in || 0);
+    bytesBy[r.model_name] = (bytesBy[r.model_name] || 0) + (r.bytes   || 0);
+  });
+  const models   = Object.keys(rowsBy).length || 1;
+  const readings = Math.max(...Object.values(rowsBy), 0);
+  const bytes    = Math.max(...Object.values(bytesBy), 0);
+  // Time *is* legitimately summed: each model's work is real work the Pi did.
+  const totalMs  = rows.reduce((a, r) => a + (r.ms || 0), 0);
+  // "last N batches", not a lifetime total. The API returns a bounded window --
+  // the same one the chart plots -- so this will sit *below* the "Readings
+  // stored" tile once the pipeline has run longer than the window. Saying
+  // "last N" is the difference between a window and a contradiction.
+  $("thruPill").textContent =
+    `last ${rows.length} batches · ${fmt.int(readings)} readings × ${models} models · ` +
+    `${(bytes / 1048576).toFixed(1)} MB · ${(totalMs / 1000).toFixed(1)}s of work`;
+
+  const { ctx, w, h } = prep(canvas);
+  const pad = 26;
+  const maxMs = Math.max(...rows.map((r) => r.ms || 0), 1);
+  grid(ctx, w, h, pad);
+
+  // One bar per batch, in commit order. Bars rather than a line because each
+  // batch is a discrete event, not a sample of a continuous signal.
+  const slot = (w - pad * 2) / rows.length;
+  const bw = Math.max(1, Math.min(14, slot * 0.72));
+  rows.forEach((r, i) => {
+    const x = pad + slot * (i + 0.5) - bw / 2;
+    const bh = (h - pad * 2) * ((r.ms || 0) / maxMs);
+    ctx.fillStyle = css(colourFor(r.model_name));
+    ctx.fillRect(x, h - pad - bh, bw, bh);
+  });
+
+  ctx.fillStyle = css("--muted");
+  ctx.font = "10px ui-monospace, monospace";
+  ctx.fillText(maxMs + " ms", pad, pad - 8);
+  ctx.fillText(fmt.time(rows[0].committed_at).slice(11, 19), pad, h - pad + 14);
+  const last = fmt.time(rows[rows.length - 1].committed_at).slice(11, 19);
+  ctx.fillText(last, w - pad - ctx.measureText(last).width, h - pad + 14);
+
+  const names = [...new Set(rows.map((r) => r.model_name))];
+  $("thruLegend").innerHTML = names.map((n) => {
+    const mine = rows.filter((r) => r.model_name === n);
+    const ms = mine.reduce((a, r) => a + (r.ms || 0), 0);
+    const rr = mine.reduce((a, r) => a + (r.rows_in || 0), 0);
+    const rate = ms ? Math.round(rr / (ms / 1000)) : 0;
+    return `<span><i style="background:${css(colourFor(n))}"></i>${n} · ${fmt.int(rate)} rows/s</span>`;
+  }).join("");
+
+  body.innerHTML = rows.slice().reverse().slice(0, 15).map((r) => {
+    const ms = r.ms || 0;
+    const rate = ms ? (r.rows_in || 0) / (ms / 1000) : 0;
+    const mbs = ms ? (r.bytes || 0) / 1048576 / (ms / 1000) : 0;
+    return `<tr>
+      <td class="mono">${fmt.time(r.committed_at).slice(11, 19)}</td>
+      <td>${r.model_name}</td>
+      <td class="num mono">${fmt.int(r.chunks)}</td>
+      <td class="num mono">${((r.bytes || 0) / 1048576).toFixed(2)} MB</td>
+      <td class="num mono">${fmt.int(r.rows_in)}</td>
+      <td class="num mono">${fmt.int(r.rows_out)}</td>
+      <td class="num mono">${fmt.int(ms)} ms</td>
+      <td class="num mono">${fmt.int(Math.round(rate))}</td>
+      <td class="num mono">${mbs.toFixed(1)}</td>
+    </tr>`;
+  }).join("");
+}
+
+/* ---------- hourly table ---------- */
+function renderHourly(rows) {
+  const body = document.querySelector("#hourly tbody");
+  const has = rows && rows.length;
+  document.getElementById("hourly").style.display = has ? "table" : "none";
+  $("hourlyEmpty").style.display = has ? "none" : "block";
+  if (!has) { body.innerHTML = ""; return; }
+  body.innerHTML = rows.map((r) => `
+    <tr>
+      <td class="mono">${fmt.time(r.hour_ts).slice(0, 16)}</td>
+      <td>${r.location_name ?? "—"}</td>
+      <td>${r.city ?? "—"}</td>
+      <td class="num mono">${fmt.int(r.sample_count)}</td>
+      <td class="num mono">${fmt.num(r.avg_x)}</td>
+      <td class="num mono">${fmt.num(r.avg_y)}</td>
+      <td class="num mono">${fmt.num(r.avg_z)}</td>
+      <td class="num mono">${fmt.num(r.avg_magnitude)}</td>
+      <td class="num mono">${fmt.num(r.min_magnitude)}</td>
+      <td class="num mono">${fmt.num(r.max_magnitude)}</td>
+      <td class="num mono">${fmt.num(r.stddev_magnitude)}</td>
+    </tr>`).join("");
+}
+
+
+/* ---------- raw fact rows, live or historical ---------- */
+// `null` cursor means "live" — follow the newest rows from the cached snapshot.
+// A timestamp means "show the page ending just before this", which is keyset
+// pagination: each page starts where the last ended, so paging back through a
+// day of 100 Hz data costs the same as the first page.
+const factView = { cursor: null, location: "", limit: 50, pageStart: null };
+
+function factRowsHtml(rows) {
+  return rows.map((r) => `
+    <tr>
+      <td class="mono">${fmt.time(r.timestamp).slice(0, 23)}</td>
+      <td>${r.location ?? "—"}</td>
+      <td class="num mono">${fmt.num(r.x)}</td>
+      <td class="num mono">${fmt.num(r.y)}</td>
+      <td class="num mono">${fmt.num(r.z)}</td>
+      <td class="num mono">${fmt.num(r.magnitude)}</td>
+    </tr>`).join("");
+}
+
+function paintFact(rows, meta) {
+  const body = document.querySelector("#fact tbody");
+  const has = rows && rows.length;
+  document.getElementById("fact").style.display = has ? "table" : "none";
+  $("factEmpty").style.display = has ? "none" : "block";
+  $("factLive").classList.toggle("primary", factView.cursor === null);
+  $("factNewer").disabled = factView.cursor === null;
+  if (!has) { body.innerHTML = ""; $("factPill").textContent = "—"; return; }
+
+  body.innerHTML = factRowsHtml(rows);
+  factView.pageStart = rows[rows.length - 1].timestamp;   // oldest on this page
+  $("factPill").textContent = factView.cursor === null
+    ? `live · newest ${rows.length}`
+    : `history · ${rows.length} rows`;
+  if (meta && meta.total) {
+    $("factRange").textContent =
+      `${fmt.int(meta.total)} readings · ${fmt.time(meta.earliest).slice(0, 19)} → ${fmt.time(meta.latest).slice(0, 19)}`;
+  }
+}
+
+// Live view: reuse the snapshot the rest of the page already fetched, so
+// following the stream costs no extra catalog read at all.
+function renderFact(recent) {
+  if (factView.cursor !== null) return;          // user is browsing history
+  const rows = (recent || []).slice().reverse()
+    .filter((r) => !factView.location || r.location === factView.location)
+    .slice(0, factView.limit);
+  paintFact(rows, null);
+  const seen = new Set([...(recent || []).map((r) => r.location)].filter(Boolean));
+  const sel = $("factLoc");
+  if (sel.options.length - 1 !== seen.size) {
+    sel.innerHTML = `<option value="">all</option>` +
+      [...seen].sort().map((l) => `<option${l === factView.location ? " selected" : ""}>${l}</option>`).join("");
+  }
+}
+
+async function loadFactHistory(before) {
+  const params = new URLSearchParams({ limit: String(factView.limit) });
+  if (before) params.set("before", before);
+  if (factView.location) params.set("location", factView.location);
+  try {
+    const data = await get("/api/readings?" + params.toString());
+    factView.cursor = before || "now";
+    paintFact(data.rows || [], data);
+  } catch (err) {
+    // Busy means the pipeline is mid-cycle. Not an error worth a red banner —
+    // the page keeps what it has and the user can click again.
+    $("factPill").textContent = err.busy ? "catalog busy — try again" : "history unavailable";
+  }
+}
+
+$("factOlder").addEventListener("click", () => loadFactHistory(factView.pageStart));
+$("factNewer").addEventListener("click", () => {
+  // One page newer is not expressible with a single `before` cursor, so this
+  // returns to live rather than pretending to step forward.
+  factView.cursor = null; refresh();
+});
+$("factLive").addEventListener("click", () => { factView.cursor = null; refresh(); });
+$("factLimit").addEventListener("change", (e) => {
+  factView.limit = Number(e.target.value);
+  factView.cursor === null ? refresh() : loadFactHistory(factView.pageStart);
+});
+$("factLoc").addEventListener("change", (e) => {
+  factView.location = e.target.value;
+  factView.cursor === null ? refresh() : loadFactHistory(null);
+});
+
+/* ---------- refresh loop ---------- */
+let busyStreak = 0;
+
+async function refresh() {
+  $("clock").textContent = new Date().toTimeString().slice(0, 8);
+  try {
+    const s = await get("/api/status");
+    busyStreak = 0;
+
+    if (!s.catalog_exists) {
+      setState("busy", "waiting for the first commit");
+      banner("busy", "The pipeline has not written anything yet. Start it, and this page will fill in on its own.");
+      renderTiles(s);
+      return;
+    }
+    banner(null);
+    setState("live", s.state === "live" ? "live" : (s.state || "live"));
+
+    const [hourly, spectrum, recent] = await Promise.all([
+      get("/api/hourly?limit=24").catch(() => []),
+      get("/api/spectrum?limit=4&bins=240").catch(() => []),
+      get("/api/recent?limit=600").catch(() => []),
+    ]);
+    const throughput = await get("/api/throughput").catch(() => []);
+    renderTiles(s);
+    renderHourly(hourly);
+    renderSpectrum(spectrum);
+    renderTrace(recent);
+    renderThroughput(throughput);
+    renderFact(recent);
+    $("foot").textContent =
+      `read-only · attaches per request so the pipeline is never locked out · refreshed ${new Date().toTimeString().slice(0, 8)}`;
+  } catch (err) {
+    if (err.busy) {
+      // Expected: the pipeline holds the catalog for a fraction of each cycle.
+      // Only complain if it persists, so a normal cycle causes no flicker.
+      busyStreak++;
+      setState("busy", "pipeline is writing…");
+      if (busyStreak > 4) banner("busy", "The catalog has been busy for a while — the pipeline may be draining a large backlog.");
+    } else {
+      setState("down", "backend unreachable");
+      banner("down", "Cannot reach the backend. Is server.py running?");
+    }
+  }
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+window.addEventListener("resize", () => refresh());
+</script>
+</body>
+</html>
