@@ -1,4 +1,4 @@
-"""Deliberate defects: phase 4's consumed-file change, and phase 3's tier three.
+"""Deliberate defects for phases 3, 4 and 5.
 
 Each entry is a plausible wrong decision somebody could actually make, not a
 syntax error. `find` must appear exactly once in `file`; it is replaced by
@@ -16,8 +16,15 @@ the README, which records the two structural reasons a conformance run can be
 blind to a defect on purpose.
 
 `expect_survives` marks the rare mutation that must **not** turn the suite red,
-with a sentence saying why. There is one: widening the tier-three file index.
-The index is a hint, so making it select more files must change no answer.
+with a sentence saying why. There are two: widening the tier-three file index
+(it is a hint, so selecting more files must change no answer), and reversing the
+landing scan's sort order (planning re-sorts, so scan order is not
+load-bearing).
+
+`skip="..."` excuses a mutation that is *live* here but whose fixture cannot be
+built on this machine -- a directory symlink, or an installed `paho-mqtt`. That
+is different from `inert_on`, which is for a mutation this OS makes a no-op.
+Both are excluded from the denominator and listed by name; see the README.
 """
 
 MUTATIONS = [
@@ -516,6 +523,180 @@ MUTATIONS = [
                 return True""",
         suite="fast",
         note="an unmarked directory would be read as if it were complete",
+    ),
+    # -- phase 5: the landing writer ---------------------------------------
+    #
+    # The guarantee is at-least-once, and every defect here breaks it in the
+    # quiet direction: the broker is told a message was handled and it was not.
+    # Nothing observes that until a process dies with a full buffer.
+    dict(
+        name="the marker is written before the data file, not after",
+        file="duckstream/landing.py",
+        find="""        os.replace(temp, target)
+        if self.marker is not None:
+            (directory / self.marker).write_bytes(b"")""",
+        repl="""        if self.marker is not None:
+            (directory / self.marker).write_bytes(b"")
+        os.replace(temp, target)""",
+        suite="fast",
+        note="a reader may then plan a directory whose data file is not there yet",
+    ),
+    dict(
+        name="tokens are released before the batch is durable",
+        file="duckstream/landing.py",
+        find="""        rows = len(self._records)
+        self._write(temp, self._records)""",
+        repl="""        rows = len(self._records)
+        tokens = tuple(self._tokens)
+        self._records = []
+        self._tokens = []
+        self._opened_at = None
+        return LandedBatch(
+            directory=directory, path=target, rows=rows, tokens=tokens
+        )""",
+        suite="fast",
+        note="at-most-once wearing at-least-once's clothes",
+    ),
+    dict(
+        name="a failed write clears the buffer, so the records are lost",
+        file="duckstream/landing.py",
+        find="""        rows = len(self._records)
+        self._write(temp, self._records)
+        # Atomic on POSIX and on Windows: a reader sees the whole file or no""",
+        repl="""        rows = len(self._records)
+        _doomed, self._records = self._records, []
+        self._write(temp, _doomed)
+        # Atomic on POSIX and on Windows: a reader sees the whole file or no""",
+        suite="fast",
+        note="a full disk becomes a data loss instead of a delay",
+    ),
+    dict(
+        name="the writer keeps only the first record's keys, dropping later fields",
+        file="duckstream/landing.py",
+        find="""        columns: dict[str, None] = {}
+        for record in records:
+            for key in record:
+                columns.setdefault(key, None)""",
+        repl="""        columns: dict[str, None] = {}
+        for record in records[:1]:
+            for key in record:
+                columns.setdefault(key, None)""",
+        suite="fast",
+        note=(
+            "what pa.Table.from_pylist does on its own, and it is silent -- the "
+            "write succeeds and the column is simply absent. Found by a test, "
+            "not by review."
+        ),
+    ),
+    dict(
+        name="an empty flush lands an empty marked directory",
+        file="duckstream/landing.py",
+        find="""        if not self._records:
+            return None
+
+        directory = self._root / self._directory_name()""",
+        repl="""        if False:
+            return None
+
+        directory = self._root / self._directory_name()""",
+        suite="fast",
+    ),
+    dict(
+        name="two flushes can share a directory, so one marker covers both",
+        file="duckstream/landing.py",
+        find="        directory.mkdir(parents=True, exist_ok=False)",
+        repl="        directory.mkdir(parents=True, exist_ok=True)",
+        suite="fast",
+        note=(
+            "on its own this only weakens a guard; paired with a constant name "
+            "it is the trap-7 shape -- a marked directory gaining a file."
+        ),
+        also=dict(
+            file="duckstream/landing.py",
+            find='''        stamp = _utcnow().strftime("%Y%m%dT%H%M%S_%f")
+        return f"{stamp}_{uuid.uuid4().hex[:8]}"''',
+            repl='        return "batch"',
+        ),
+    ),
+    dict(
+        name="the time trigger measures the newest record, not the oldest",
+        file="duckstream/landing.py",
+        find="""        if self._opened_at is None:
+            self._opened_at = _utcnow()""",
+        repl="        self._opened_at = _utcnow()",
+        suite="fast",
+        note="a steady topic just under the threshold would never flush at all",
+    ),
+    dict(
+        name="a writer with no flush trigger at all is accepted",
+        file="duckstream/landing.py",
+        find="        if flush_rows is None and flush_seconds is None:",
+        repl="        if False:",
+        suite="fast",
+        note="looks like working right up until the buffer exhausts memory",
+    ),
+    dict(
+        name="the MQTT adapter acknowledges on arrival, like paho's default",
+        file="duckstream/sources/mqtt.py",
+        find="""        with self._lock:
+            self.writer.add(record, token=message)
+            if self.writer.due():
+                self._flush_locked()""",
+        repl="""        self._ack(message)
+        with self._lock:
+            self.writer.add(record, token=message)
+            if self.writer.due():
+                self._flush_locked()""",
+        suite="fast",
+        note="the exact defect the reference subscriber.py has",
+    ),
+    dict(
+        name="manual_ack is never set, so paho acks everything itself",
+        file="duckstream/sources/mqtt.py",
+        find="        client.manual_ack = True",
+        repl="        client.manual_ack = False",
+        suite="fast",
+        note=(
+            "Not reachable without paho installed, so it cannot be audited "
+            "here. Declared rather than left to report as a survivor."
+        ),
+        skip=(
+            "needs paho-mqtt, which is an optional dependency and is not "
+            "installed; the adapter's tests drive the callbacks directly"
+        ),
+    ),
+    dict(
+        name="a reconnect does not resubscribe",
+        file="duckstream/sources/mqtt.py",
+        find="""        for topic in self.topics:
+            client.subscribe(topic, qos=self.qos)""",
+        repl="""        if not getattr(self, "_subscribed_once", False):
+            self._subscribed_once = True
+            for topic in self.topics:
+                client.subscribe(topic, qos=self.qos)""",
+        suite="fast",
+        note="comes back connected, healthy-looking, and receiving nothing",
+    ),
+    dict(
+        name="an undecodable message is buffered as an empty row",
+        file="duckstream/sources/mqtt.py",
+        find="""        if record is None:
+            self.undecodable += 1
+            # Acked anyway: it is not going to decode on redelivery either, and
+            # leaving it unacked makes the broker replay it for ever. The count
+            # above is the record that it happened.
+            self._ack(message)
+            return""",
+        repl="""        if record is None:
+            record = {}
+            self.undecodable += 1""",
+        suite="fast",
+        note=(
+            "Written this way on the second attempt. The first assigned to "
+            "`record` and left the early return in place, so it changed nothing "
+            "and survived while testing nothing -- the third time that has "
+            "happened in this project."
+        ),
     ),
     dict(
         name="a model may recompute windows without declaring a grain",

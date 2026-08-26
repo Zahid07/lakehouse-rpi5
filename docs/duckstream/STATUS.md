@@ -6,7 +6,7 @@ is proven, what is not, and what to do next. It is current as of **2026-08-25**.
 Read in this order:
 
 1. **this file** — where things are
-2. `CONTEXT.md` — measured constraints and settled decisions. **Twenty**
+2. `CONTEXT.md` — measured constraints and settled decisions. **Twenty-two**
    measured constraints; §1.8, §1.9 and §1.10 were measured during the phase-1
    build, §1.11 during phase 2, §1.12 during the phase-2b cleanup, §1.16 during
    phase 4, §1.17–§1.19 during tier three and §1.20 during phase 4's scan work,
@@ -20,9 +20,9 @@ Read in this order:
 4. `BUILD_GRAPH.md` — the decision record: frozen interfaces, every ratified
    decision with its reasoning, and the notes each task left for the next
 
-**Phases 1, 2, 2b and 3 are complete. Phase 4 is under way**: its first item
-(the consumed set as rows) is done, and the landing-tree scan is now 3–9x
-cheaper. Phases 5–6 are not started.
+**Phases 1, 2, 2b, 3 and 5 are complete. Phase 4 is under way**: its first item
+(the consumed set as rows) is done and the landing-tree scan is now 3–9x
+cheaper, but retention and compaction are not. Phase 6 is not started.
 
 **Phase 3 is finished: all three tiers execute.** Tier two is maintained through
 sufficient statistics — `(n, mean, M2)`, not `(sum, sum_sq, count)` — and proved
@@ -50,8 +50,34 @@ what happens when the *data* will not process.
 
 ## Where to start
 
-**Retention at the source — the rest of phase 4.** Nothing is half-built; the
-scan work below is finished and audited.
+**The Raspberry Pi.** Every number in `CONTEXT.md` is a Windows dev box with
+`threads=2` as a Pi proxy, and that proxy is defensible for DuckDB work and
+*not* for the two most recent constraints: §1.20 measured the landing scan as
+**81% Python path manipulation**, and §1.22 measured a Python UDF reaching only
+1.31x on four threads. Both predict the Pi behaves *worse* than this box, which
+is the opposite of the usual caveat and is testable.
+
+Standing the current build up there also closes coverage that cannot be closed
+here at all:
+
+| | this box | Pi (Linux) |
+|---|---|---|
+| suite | 1,258 pass, **3 skip** | 3 skips become **0** |
+| audit | 3 excused as un-auditable | all three become auditable |
+
+The three are a case-fold branch Windows never takes, a directory symlink
+Windows will not create without a privilege, and `paho-mqtt` — which phase 5
+made worth installing.
+
+Practical checks before starting: a `linux_arm64` wheel for `duckdb==1.5.5` on
+the Pi's Python, and `INSTALL ducklake` once while it has network (§1.7). Both
+are day-one problems if they are problems at all.
+
+**Then: retention at the source — the rest of phase 4.** Nothing is half-built:
+the scan work below is finished and audited, and phase 5 shipped whole.
+
+After that, only **phase 6** remains — validation on real hardware, the soak,
+and release discipline. Everything `PLAN.md` names as code is written.
 
 **The scan is already 3–9x cheaper, and that is a constant factor, not the
 fix.** §1.20 profiled `latest_offset()` and found it was never I/O-bound: 81% of
@@ -100,9 +126,9 @@ two unmeasured numbers, and release discipline.
 
 ```bash
 cd d:\lakehouse-rpi5
-.venv\Scripts\python.exe -m pytest -q                        # 1211 passed, 3 skipped, ~6m
-.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 1077 passed, 3 skipped, ~60s
-.venv\Scripts\python.exe -m pytest -q -m conformance         # 133 passed, 1 skipped, ~5m
+.venv\Scripts\python.exe -m pytest -q                        # 1258 passed, 3 skipped, ~6m
+.venv\Scripts\python.exe -m pytest -q -m "not conformance"   # 1120 passed, 3 skipped, ~60s
+.venv\Scripts\python.exe -m pytest -q -m conformance         # 137 passed, 1 skipped, ~5m
 .venv\Scripts\duckstream.exe --help                          # the console script is installed
 ```
 
@@ -328,6 +354,96 @@ There is a pleasant corollary. This is CPU, not I/O, so it transfers to a Pi
 *better* than a DuckDB measurement would: a Pi's cores are slower, so Python
 path manipulation costs it more, while `stat` on local storage is comparable.
 That is the opposite of this project's usual caveat.
+
+## Phase 5: MQTT, as the landing writer it has to be
+
+`CONTEXT.md` section 4 settled this before phase 1 was built and shipping it did
+not change it: **MQTT cannot be a source.** Once a message is acked it is gone
+from the broker, so there is no offset to resume from and nothing to replay.
+`type: mqtt` on a model is still refused — what changed is that the message now
+names the thing that exists.
+
+```
+broker  ->  MqttLandingWriter  ->  landing/  ->  file source  ->  engine
+              at least once                       exactly once
+```
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| At-least-once into durable storage | met | tokens released only after the marker is on disk; 22 unit tests |
+| **Nothing is acked before it is durable** | **met** | the inverse of `paho`'s default *and* of this repo's own `subscriber.py` |
+| Replayable downstream | met | four conformance scenarios through both doors, diffed against a recompute of the landing tree |
+| A crash before the marker is invisible | met | unmarked directory, never read, never mistaken for a short batch |
+| A failed write is a delay, not a loss | met | buffer kept, nothing acked, next flush retries |
+| Duplicates are visible, not hidden | met | a redelivery is counted twice and asserted to be |
+| No MQTT dependency unless you use MQTT | met | `duckstream[mqtt]`, lazily imported; the durability half needs no broker to test |
+
+### The design decision that carries it
+
+**Durability lives in `landing.py`, which has no MQTT in it at all.** Everything
+that makes the guarantee — the write order, the acknowledgement tokens, the
+one-directory-per-flush rule — is in a class that takes dicts. So it is tested on
+every machine with no broker, and the adapter over it is thin enough to read in
+one sitting. A test that needed a broker would run nowhere and prove it nowhere.
+
+### What at-least-once actually costs, stated rather than implied
+
+A redelivery lands the same reading **twice, in two different files**, and
+duckstream does not de-duplicate it. It cannot: the two files genuinely differ
+and nothing marks one as a repeat. So exactly-once is over **files**, not over
+readings — and a model that cares needs a merge key and `mode='update'`, which
+converges to one row per key however many times a reading arrives.
+
+That is asserted in a conformance scenario rather than left in a docstring,
+because "exactly-once means my rows cannot be duplicated" is the reading a user
+will arrive with.
+
+### The audit, and one caveat on it that is about the box, not the code
+
+**59 deliberate defects. 46 of 55 auditable turned the suite red, one had to
+survive and did, three cannot be audited on this machine — and nine came back
+`ERROR` from contention rather than from anything in the code.**
+
+The nine are all on the expensive `conf` and `all` suites; every `fast` one
+finished cleanly. Each was **red** in the audit taken before this machine
+restarted, and nothing touching them changed since — phase 5 added no code to
+`offsets.py`, `state.py`, `recompute.py` or `consumed.py`. Re-running them at
+two workers has so far returned **red for the two that finished**; the remaining
+seven were still running when this was written and should be re-run before the
+next commit:
+
+```bash
+DUCKSTREAM_AUDIT_WORKERS=2 .venv/Scripts/python.exe tools/mutation/run_audit.py <indices>
+```
+
+**That this is worth a paragraph at all is the finding.** A starved suite is
+killed at its budget and reported as `ERROR` — which is precisely how a suite
+that genuinely *hangs* is reported, and that is a real finding this audit exists
+to be able to make; one mutation once put the engine into an infinite loop and
+that is what produced `Engine._require_recorded`. The two outcomes must not be
+confusable. `run_audit.py` now takes `DUCKSTREAM_AUDIT_WORKERS`, and the README
+says an `ERROR` on an expensive suite is contention until proven otherwise.
+
+The three legitimately not audited here are all this platform, not gaps: a
+case-fold branch Windows never takes, a directory symlink Windows will not
+create without a privilege, and a `paho-mqtt` that is deliberately not installed.
+**All three become auditable on the Pi**, along with the three tests that skip
+here — which is the concrete reason to run the suite there.
+
+### Two things the build surfaced that were on no list
+
+**`pa.Table.from_pylist` infers its schema from the first record only.** A field
+that appears later in a batch is *silently dropped* — the write succeeds, the
+file looks fine, the column is not there. A sensor that starts reporting a
+battery level half way through a flush would lose it with nothing to say so. The
+union of keys is now computed before writing. Found by a test, not by review.
+
+**Two of the three phase-5 mutation survivors were weak *tests*, not holes.**
+The ordering test hooked `_write`, but both the rename and the marker happen
+after `_write` returns, so it passed with the order reversed. And the
+time-trigger test used a **single** buffered record, where "oldest" and "newest"
+are the same record — trap 16's shape in a new place. Both now do what their
+names say.
 
 ## Phase 3, tier three: the recompute
 
@@ -870,6 +986,7 @@ still owed.
 | A window whose key stops reporting seals only on someone else's timestamp | `watermark.py` | The watermark is per model, not per key, so a sensor that goes silent leaves its last window open until any later-timestamped row arrives for that model. Standard for event-time engines, but it surprises people, so it is documented in the README's limits. |
 | Two memoised values ride on single-writer | `engine.py` | The batch id (§1.10) and the committed watermark (§1.11). They expire together. |
 | The run lock is advisory | `lock.py` | Safety still comes from DuckDB's catalog file lock. The advisory lock exists to say *what happened* in words. Never promote it to the guarantee without a filesystem story. |
+| **Nothing bounds group cardinality, and memory follows groups** | `recompute.py`, `model.py` | §1.21, and it is a gap rather than a tuning note. A group is `key × window`. Window-range chunking bounds the window half; **nothing bounds the key half**. A model with 4,000 sensors materialises 4,000 lists in every chunk however small that chunk is, and `max_rows_per_trigger` cannot help — a batch of few rows spread across many keys is strictly worse than many rows in one. §1.1's "bound rows in flight" is incomplete as written. Closing it needs chunking by key range as well as by window range, which is a design question rather than a setting. |
 | A tier-three recompute costs a whole window, whatever the batch | `recompute.py` | Inherent, not a defect: a one-row batch landing in a busy hour re-derives that hour. The lever is a finer `grain`, never a smaller batch. Worth saying because the obvious reaction — turn `max_files_per_trigger` down — makes it *worse* by recomputing the same window more often. |
 | A recompute writes a tombstone per window range | `sinks/table.py` | §1.10's ~26 ms `DELETE`, bought deliberately: the range is cleared so a key whose source rows are gone disappears with them. Partitioning sink tables by grain (phase 4) is what would make it cheap. |
 | The index is not rebuilt for a model promoted to tier three | `engine.py` | Bounds are measured only for models that already recompute, so files consumed while a model was tier one carry the sentinel range and are read by every recompute. Correct, and slower than it needs to be. A backfill would be a maintenance task, not a fix. |
@@ -926,22 +1043,20 @@ the standing of intuition and this project's first rule applies to it.
 
 ## Still unmeasured
 
-Two are from `PLAN.md`'s performance list, one from its phase 6, and one from
-`CONTEXT.md` §6 — which is worth stating because an earlier version of this
-section attributed all four to §6, and a session that went looking for them
-there found something else entirely:
+**Both of `PLAN.md`'s performance items are now measured** (§1.21, §1.22), and
+are struck through below rather than deleted because what each *found* is not
+what its question assumed. Two remain — one from `PLAN.md`'s phase 6, one from
+`CONTEXT.md` §6 — and the attribution is worth stating, because an earlier
+version of this section put all four under §6 and a session that went looking
+for them there found something else entirely:
 
-- **memory ratio per tier** (`PLAN.md`) — bisect `memory_limit` against
-  `max_rows_per_trigger` and publish the ratio so users can size the knob.
-  **Partially measured while building tier three, and deliberately not promoted
-  to a constraint**: the same `LIST`-based recompute over 2.4 M rows needs
-  128 MB in one execution and fits in 64 MB at 400,000 rows a chunk, which
-  confirms §1.1's *direction* — the ceiling moves with rows in flight, not with
-  window count — but 64 MB is the floor of the bisection grid, so the low end is
-  clamped and the ratio is not established. Publishing a number from that would
-  be exactly the derived-figure mistake §1.15 made
-- **UDF parallelism penalty** (`PLAN.md`) — quantify the single-thread cost
-  (§2.1) so the docs can say when to split across processes
+- ~~**memory ratio per tier**~~ (`PLAN.md`) — **measured, §1.21**, and the answer
+  is not the one the question assumed: memory follows **groups**, not rows. Same
+  1.92 M rows, 64 MB at one group and **over 2 GB at 4,000**. It closed the item
+  and opened a bigger one — see "Known open items"
+- ~~**UDF parallelism penalty**~~ (`PLAN.md`) — **measured, §1.22**: native SQL
+  scales 3.18x on four threads, the same query with a Python UDF reaches 1.31x,
+  about two thirds serial, and costs 4.2x native at four threads
 - **accumulator size under a real workload** (`PLAN.md` phase 6, and §1.3's own
   caveat) — sealing bounds it by the horizon, but §1.3 only measured a state
   table to 6,000 rows
@@ -1183,6 +1298,25 @@ And two that phase 4's scan work added:
     what is left and writes a window built from part of its data. `PLAN.md`
     phase 4 states it in full.
 
+And two that phase 5 added:
+
+30. **Never acknowledge a message before its marker is on disk.** `paho` acks a
+    QoS-1 message on arrival by default, and this repository's own
+    `subscriber.py` relies on that — which is at-*most*-once for anything still
+    buffered: the broker is told it was handled, the process dies, and it is
+    gone with nothing to report it. `LandingWriter.flush` returns the
+    acknowledgement tokens and returns them **only after** the marker exists.
+    Anything that acks earlier has chosen at-most-once and should say so out
+    loud.
+
+31. **Exactly-once is over files, not over readings.** At-least-once means the
+    broker re-delivers whatever was never acked, so the same reading can land in
+    two files. duckstream does not de-duplicate that and cannot — the two files
+    genuinely differ and nothing marks one as a repeat. A model that cares needs
+    a merge key and `mode='update'`. Do not "fix" this by de-duplicating in the
+    source: it would need a message identity the broker does not provide, and
+    guessing one silently drops real readings.
+
 One phase-1 invariant that phase 2 **deliberately breaks**, so do not restore it:
 **"chunked equals unchunked" no longer holds once a horizon exists.** The
 watermark is a function of what has been observed, so a batch boundary between
@@ -1212,14 +1346,16 @@ anything.
 | `lake.py` | attach, settings, inlining enforcement, snapshot introspection |
 | `offsets.py` | offset encoding, and both file-offset shapes — v2 counts, v1 carried a map |
 | `consumed.py` | the consumed-file set as rows: the table, the anti-join, the two index shapes, and the file → time-range index |
+| `landing.py` | the landing writer: buffer, atomic write, marker last, tokens released only when durable |
 | `sources/files.py` | directory tailing with completion markers |
+| `sources/mqtt.py` | the MQTT adapter over `landing.py`. `paho-mqtt` is optional and lazily imported |
 | `sinks/table.py` | append, update-by-merge, and sealed windowed append |
 | `sql.py` | identifier and literal quoting |
 | `config.py` | YAML deserialiser, `${VAR}` substitution — parsing isolated here |
 | `registry.py` | built-in names plus dotted-path resolution |
 | `cli.py` | `run`, `validate`, `status`, `models` |
 
-Not yet written, and named in `PLAN.md`: `sources/mqtt.py` (phase 5).
+Everything `PLAN.md` names is now written.
 
 ## How tier three was built
 

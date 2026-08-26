@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -30,7 +31,16 @@ PYTHON = REPO / ".venv" / "Scripts" / "python.exe"
 # checkout" hazard this design exists to remove -- one `git add -A` away from
 # committing a tree full of mutated copies of the package.
 WORKTREES = pathlib.Path(tempfile.gettempdir()) / "duckstream-mutation-worktrees"
-WORKERS = 4
+
+# Four suites at once is right on an idle box and wrong on a busy one, and the
+# failure mode is not "slower" -- it is a mutation reported as ERROR because its
+# suite was starved past the timeout. That reads exactly like a suite that hangs,
+# which is a real finding this audit is supposed to be able to report, so the two
+# must not be confusable. Nine mutations came back ERROR on a loaded box here and
+# every one of them was red when re-run alone.
+#
+# Turn it down when anything else is running:  DUCKSTREAM_AUDIT_WORKERS=2
+WORKERS = max(1, int(os.environ.get("DUCKSTREAM_AUDIT_WORKERS", "4")))
 
 sys.path.insert(0, str(HERE))
 from mutations import MUTATIONS  # noqa: E402

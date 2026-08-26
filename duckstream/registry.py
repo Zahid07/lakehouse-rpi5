@@ -463,12 +463,19 @@ SOURCES.register("file", "duckstream.sources.files:FileSource")
 SOURCES.register(
     "mqtt",
     _Pending(
-        "not implemented until phase 5",
-        "the 'mqtt' source is reserved but not implemented until phase 5. MQTT "
-        "cannot be a source in the exactly-once sense at all: once a message is "
-        "acked it is gone, so there is no offset to replay from. It is modelled "
-        "as a landing writer that writes durably to disk, and a 'file' source "
-        "then reads that landing directory replayably.",
+        "not a source, and never will be",
+        "the 'mqtt' source does not exist and is not coming. MQTT cannot be a "
+        "source in the exactly-once sense at all: once a message is acked it is "
+        "gone from the broker, so there is no offset to resume from and nothing "
+        "to replay. It is built instead as a landing writer -- "
+        "duckstream.sources.mqtt.MqttLandingWriter -- which subscribes and "
+        "writes durably to disk, acknowledging each message only once it is on "
+        "disk. Point a 'file' source at the same directory and that source is "
+        "replayable, so exactly-once holds from there: "
+        "broker -> MqttLandingWriter -> landing/ -> file source -> engine. "
+        "So run the landing writer as a daemon, and declare "
+        "source: {type: file, path: 'landing/', marker: _READY} on the model. "
+        "It needs `pip install duckstream[mqtt]`.",
     ),
 )
 SINKS.register("table", "duckstream.sinks.table:TableSink")

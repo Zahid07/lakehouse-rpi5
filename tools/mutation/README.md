@@ -108,9 +108,28 @@ print(len(MUTATIONS), 'mutations')"
 
 ## Concurrency
 
-Four workers by default. The suites set `threads=2` to approximate a Pi and
-DuckLake commits are disk-bound, so oversubscribing turns a wall-clock win into
-contention — and into timing-sensitive tests failing for reasons that have
-nothing to do with the mutation. **Do not run anything else heavy alongside it**:
-one conformance run started during an audit had a CLI subprocess starved past
-its 300-second timeout and failed for no reason at all.
+Four workers by default, and **turn it down when the box is busy**:
+
+```bash
+DUCKSTREAM_AUDIT_WORKERS=2 .venv/Scripts/python.exe tools/mutation/run_audit.py
+```
+
+The suites set `threads=2` to approximate a Pi and DuckLake commits are
+disk-bound, so oversubscribing turns a wall-clock win into contention — and into
+timing-sensitive tests failing for reasons that have nothing to do with the
+mutation. **Do not run anything else heavy alongside it**: one conformance run
+started during an audit had a CLI subprocess starved past its 300-second timeout
+and failed for no reason at all.
+
+**And the failure mode is worse than slow, which is why the knob exists.** A
+starved suite is killed at its budget and reported as `ERROR` — which is exactly
+how a suite that genuinely *hangs* is reported, and that is a real finding this
+audit is meant to be able to make (one mutation once put the engine into an
+infinite loop, and that is what produced `Engine._require_recorded`). The two
+must not be confusable. On a loaded box here, **nine** mutations came back
+`ERROR` and every one of them was red when re-run at two workers; all nine were
+on the `conf` and `all` suites, while every `fast` one finished cleanly.
+
+So: an `ERROR` on an expensive suite is contention until proven otherwise.
+Re-run those indices alone before recording anything about them —
+`run_audit.py` takes indices, so it is cheap to do.
