@@ -400,21 +400,16 @@ will arrive with.
 
 ### The audit, and one caveat on it that is about the box, not the code
 
-**59 deliberate defects. 46 of 55 auditable turned the suite red, one had to
-survive and did, three cannot be audited on this machine — and nine came back
-`ERROR` from contention rather than from anything in the code.**
+**59 deliberate defects. All 55 auditable on this platform land where they
+should: 54 turn the suite red, and one had to survive and did.** Three cannot be
+audited here at all, and all three become auditable on Linux.
 
-The nine are all on the expensive `conf` and `all` suites; every `fast` one
-finished cleanly. Each was **red** in the audit taken before this machine
-restarted, and nothing touching them changed since — phase 5 added no code to
-`offsets.py`, `state.py`, `recompute.py` or `consumed.py`. Re-running them at
-two workers has so far returned **red for the two that finished**; the remaining
-seven were still running when this was written and should be re-run before the
-next commit:
-
-```bash
-DUCKSTREAM_AUDIT_WORKERS=2 .venv/Scripts/python.exe tools/mutation/run_audit.py <indices>
-```
+Getting that number took two passes, and the reason is worth keeping. The first
+full run returned **nine `ERROR`s** — every one on the expensive `conf` and
+`all` suites, while every `fast` one finished cleanly. Re-run at two workers,
+**all nine came back exactly as before: eight red and the one `held`.** There
+was nothing behind them. They were suites starved past their timeout on a
+loaded box.
 
 **That this is worth a paragraph at all is the finding.** A starved suite is
 killed at its budget and reported as `ERROR` — which is precisely how a suite
