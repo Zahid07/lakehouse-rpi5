@@ -272,6 +272,112 @@ def test_the_missing_dependency_names_itself(tmp_path, monkeypatch):
     assert "duckstream[mqtt]" in message
 
 
+class RecordingClient:
+    """A stand-in for `paho.mqtt.client.Client` that records its configuration.
+
+    The rest of this module hands `MqttLandingWriter` a `FakeClient` by
+    assigning `_client` directly, which never runs `connect()` -- so nothing
+    exercised the code that configures the real client. This one is installed
+    *through* the import, so `connect()` runs for real against it.
+    """
+
+    def __init__(self, client_id=""):
+        self.client_id = client_id
+        self.events: list[str] = []
+        self.manual_ack = False
+        self.on_connect = None
+        self.on_message = None
+        self.credentials = None
+        self.connected_to = None
+
+    def __setattr__(self, name, value):
+        if name == "manual_ack" and getattr(self, "events", None) is not None:
+            self.events.append(f"manual_ack={value}")
+        object.__setattr__(self, name, value)
+
+    def username_pw_set(self, username, password=None):
+        self.credentials = (username, password)
+
+    def connect(self, host, port, keepalive):
+        self.events.append("connect")
+        self.connected_to = (host, port, keepalive)
+
+
+def _install_fake_paho(monkeypatch, client_class):
+    """Make `import paho.mqtt.client` yield a module exposing `client_class`.
+
+    Injected into `sys.modules` rather than by intercepting `__import__`, for
+    two reasons: it goes through the real import machinery, and it works
+    identically whether or not `paho-mqtt` is actually installed -- which is
+    the property phase 5 ratified for this module, so the guarantee is tested
+    on every machine rather than only where a broker's client library is.
+    """
+    import sys
+    import types
+
+    paho = types.ModuleType("paho")
+    mqtt = types.ModuleType("paho.mqtt")
+    client_module = types.ModuleType("paho.mqtt.client")
+    client_module.Client = client_class
+    mqtt.client = client_module
+    paho.mqtt = mqtt
+
+    monkeypatch.setitem(sys.modules, "paho", paho)
+    monkeypatch.setitem(sys.modules, "paho.mqtt", mqtt)
+    monkeypatch.setitem(sys.modules, "paho.mqtt.client", client_module)
+
+
+def test_connect_puts_the_client_into_manual_acknowledgement_mode(
+    tmp_path, monkeypatch
+):
+    """Trap 30, at the only place it can actually be enforced.
+
+    `paho` acknowledges a QoS-1 message the moment it arrives unless
+    `manual_ack` is set, and that is at-*most*-once for anything still in the
+    buffer: the broker is told the message was handled, the process dies, and
+    it is gone with nothing to report it. Every other acknowledgement test in
+    this module drives `_on_message` against a client that was never
+    configured, so all of them pass whether this line is here or not -- the
+    assertions hook below the layer the defect lives in, which is exactly how
+    two phase-5 mutations survived a suite that looked thorough.
+
+    Setting it must also happen **before** `connect`, because a connected
+    client can be handed a message immediately, and one auto-acked message is
+    the whole guarantee gone.
+    """
+    _install_fake_paho(monkeypatch, RecordingClient)
+    writer = MqttLandingWriter(tmp_path / "landing", "sensors/#", flush_rows=1)
+
+    client = writer.connect()
+
+    assert client.manual_ack is True, (
+        "paho acks a QoS-1 message on arrival unless manual_ack is set, which "
+        "is at-most-once for the buffer -- see CONTEXT.md section 4 and trap 30"
+    )
+    assert client.events.index("manual_ack=True") < client.events.index(
+        "connect"
+    ), "manual_ack must be set before connecting, or the first message can be auto-acked"
+    assert writer._client is client
+    assert client.on_message == writer._on_message
+    assert client.on_connect == writer._on_connect
+    assert client.connected_to == (writer.host, writer.port, writer.keepalive)
+
+
+def test_connect_sets_credentials_only_when_a_username_is_given(
+    tmp_path, monkeypatch
+):
+    """An anonymous broker must not be handed `username_pw_set(None, None)`."""
+    _install_fake_paho(monkeypatch, RecordingClient)
+
+    anonymous = MqttLandingWriter(tmp_path / "a", "s/#", flush_rows=1)
+    assert anonymous.connect().credentials is None
+
+    authenticated = MqttLandingWriter(
+        tmp_path / "b", "s/#", flush_rows=1, username="u", password="p"
+    )
+    assert authenticated.connect().credentials == ("u", "p")
+
+
 # ==========================================================================
 # The time trigger
 # ==========================================================================

@@ -886,40 +886,28 @@ factor in front of it. Quoting a projected per-trigger figure for a year is
 exactly what the withdrawn version got wrong; measure it on the target, in
 phase 6's soak, or not at all.
 
----|---|---|---|
-| 100 | 100 | 15.4 ms | 154 µs |
-| 1,000 | 1,000 | 139.6 ms | 140 µs |
-| 5,000 | 5,000 | 2,455.9 ms | 491 µs |
-| 20,000 | 20,000 | 8,581.0 ms | 429 µs |
-| 50,000 | 50,000 | **23,460 ms** | 469 µs |
+> **A block of withdrawn numbers stood here until the Pi run of 2026-08-26.**
+> It was the first draft of 1.20 — a headerless table fragment, a per-file
+> constant of "~0.15–0.5 ms per ready file", and a conclusion of "**minutes per
+> trigger**" at a year of files. 1.20 above says in terms that those figures
+> were withdrawn, so the document was contradicting itself, and the withdrawn
+> half was the half that read like a measurement. It has been deleted rather
+> than annotated, because a plausible wrong number inside the measured-constraints
+> section is the exact failure this framework exists to remove — and this one
+> sat under a heading telling the reader to trust it over their intuition.
+>
+> It is also now measurably wrong. 1.20's Pi re-measurement (below) puts the
+> shipped scan at **4.7–25 µs per file** on the target hardware — that is
+> 0.005–0.025 ms, **10x to 100x smaller** than the constant that was here.
 
-Same 2,000 files, three shapes: **322 ms** at one file per directory, **251 ms**
-at ten, **353 ms** at a hundred. And doubling the directories doubles the time
-(1.96x, 2.02x, 2.52x).
-
-**Conclusion.** The walk is **linear in files and near-indifferent to tree
-shape** — it is the per-file `stat` that costs, not the directory traversal. The
-constant is **~0.15–0.5 ms per ready file**, which is **1.4x to 5x** what
-`PLAN.md` assumed when it carried 1.13's ~0.1 ms across to this walk. 1.13
-measured *DuckDB opening a parquet footer*; this is `os.walk` plus a `stat` plus
-a glob match, and the two constants are not the same number. Carrying one across
-to the other is the derived-figure mistake 1.15 made, in a new place.
-
-**Consequence, and it is worse than phase 4 was scoped for.** At one file a
-minute for a year — 525,600 ready files — this is **minutes per trigger**, and
-it is paid on *every* trigger including idle ones, because the scan is how the
-source learns there is nothing to do. It dwarfs every other number in this
-document: 1.16 took the commit from 1,078 ms to 13.8 ms, and this would sit at
-four minutes in front of it.
-
-**It is also not fixed by retention alone.** The cost is per *ready* file, and
-every already-consumed file is re-`stat`ed on every trigger purely so the
-anti-join can discard it. Retention bounds the tree; making the scan skip what
-it has already consumed would bound the *work*, and the two are different
-levers. Note that 1.15's forbidden shortcut is specifically a high-water **mtime
-mark**, because a file may arrive with an older mtime — a directory-level rule
-gated on the completion marker is a different proposition and has not been
-measured or ruled out.
+**What survives from it, because it is reasoning rather than arithmetic.** The
+cost is per *ready* file, and every already-consumed file is re-`stat`ed on
+every trigger purely so the anti-join can discard it. Retention bounds the tree;
+making the scan skip what it has already consumed would bound the *work*, and
+the two are different levers. Note that 1.15's forbidden shortcut is
+specifically a high-water **mtime mark**, because a file may arrive with an
+older mtime — a directory-level rule gated on the completion marker is a
+different proposition and has not been measured or ruled out.
 
 ### 1.21 Memory follows **groups**, not rows — and no knob bounds groups
 
@@ -997,6 +985,184 @@ lever is **processes, not threads**: run independent models in separate
 processes, each with its own catalog connection. And it is a direct argument for
 keeping tier three off the hot path wherever a foldable tier will do — the
 4.2x is on top of the recompute's own re-reading of the window (1.19).
+
+### 1.23 On the actual Pi 5: 1.20 and 1.22 confirmed, 1.19 inverted, 1.21 narrowed
+
+**Method.** Everything in section 1 above was measured on a Windows dev box with
+`threads=2` standing in for a Pi. This section is the same measurements taken on
+the device: **Raspberry Pi 5 Model B, aarch64, 4 cores, 4 GB RAM**, Linux
+6.12.75, Python 3.13.5, `duckdb==1.5.5`, ducklake `d8a1881e` — the *same*
+extension build, so what differs is the machine.
+
+**Storage first, because it nearly invalidated everything.** `/` is
+`/dev/mmcblk0p2`, ext4 on an **SD card**; `/tmp` is **tmpfs**, i.e. RAM; swap is
+`zram`, i.e. compressed RAM. A filesystem benchmark run in `/tmp` measures RAM
+and would have been published as storage. Everything below that touches the
+filesystem was run on the SD card. Page caches were warm, which is
+representative of a tree scanned every trigger and is **not** a cold-boot
+figure.
+
+#### 1.20 — confirmed, and by better evidence than the dev box could produce
+
+The dev box *inferred* "not I/O-bound" from a profile. On the Pi the storage
+medium itself can be varied, which tests the claim directly. Shipped `_scan`:
+
+| Shape | SD card | tmpfs (RAM) | RAM buys |
+|---|---|---|---|
+| 2,000 files, 100/dir | 9.4 ms | 8.1 ms | 1.16x |
+| 2,000 files, 1/dir | 49.8 ms | 41.9 ms | 1.19x |
+| 5,000 files, 50/dir | 24.9 ms | 22.0 ms | 1.13x |
+
+**Replacing the disk entirely with RAM buys 13–19%.** The scan is CPU-bound.
+
+Per-file, SD card, interleaved, nine reps, the two implementations asserted
+equal before either was timed:
+
+| Shape | bare `stat` | pre-1.20 scan | shipped scan | speedup | old overhead |
+|---|---|---|---|---|---|
+| 2,000 / 100 per dir | 3.55 µs | 30.41 µs | 4.68 µs | 6.49x | 88.2% |
+| 2,000 / 1 per dir | 9.20 µs | 63.09 µs | 24.88 µs | 2.54x | 70.8% |
+| 5,000 / 50 per dir | 3.70 µs | 30.63 µs | 4.97 µs | 6.16x | 87.7% |
+
+**The prediction that the Pi is worse is half right.** The overhead *fraction*
+is higher here (88.2% against 81%) — Python path manipulation does cost this
+machine relatively more, as predicted. But `stat` is **cheaper** here, not
+comparable: 3.55 µs against 4.7 µs. So the Pi is more CPU-dominated *and*
+faster at the syscall, and the shipped scan costs **4.7–25 µs per file**.
+
+**And the next constant is `pathlib`, which is 1.20's own finding one layer
+down.** Profiling the *shipped* scan at one file per directory — a ratio within
+one run, so drift cannot flatter it — `pathlib._parse_path`, `__str__`, `drive`
+and `__init__` together are **~19% of the whole scan**, with 60,005
+`sys.intern` calls for 10,000 files. The source is `Path(entry.path)` per
+directory in `FileSource._walk`. 1.20 removed `normcase`/`relpath` per *file*
+and left a `Path()` per *directory*, which at duckstream's real shape is the
+same thing. A constant factor again; retention is still the structural fix.
+
+#### 1.22 — confirmed, and the penalty is ~1.8x worse than predicted
+
+1,920,000 rows in 480 groups; native and UDF assert-agree to ~4e-16 before
+timing; interleaved. **Best-of-25**, because median-of-5 and median-of-15
+disagreed between runs by a third — these queries are tens of milliseconds,
+short enough that scheduler noise swamps the effect even interleaved, which is
+1.20's withdrawn draft happening again. Noise only *adds* time to CPU-bound
+work, so the minimum is the least contaminated estimate, and 1.2 uses best-of
+for the same reason. Three runs, reproducible to ~1% native / ~5% UDF:
+
+| Threads | Native | Speedup | Arrow UDF | Speedup | UDF/native |
+|---|---|---|---|---|---|
+| 1 | 13.6–13.9 ms | 1.00x | 63.2–63.8 ms | 1.00x | 4.6x |
+| 2 | 7.7–7.8 ms | 1.77x | 42.3–45.8 ms | 1.4x | 5.5–5.9x |
+| 4 | **5.5–5.6 ms** | **2.49x** | **40.7–41.9 ms** | **1.54x** | **7.4–7.5x** |
+
+| | dev box (`threads=2`) | Pi 5 (four real cores) |
+|---|---|---|
+| native 4-thread speedup | 3.18x | 2.49x |
+| UDF 4-thread speedup | 1.31x | 1.54x |
+| UDF serial fraction (Amdahl) | ~67% | ~53% |
+| **UDF cost against native, 4 threads** | **4.2x** | **7.5x** |
+
+Two things, and they point opposite ways. The UDF is slightly **less** serial
+here and scales marginally better — so "four cores is where it bites" is wrong
+in the *scaling* sense. What bites is the **penalty**: 7.5x native rather than
+4.2x, because native SQL is proportionally much faster on this machine than
+anything routed through CPython. 1.22's advice — processes not threads, keep
+tier three off the hot path — is roughly **twice as load-bearing** as written.
+
+#### 1.19 — the intercept is worse, the slope is better, and the advice shifts
+
+Recompute step in isolation, DuckLake catalog **on the SD card**, 200 rows/file,
+interleaved, nine reps, three runs:
+
+| | intercept | slope |
+|---|---|---|
+| threads=4, run A | 28.8 ms | 0.081 ms/file |
+| threads=4, run B | 26.0 ms | 0.074 ms/file |
+| threads=2 | 25.1 ms | 0.111 ms/file |
+| **dev box (threads=2)** | **17.5 ms** | **0.14 ms/file** |
+
+So **~25–29 ms of intercept** (±10%) and **~0.07–0.11 ms per file** (quoted as a
+range because it moves ±50%). The intercept is ~1.5x worse — that is 1.8's
+commit floor paid to an SD card rather than an SSD — and the slope is at or
+below the dev box, so per-file reading is not this machine's problem.
+
+**This partially inverts 1.19's own advice.** On the dev box, intercept and
+slope were roughly balanced over a 100-file window (17.5 ms against 14 ms). Here
+the intercept dominates about **3:1** (26 ms against 8 ms). 1.19 says "the lever
+is a finer `grain`" — but a finer grain means more windows touched per batch,
+each paying the intercept. Retention and compaction (fewer files per window)
+remain unambiguously right; **finer grain is now the weaker lever, not the
+stronger one.**
+
+#### 1.21 — the shape holds; the magnitude is not comparable and must not be quoted
+
+1,920,000 rows held fixed, read from **parquet** so the buffer manager holds the
+aggregate rather than the input, spilling disabled (see 1.24 — without that
+there is no ceiling to find at all), smallest rung at which one execution
+completes:
+
+| Groups | `additive` | `non_foldable` (LIST + Arrow UDF) |
+|---|---|---|
+| 1 | 16 MB | 128 MB |
+| 40 | 24 MB | 96 MB |
+| 400 | 24 MB | 192 MB |
+| 4,000 | 24 MB | **512 MB** |
+
+**Confirmed:** the additive tier is flat whatever the key cardinality; the
+`LIST` tier grows with groups at a fixed row count. Groups drive it, not rows.
+
+Two caveats, and the second is the important one.
+
+*The 1-group cell is not the minimum* — 128 MB at one group against 96 MB at
+forty. That is physical, not noise: one group is a single `LIST` of 1.92 M
+elements. The real cost is the materialised list structure, roughly
+`max(one enormous list, many small ones)`, with a minimum in between. 1.21's
+"rows are close to free" holds across the top of the range and not at the bottom
+— which also reconciles it with this repository's own FFT mart, whose comment
+says peak memory there is *O(rows), not O(groups)*. Both are describing the same
+structure from opposite ends.
+
+*The magnitude is not comparable with 1.21 and 512 MB must not be quoted against
+its ">2048 MB".* 1.21 bisected **through the engine**; this bisects the bare
+query, which is 1.1's method. The engine materialises per-group state the bare
+query does not, so these are a **lower bound** on what a model needs. Re-running
+1.21's engine bisect on this box is still owed. What can be said: a 4,000-key
+tier-three model is *feasible* on a 4 GB Pi rather than impossible, the headroom
+is not generous, and nothing in duckstream bounds key cardinality.
+
+### 1.24 DuckDB spills to the SD card by default, and duckstream never says otherwise
+
+**Method.** Found while measuring 1.21: a first bisect reported 4,000 groups
+completing in 512 MB and finishing implausibly fast. It was not measuring a
+memory ceiling at all.
+
+```
+temp_directory           .tmp                        <- relative to the CWD
+max_temp_directory_size  90% of available disk space
+```
+
+`grep -rn "temp_directory" duckstream/` returns **nothing**. `apply_settings`
+applies only what the caller passes, and `PLAN.md`'s own YAML example sets
+`memory_limit` and `threads` but not this. So on a Pi:
+
+- a model that exceeds `memory_limit` **does not fail** — it spills and
+  completes slowly, so the bound `max_rows_per_trigger` exists to enforce stops
+  being enforced, and 1.1's conclusion quietly stops holding;
+- the spill lands on the **SD card**, up to 90% of the disk — the write
+  endurance 1.15 and 1.16 spent a phase reclaiming;
+- it goes to the **process's CWD**, which under cron is wherever the job
+  happened to `cd`. During this session it silently created
+  `lakehouse-rpi5/.tmp/` inside the repository, invisible to `git status`
+  because `.gitignore` carries `*.tmp`.
+
+`SET temp_directory=''` restores the refusal — verified: DuckDB then raises
+`OutOfMemoryException` naming the limit.
+
+**Consequence.** Whether duckstream should disable spilling, set an explicit
+path off the boot medium, or merely document it is a design decision for
+whoever owns phase-4 maintenance. What is not open is that it should be a
+*decision*: today it is a default nobody chose, and its failure mode is a
+pipeline that gets mysteriously slow rather than one that says what is wrong.
 
 ---
 
@@ -1301,8 +1467,15 @@ Do not treat these as known.
 - **Change-feed cost** on a large table. No published guidance.
 - **Whether the change feed survives `expire_snapshots`** in practice, beyond the
   documented statement that expired history is unavailable.
-- **`PRAGMA platform;` on the target Pi 5.** Must print `linux_arm64` for prebuilt
-  community extensions to be an option at all. Affects only future extension work.
+- ~~**`PRAGMA platform;` on the target Pi 5.**~~ **Verified 2026-08-26 on the
+  actual Raspberry Pi 5: `linux_arm64`**, exactly as 2.6 predicted. Prebuilt
+  community extensions are an option on this device. Also confirmed on the same
+  run: `duckdb==1.5.5` ships a real `cp313` aarch64 wheel
+  (`manylinux_2_26_aarch64.manylinux_2_28_aarch64`) so there is no source build,
+  and `INSTALL ducklake` fetches build **`d8a1881e`** — byte-identical to the
+  one every measurement in section 1 was taken against, which is what makes the
+  Pi/dev-box comparisons below attributable to the machine rather than the
+  extension.
 - **Whether community-extensions CI accepts a C-API extension today.** The C
   template is marked experimental with community support "coming soon".
 - **DuckDB v2.0's final scope.** Announced, unreleased, and the announcement says
