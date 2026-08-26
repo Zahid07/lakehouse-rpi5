@@ -1,4 +1,4 @@
-"""Deliberate defects for phases 3, 4 and 5.
+"""Deliberate defects for phases 3, 4, 5 and 6.
 
 Each entry is a plausible wrong decision somebody could actually make, not a
 syntax error. `find` must appear exactly once in `file`; it is replaced by
@@ -21,10 +21,19 @@ with a sentence saying why. There are two: widening the tier-three file index
 landing scan's sort order (planning re-sorts, so scan order is not
 load-bearing).
 
-`skip="..."` excuses a mutation that is *live* here but whose fixture cannot be
-built on this machine -- a directory symlink, or an installed `paho-mqtt`. That
-is different from `inert_on`, which is for a mutation this OS makes a no-op.
-Both are excluded from the denominator and listed by name; see the README.
+`requires="<capability>"` excuses a mutation that is *live* here but whose
+fixture cannot be built on this machine -- currently only `dirsymlink`. The
+capability is **probed at audit time**, the same way the matching test probes
+it, so the same declaration excuses the mutation where it cannot run and audits
+it where it can. That is different from `inert_on`, which is for a mutation this
+OS makes a textual no-op. Both are excluded from the denominator and listed by
+name; see the README.
+
+This used to be an unconditional `skip="..."` string, and the word doing the
+work in its reason -- "this platform will not create a directory symlink" --
+was *here*, which the implementation never checked. Two mutations were
+therefore excused on every platform for ever. When the probe was added and they
+ran for the first time, one of them survived and exposed a real hole.
 """
 
 MUTATIONS = [
@@ -705,5 +714,143 @@ MUTATIONS = [
         repl="""        if False:
             missing.append("grain")""",
         suite="fast",
+    ),
+    # ---- ProcessingTime, the daemon loop (phase 6) ------------------------
+    dict(
+        name="a cycle's engine is closed only when the drain succeeded",
+        file="duckstream/daemon.py",
+        find="""        finally:
+            if engine is not None:
+                try:
+                    engine.close()      # releases the catalog -- the point
+                except Exception:       # noqa: BLE001
+                    pass""",
+        repl="""            if engine is not None:
+                engine.close()""",
+        suite="fast",
+        note=(
+            "The whole justification for the daemon. CONTEXT.md 1.25 measured "
+            "that a second process cannot ATTACH the catalog even READ_ONLY "
+            "while one holds it, so a cycle that raises and leaks its engine "
+            "locks the catalog for ever -- and the *next* cycle then cannot "
+            "attach either, so one transient fault becomes permanent."
+        ),
+    ),
+    dict(
+        name="the engine is built once and reused for every cycle",
+        file="duckstream/daemon.py",
+        find="""                started = now()
+                cycle = self._one_cycle(
+                    factory, drain, report.cycles + 1, started, now
+                )""",
+        repl="""                started = now()
+                if not hasattr(self, "_cached_engine"):
+                    object.__setattr__(self, "_cached_engine", factory())
+                cycle = self._one_cycle(
+                    lambda: self._cached_engine, drain,
+                    report.cycles + 1, started, now
+                )""",
+        suite="fast",
+        note=(
+            "Reads like an optimisation -- skip the ~11 ms re-attach -- and it "
+            "holds the catalog for the daemon's whole life, which is exactly "
+            "the objection trigger.py used to raise against building this. It "
+            "also keeps the memoised batch id and watermark (1.10, 1.11) "
+            "across a window in which another writer could have committed."
+        ),
+    ),
+    dict(
+        name="a consecutive-error run is never reset by a success",
+        file="duckstream/daemon.py",
+        find="""                else:
+                    consecutive = 0""",
+        repl="""                else:
+                    pass""",
+        suite="fast",
+        note=(
+            "Turns a budget for *consecutive* faults into a budget for total "
+            "faults, so a daemon that fails intermittently and recovers every "
+            "single time still gives up -- the opposite of what it is for."
+        ),
+    ),
+    dict(
+        name="any cycle error stops the daemon, whatever the policy says",
+        file="duckstream/daemon.py",
+        find="""                if cycle.error is not None and self.stop_on_error:""",
+        repl="""                if cycle.error is not None:""",
+        suite="fast",
+        note=(
+            "A daemon that dies on the first transient fault -- a full disk, a "
+            "broker blip, a catalog briefly held elsewhere -- is not running "
+            "unattended, which is the only reason to have one."
+        ),
+    ),
+    dict(
+        name="the interval is measured from the end of a cycle, not its start",
+        file="duckstream/daemon.py",
+        find="""                remaining = self.seconds - (now() - started)""",
+        repl="""                remaining = self.seconds""",
+        suite="fast",
+        note=(
+            "Drift: every cycle's own duration is added to the gap, so a "
+            "2-second schedule on a 260 ms cycle actually fires every 2.26 s "
+            "and an overrun is never detected at all."
+        ),
+    ),
+    dict(
+        name="a bounded run idles out one more interval before exiting",
+        file="duckstream/daemon.py",
+        find="""                if self.max_cycles is not None and report.cycles >= self.max_cycles:
+                    report.stopped_by = "max_cycles"
+                    break
+
+                if remaining > 0:""",
+        repl="""                if remaining > 0:""",
+        suite="fast",
+        note=(
+            "This was a real defect, found by running it: the loop checked "
+            "max_cycles only at the top, so `--max-cycles 1` slept a whole "
+            "interval after its only cycle before returning."
+        ),
+    ),
+    dict(
+        name="a KeyboardInterrupt is swallowed and retried as a cycle error",
+        file="duckstream/daemon.py",
+        find="""            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise""",
+        repl="""            if False:
+                raise""",
+        suite="fast",
+        note=(
+            "Ctrl-C would be logged as one more failed cycle and the loop "
+            "would carry on a second later, which is indistinguishable from "
+            "the daemon ignoring you."
+        ),
+    ),
+    dict(
+        name="signal handlers are left installed after the loop returns",
+        file="duckstream/daemon.py",
+        find="""        finally:
+            flag.restore()""",
+        repl="""        finally:
+            pass""",
+        suite="fast",
+        note=(
+            "A daemon embedded in a larger process would leave its SIGINT "
+            "handler behind, so the host's own shutdown stops working after "
+            "the daemon returns."
+        ),
+    ),
+    dict(
+        name="a zero or negative interval is accepted, spinning the loop",
+        file="duckstream/daemon.py",
+        find="""    if seconds <= 0:""",
+        repl="""    if False:""",
+        suite="fast",
+        note=(
+            "Zero never sleeps, so the catalog is re-attached continuously and "
+            "never released -- the single behaviour this design exists to "
+            "prevent, arriving through a knob rather than through the loop."
+        ),
     ),
 ]

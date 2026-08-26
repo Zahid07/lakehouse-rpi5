@@ -855,6 +855,80 @@ exactly-once sense and no amount of implementation changes that.
 
 ---
 
+---
+
+## Phase 6, `ProcessingTime` — the daemon, ratified
+
+**It is a schedule, not a trigger, and that is the load-bearing decision.**
+`trigger.py`'s own docstring is the argument: a trigger answers *"after a batch
+committed, is there another right now?"* and is consulted **only after a
+non-empty batch**, because an empty batch always ends the run. A fixed interval
+asks the opposite question — *"the source is empty, when do I look again?"* —
+which a trigger structurally cannot express. Forcing it in would mean blocking
+inside `should_continue`, holding the catalog across the wait, which is the one
+thing 1.6 and 1.25 forbid. So `ProcessingTime` lives in `duckstream/daemon.py`,
+owns the loop, and drives it with `AvailableNow` unchanged. A module-level
+`__getattr__` in `trigger.py` keeps the old import path resolving, because that
+is what anyone who read the previous docstring will type.
+
+**The objection that deferred it was real, and `DETACH` answers it.** The old
+refusal message said a daemon would lock the operator out of their own
+warehouse, and 1.25 confirms the premise exactly — a second process cannot
+`ATTACH` the catalog even `READ_ONLY`, even while the holder is idle. What had
+never been tested is whether the lock is *released*. It is. Measured: an outside
+reader attached 33 times in 38 attempts against a two-second daemon, so the
+catalog is free ~86% of the time, against 0% for a daemon that held its attach.
+
+**A fresh engine per cycle, and the two costs that would have forbidden it do
+not exist.** Re-attaching a *warm* process is ~11 ms rather than 1.8's ~235 ms
+of cold start, and `ensure` is idempotent — a fresh engine writes **3 snapshots
+on the first cycle and zero after**. That second number was measured *before*
+the design was settled precisely because it could have killed it: without it a
+two-second loop would add 43,200 snapshots a day.
+
+**Dropping the memos is correct rather than collateral.** 1.10 and 1.11 memoise
+the batch id and the committed watermark and both say to revisit "the moment a
+second writer exists". Detaching creates that window, so a fresh engine starting
+with empty caches is the *sound* choice, not merely the cheap one — and it is
+the same exposure cron already has between ticks.
+
+**Errors are contained by default.** A daemon exists to survive a transient
+fault; stopping at the first full disk or broker blip defeats the point. So
+`stop_on_error` defaults to `False`, and `max_consecutive_errors` (10) draws
+the line between riding out a fault and logging a permanent one at speed. The
+counter resets on success, or an intermittently-failing daemon that recovers
+every time would still give up.
+
+**A quarantined batch is a verdict, not a crash.** The CLI passes its own
+`drain` so `BatchFailed` is unwrapped exactly as the single-pass path unwraps
+it — every model already had its turn. Without that seam a quarantine would
+count against the give-up budget and eventually stop a pipeline that was
+handling bad data correctly.
+
+**Overruns are reported, not forbidden.** A cycle measured ~200 ms, so a
+sub-second interval is achievable but leaves no headroom. Rather than invent a
+minimum, the loop counts cycles that outlast their interval and says so —
+whether a deployment keeps up is a fact about that deployment.
+
+### Notes the next phase must not rediscover
+
+1. **`EXIT_OK` is `0`, which is falsy.** Extracting the CLI's reporting into a
+   helper that still returned an exit code made a healthy daemon exit 1. The
+   helper returns a `bool` now and both callers convert. Found by running it,
+   not by review.
+2. **Do not assert on `id()` for per-cycle objects.** CPython recycles an id as
+   soon as an object is collected, so two short-lived engines can share one and
+   a "was it reused?" test fails for reasons that have nothing to do with the
+   loop. Hold the references instead.
+3. **Check `max_cycles` before sleeping, not only at the top of the loop.**
+   Otherwise `--max-cycles 1` idles out a whole interval after its only cycle.
+   That was a real defect; there is a mutation for it.
+4. **`/tmp` is tmpfs on this platform (1.26).** The full suite outgrew a 2 GB
+   cap between 1,257 and 1,299 tests. Run expensive suites with `TMPDIR` on
+   disk, and note the failure mode: a starved *audit* reports `ERROR`, which is
+   loud, but an `ENOSPC` failure reports **red**, which is silent and inflates
+   the count.
+
 ## Phase 1 definition of done (from PLAN.md, not negotiable)
 
 - one file source, one `additive` model, `AvailableNow` trigger

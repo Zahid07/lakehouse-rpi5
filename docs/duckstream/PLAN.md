@@ -110,7 +110,8 @@ Stating these prevents scope collapse:
 Four planes. The trigger loop stays in the host process, never in the database.
 
 ```
-Trigger   AvailableNow / Once / ProcessingTime   - cron or supervisor owns it
+Trigger   AvailableNow / Once                   - how many batches per run
+Schedule  ProcessingTime, or cron               - how often a run happens
 Plan      offsets in, bounded micro-batch out    - enforces memory limits
 Execute   SQL over (micro-batch x state)         - DuckDB
 State     offsets, watermarks, windows, metrics  - DuckLake tables
@@ -469,10 +470,24 @@ From constraint 1: bound rows, not UDF cost.
      (`rows_late`/`rows_undated` on `batches`, `attempt`/`failed_at`/`error` on
      `offsets`, and the `quarantine` table).
 
-Post-v1: `ProcessingTime` trigger with portable locking, sliding and session
-windows, CDC source (evaluate adopting `ducklake_cdc` rather than building),
-Kafka (evaluate Tributary plus external offset tracking), stream-stream joins,
-native extension against the DuckDB v2.0 C ABI.
+**`ProcessingTime` is built** — it was the last item standing between cron's
+sixty-second floor and a realtime lakehouse, and constraint 25 is what unblocked
+it. It is deliberately **not** a `Trigger`: a trigger is asked "another batch
+right now?" only after a non-empty batch commits, so it can never express
+"nothing is there, wait and look again", and expressing it as one would mean
+blocking inside `should_continue` while holding the catalog. It lives in
+`duckstream/daemon.py` as a *schedule*, drives its loop with `AvailableNow`, and
+releases the catalog every cycle:
+
+```bash
+duckstream run --config models.yaml --interval "2 seconds"
+```
+
+Post-v1, still: sliding and session windows, CDC source (evaluate adopting
+`ducklake_cdc` rather than building), Kafka (evaluate Tributary plus external
+offset tracking), stream-stream joins, a `TableSource` so a model can read a
+DuckLake table rather than files, native extension against the DuckDB v2.0 C
+ABI, and a SQLite or PostgreSQL catalog for genuinely concurrent writers.
 
 ## Running it
 
@@ -626,10 +641,22 @@ enough that swapping it is cheap, so keep parsing isolated in `config.py`.
 DuckDB *file* can be held by only one process at a time — while one holds it
 read-write, no other process can open it **even read-only** (measured; see
 `CONTEXT.md`). A long-running engine on a single DuckDB file would lock you out of
-your own warehouse. DuckLake avoids this entirely: the catalog is a separate
-database and the data is parquet, so readers attach freely while the engine
-writes. This is what makes a `ProcessingTime` daemon viable later, and it is
-another reason DuckLake is the foundation rather than an option.
+your own warehouse.
+
+DuckLake softens this rather than avoiding it, and constraint **25** is the
+correction: the `.ducklake` catalog is itself a DuckDB file, so the same lock
+applies to it, on **attach** rather than on write — a second process is refused
+even `READ_ONLY`, and even while the holder sits idle. What DuckLake genuinely
+gives you is that the **data** is parquet: a landing tree or a mart's files stay
+readable by anything, with no catalog involved.
+
+What makes a `ProcessingTime` daemon viable is therefore not free attachment but
+that **`DETACH` releases the lock**. The daemon attaches, drains, detaches and
+sleeps, holding the catalog about 10% of the time at a two-second interval —
+measured, along with the two costs that would otherwise forbid it: a warm
+re-attach is ~11 ms, and a fresh engine writes no extra snapshots after the
+first cycle. Free attachment for concurrent writers would need a SQLite or
+PostgreSQL catalog (2.5), which remains unmeasured.
 
 ## Verification
 
@@ -705,7 +732,7 @@ Performance, to publish the operating envelope:
 | Config format | **YAML** (`pyyaml`), for readable nested model declarations and ecosystem familiarity. Keep parsing isolated in `config.py` so stdlib `tomllib` can replace it if the dependency ever becomes unwelcome on a constrained device. |
 | Change feed as a source | **Post-v1**, and evaluate adopting `ducklake_cdc` first. It dies with snapshot expiry, so any consumer must **fail loudly** on a missing snapshot rather than skip silently. |
 | DuckLake maintenance | Do not rely on `CHECKPOINT` to flush inlined data (ducklake#1368). Since v1 avoids inlining, the ordinary maintenance chain suffices. |
-| Concurrency and locking | v1 is single-writer under `AvailableNow`, so contention is structurally impossible and **no lock is needed**. DuckLake additionally retries snapshot-id conflicts without rewriting data files. A portable lock arrives with `ProcessingTime`. Never `fcntl` — it is POSIX-only and breaks import on Windows. |
+| Concurrency and locking | **Single-writer, and the guarantee is DuckDB's catalog file lock rather than the trigger.** This row used to say contention was "structurally impossible and no lock is needed"; `CONTEXT.md` 2.5 was corrected on that in phase 2b — `AvailableNow` drains until empty, so a backlog can make one tick outlast the interval that started it, and what actually prevents corruption is the lock (constraint 25: a second process cannot even `ATTACH`, `READ_ONLY` or not). `duckstream/lock.py` is advisory on top, so an overlap reads as a sentence rather than as "Unique file handle conflict". `ProcessingTime` releases the catalog every cycle instead of holding it. Never `fcntl` — POSIX-only, breaks import on Windows. |
 | `ducklake_add_data_files` as cheap ingestion | **Do not use.** Registration transfers file ownership to DuckLake, so maintenance may delete the landing file, and pruning is silently lost if the writer omits footer statistics. |
 | `ducklake_commit` / staged commit | **Do not use.** In-tree but undocumented transaction internals. Attractive later — it would let an external writer inherit DuckLake's conflict handling. |
 | Kafka | Out of v1 scope. Tributary is a bulk reader with no offset commits, so adopting it means building the offset layer anyway. |

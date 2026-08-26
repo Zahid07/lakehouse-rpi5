@@ -68,7 +68,7 @@ _EXPORTS: dict[str, str] = {
     "FAULT_POINTS": "duckstream.engine",
     "AvailableNow": "duckstream.trigger",
     "Once": "duckstream.trigger",
-    "ProcessingTime": "duckstream.trigger",
+    "ProcessingTime": "duckstream.daemon",
     "Trigger": "duckstream.trigger",
     # the canonical declaration
     "Model": "duckstream.model",
@@ -150,7 +150,8 @@ if TYPE_CHECKING:  # pragma: no cover - for type checkers and IDEs only
     from duckstream.sinks.table import TableSink
     from duckstream.sources.files import FileSource
     from duckstream.state import DuckLakeStateStore, MemoryStateStore
-    from duckstream.trigger import AvailableNow, Once, ProcessingTime, Trigger
+    from duckstream.daemon import ProcessingTime
+    from duckstream.trigger import AvailableNow, Once, Trigger
 
 
 def __getattr__(name: str) -> Any:

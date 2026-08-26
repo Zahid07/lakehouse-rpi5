@@ -97,6 +97,25 @@ def build_parser() -> argparse.ArgumentParser:
             "stepping a backlog forward one bounded chunk at a time."
         ),
     )
+    run.add_argument(
+        "--interval",
+        metavar="DURATION",
+        default=None,
+        help=(
+            "keep running, draining every DURATION (e.g. '2 seconds'). Without "
+            "this, run drains once and exits, which is what cron wants. With "
+            "it the process stays up and releases the catalog between cycles, "
+            "so anything else can still attach. Stops cleanly on SIGINT or "
+            "SIGTERM."
+        ),
+    )
+    run.add_argument(
+        "--max-cycles",
+        metavar="N",
+        type=int,
+        default=None,
+        help="with --interval, stop after N cycles instead of running forever",
+    )
     run.set_defaults(handler=_cmd_run)
 
     validate = commands.add_parser(
@@ -373,6 +392,10 @@ def _cmd_run(args: argparse.Namespace, out: TextIO) -> int:
 
     document = load_config(args.config)
     trigger = Once() if args.once else AvailableNow()
+
+    if getattr(args, "interval", None) is not None:
+        return _cmd_run_forever(args, document, trigger, out)
+
     engine = Engine.from_document(document)
     try:
         try:
@@ -386,6 +409,77 @@ def _cmd_run(args: argparse.Namespace, out: TextIO) -> int:
     finally:
         engine.close()
 
+    return EXIT_OK if _report_run(report, out) else EXIT_ERROR
+
+
+def _cmd_run_forever(
+    args: argparse.Namespace,
+    document: Any,
+    trigger: Any,
+    out: TextIO,
+) -> int:
+    """``run --interval``: stay up, drain on a schedule, release between cycles.
+
+    The engine is rebuilt each cycle rather than held, and that is the whole
+    design: ``CONTEXT.md`` 1.25 measured that a second process cannot ``ATTACH``
+    the catalog even ``READ_ONLY`` while one holds it, so a daemon that never
+    let go would lock the operator out of their own warehouse. Closing per cycle
+    costs ~11 ms to re-attach a warm process and writes **no** extra snapshots,
+    both measured, so the release is close to free.
+
+    The exit code follows the *last* cycle, not the worst: a daemon that
+    recovered from a transient fault an hour ago is healthy now, and a service
+    manager reading a non-zero exit would restart something that is working.
+    Every unhealthy cycle is still printed as it happens.
+    """
+    from duckstream.daemon import ProcessingTime
+    from duckstream.engine import Engine
+    from duckstream.errors import BatchFailed
+
+    schedule = ProcessingTime(
+        interval=args.interval, max_cycles=getattr(args, "max_cycles", None)
+    )
+    print(f"{PROGRAM}: {schedule.describe()}", file=out)
+
+    state = {"healthy": True}
+
+    def drain(engine: Any) -> Any:
+        """One cycle's drain. `BatchFailed` is a verdict, not an interruption —
+        every model already had its turn — so it is unwrapped here exactly as
+        the single-pass path unwraps it, and the daemon never sees it as a
+        crashed cycle."""
+        try:
+            return engine.run(trigger=trigger, model=args.model)
+        except BatchFailed as exc:
+            return exc.report
+
+    def on_cycle(cycle: Any) -> None:
+        if cycle.error is not None:
+            print(f"{PROGRAM}: cycle {cycle.cycle} failed: {cycle.error}", file=out)
+            state["healthy"] = False
+            return
+        state["healthy"] = (
+            _report_run(cycle.report, out) if cycle.report is not None else True
+        )
+        if cycle.overran:
+            print(
+                f"{PROGRAM}: cycle {cycle.cycle} took "
+                f"{cycle.seconds:.1f}s, longer than the {schedule.seconds:g}s "
+                f"interval — not keeping up",
+                file=out,
+            )
+
+    report = schedule.run(
+        factory=lambda: Engine.from_document(document),
+        drain=drain,
+        on_cycle=on_cycle,
+    )
+    print(f"{PROGRAM}: {report.describe()}", file=out)
+    return EXIT_OK if state["healthy"] else EXIT_ERROR
+
+
+def _report_run(report: Any, out: TextIO) -> bool:
+    """Print the per-model summary. Returns whether every model is healthy."""
     healthy = True
     for name in report.model_names:
         results = report.for_model(name)
@@ -416,10 +510,11 @@ def _cmd_run(args: argparse.Namespace, out: TextIO) -> int:
         if not committed and all(r.is_empty for r in results):
             print(f"{name}: nothing to do", file=out)
 
-    # Non-zero whenever a model is not healthy, including a model that is
-    # merely waiting out its backoff: the underlying failure is unresolved, and
-    # a run that exited 0 would hide it until somebody happened to look.
-    return EXIT_OK if healthy else EXIT_ERROR
+    # Returns a *bool*, not an exit code. Both callers turn it into one, and
+    # they must: EXIT_OK is 0, which is falsy, so returning the code from here
+    # and testing it for truth inverts the verdict — a healthy run exits 1.
+    # That is exactly what happened the first time the daemon path ran.
+    return healthy
 
 
 def _describe_outcome(result: Any) -> str:
