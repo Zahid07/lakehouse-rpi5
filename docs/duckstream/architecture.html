@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>duckstream — realtime sensor lakehouse on DuckDB</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+  :root{
+    --ground:#F6F7F9; --surface:#FFFFFF; --surface-2:#EDF0F4;
+    --ink:#161B22; --ink-soft:#3A4553; --muted:#626E7E;
+    --rule:#DCE2EA; --rule-strong:#C3CCD8;
+    --accent:#0B6E78; --accent-soft:#E1EFF0;
+    --hot:#9A6414; --hot-soft:#F6EDDC;
+    --cool:#3A6F4F; --cool-soft:#E4EFE7;
+    --alert:#9B3F52; --alert-soft:#F7E7EA;
+    --code-bg:#F0F3F7;
+    --shadow:0 1px 2px rgba(22,27,34,.05),0 8px 24px rgba(22,27,34,.06);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#10141A; --surface:#171C24; --surface-2:#1E242E;
+      --ink:#E6EAF0; --ink-soft:#BDC6D2; --muted:#8B97A6;
+      --rule:#2A323D; --rule-strong:#3B4插451;
+      --rule-strong:#3B4451;
+      --accent:#48B7C1; --accent-soft:#15323A;
+      --hot:#D7A34F; --hot-soft:#332715;
+      --cool:#6FBF8D; --cool-soft:#17301F;
+      --alert:#DE8496; --alert-soft:#351C22;
+      --code-bg:#1B212A;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#10141A; --surface:#171C24; --surface-2:#1E242E;
+    --ink:#E6EAF0; --ink-soft:#BDC6D2; --muted:#8B97A6;
+    --rule:#2A323D; --rule-strong:#3B4451;
+    --accent:#48B7C1; --accent-soft:#15323A;
+    --hot:#D7A34F; --hot-soft:#332715;
+    --cool:#6FBF8D; --cool-soft:#17301F;
+    --alert:#DE8496; --alert-soft:#351C22;
+    --code-bg:#1B212A;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.28);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;padding:0 1.5rem 6rem;background:var(--ground);color:var(--ink);
+    font-family:"Source Serif 4",Georgia,serif;font-size:17px;line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1100px;margin:0 auto}
+  .col{max-width:68ch}
+  header{padding:4rem 0 2.2rem;border-bottom:2px solid var(--ink);margin-bottom:2.6rem}
+  .eyebrow{font-family:"Archivo",sans-serif;font-size:.72rem;font-weight:600;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 1rem}
+  h1{font-family:"Archivo",sans-serif;font-weight:700;
+    font-size:clamp(2rem,4.8vw,2.9rem);line-height:1.07;letter-spacing:-.022em;
+    text-wrap:balance;margin:0 0 1rem}
+  .standfirst{font-size:1.14rem;color:var(--ink-soft);max-width:62ch;margin:0}
+  h2{font-family:"Archivo",sans-serif;font-weight:600;font-size:1.55rem;
+    letter-spacing:-.012em;text-wrap:balance;margin:3.4rem 0 .3rem;padding-top:1.5rem;
+    border-top:1px solid var(--rule)}
+  h3{font-family:"Archivo",sans-serif;font-weight:600;font-size:1.05rem;margin:2rem 0 .5rem}
+  .kicker{font-family:"Archivo",sans-serif;font-size:.7rem;font-weight:600;
+    letter-spacing:.13em;text-transform:uppercase;color:var(--muted);margin:0 0 1.5rem}
+  p{margin:0 0 1.05rem}
+  code{font-family:"JetBrains Mono",ui-monospace,monospace;font-size:.85em;
+    background:var(--code-bg);padding:.1em .36em;border-radius:3px}
+  figure{margin:2rem 0 1rem;background:var(--surface);border:1px solid var(--rule);
+    border-radius:8px;padding:1.6rem 1.4rem 1.2rem;box-shadow:var(--shadow);overflow-x:auto}
+  figcaption{font-family:"Archivo",sans-serif;font-size:.75rem;color:var(--muted);
+    margin-top:1.1rem;padding-top:.9rem;border-top:1px solid var(--rule);line-height:1.5}
+  svg{display:block;max-width:100%;height:auto}
+  .svg-l{font-family:"Archivo",sans-serif;font-size:11px;font-weight:600;
+    letter-spacing:.06em;text-transform:uppercase}
+  .svg-t{font-family:"JetBrains Mono",monospace;font-size:11.5px}
+  .svg-n{font-family:"JetBrains Mono",monospace;font-size:10.5px}
+  .tablewrap{overflow-x:auto;margin:1.5rem 0}
+  table{width:100%;border-collapse:collapse;font-family:"Archivo",sans-serif;
+    font-size:.86rem;font-variant-numeric:tabular-nums}
+  th{text-align:left;font-size:.68rem;font-weight:600;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--muted);padding:0 .8rem .55rem 0;
+    border-bottom:1.5px solid var(--rule-strong);white-space:nowrap}
+  td{padding:.68rem .8rem .68rem 0;border-bottom:1px solid var(--rule);
+    vertical-align:top;color:var(--ink-soft)}
+  td:first-child{color:var(--ink);font-weight:500}
+  td.num{font-family:"JetBrains Mono",monospace;white-space:nowrap}
+  pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:5px;
+    padding:1rem 1.15rem;overflow-x:auto;margin:1rem 0 1.4rem;
+    font-family:"JetBrains Mono",monospace;font-size:.79rem;line-height:1.6;color:var(--ink)}
+  pre .c{color:var(--muted)} pre .h{color:var(--accent);font-weight:600}
+  pre .w{color:var(--hot);font-weight:600}
+  .note{border-left:3px solid var(--accent);background:var(--surface);
+    padding:1.1rem 1.3rem;margin:1.7rem 0;border-radius:0 5px 5px 0}
+  .note.warn{border-left-color:var(--alert)}
+  .note .hd{font-family:"Archivo",sans-serif;font-size:.68rem;font-weight:600;
+    letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 .45rem}
+  .note.warn .hd{color:var(--alert)}
+  .note p:last-child{margin-bottom:0}
+  .tag{display:inline-block;font-family:"Archivo",sans-serif;font-size:.65rem;
+    font-weight:600;letter-spacing:.07em;text-transform:uppercase;
+    padding:.2em .55em;border-radius:3px}
+  .tag.built{background:var(--cool-soft);color:var(--cool)}
+  .tag.todo{background:var(--hot-soft);color:var(--hot)}
+  ul{margin:0 0 1.05rem;padding-left:1.25rem} li{margin-bottom:.4rem}
+  footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid var(--rule);
+    font-family:"Archivo",sans-serif;font-size:.78rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">Architecture &middot; measured on the Pi 5, 26 August 2026</p>
+  <h1>A realtime sensor lakehouse, entirely on DuckDB</h1>
+  <p class="standfirst">Sensors to queryable marts in about two seconds, with no broker cluster, no JVM, and no second database. One unbuilt piece stands between today and this: the trigger.</p>
+</header>
+
+<div class="col">
+<p class="kicker">The whole system</p>
+<p>Everything below the dashed line is DuckDB. The landing tree is parquet on the same disk; the marts are DuckLake, which <em>is</em> DuckDB&rsquo;s lakehouse format. There is no other process in the picture.</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1040 340" role="img" aria-label="End-to-end dataflow from sensors through MQTT and the landing tree into DuckLake marts">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/>
+    </marker>
+  </defs>
+
+  <!-- sensors -->
+  <rect x="8" y="96" width="118" height="70" rx="6" fill="var(--surface-2)" stroke="var(--rule-strong)"/>
+  <text x="67" y="124" text-anchor="middle" class="svg-l" fill="var(--ink)">Sensors</text>
+  <text x="67" y="143" text-anchor="middle" class="svg-n" fill="var(--muted)">100 Hz, x/y/z</text>
+  <text x="67" y="157" text-anchor="middle" class="svg-n" fill="var(--muted)">MQTT QoS 1</text>
+
+  <line x1="128" y1="131" x2="166" y2="131" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- landing writer -->
+  <rect x="168" y="86" width="150" height="90" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="243" y="112" text-anchor="middle" class="svg-l" fill="var(--accent)">Landing writer</text>
+  <text x="243" y="131" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">buffer &rarr; temp file</text>
+  <text x="243" y="145" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">rename &rarr; marker</text>
+  <text x="243" y="163" text-anchor="middle" class="svg-n" fill="var(--accent)">ack only when durable</text>
+
+  <line x1="320" y1="131" x2="358" y2="131" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- landing tree -->
+  <rect x="360" y="86" width="150" height="90" rx="6" fill="var(--cool-soft)" stroke="var(--cool)" stroke-width="1.5"/>
+  <text x="435" y="112" text-anchor="middle" class="svg-l" fill="var(--cool)">Landing tree</text>
+  <text x="435" y="131" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">parquet + _READY</text>
+  <text x="435" y="145" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">durable, replayable</text>
+  <text x="435" y="163" text-anchor="middle" class="svg-n" fill="var(--cool)">no catalog lock</text>
+
+  <line x1="512" y1="131" x2="550" y2="131" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- engine -->
+  <rect x="552" y="76" width="176" height="110" rx="6" fill="var(--hot-soft)" stroke="var(--hot)" stroke-width="1.5"/>
+  <text x="640" y="102" text-anchor="middle" class="svg-l" fill="var(--hot)">duckstream engine</text>
+  <text x="640" y="122" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">plan &middot; bind &middot; aggregate</text>
+  <text x="640" y="136" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">tier 1 / 2 / 3 routing</text>
+  <text x="640" y="155" text-anchor="middle" class="svg-n" fill="var(--hot)">one transaction</text>
+  <text x="640" y="169" text-anchor="middle" class="svg-n" fill="var(--hot)">one snapshot</text>
+
+  <line x1="730" y1="131" x2="768" y2="131" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- ducklake -->
+  <rect x="770" y="76" width="160" height="110" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="850" y="102" text-anchor="middle" class="svg-l" fill="var(--accent)">DuckLake</text>
+  <text x="850" y="122" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">marts + state</text>
+  <text x="850" y="136" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">snapshots, time travel</text>
+  <text x="850" y="155" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">parquet on disk</text>
+  <text x="850" y="169" text-anchor="middle" class="svg-n" fill="var(--accent)">SQL catalog</text>
+
+  <!-- readers -->
+  <rect x="360" y="238" width="150" height="62" rx="6" fill="var(--surface-2)" stroke="var(--rule-strong)" stroke-dasharray="4 3"/>
+  <text x="435" y="262" text-anchor="middle" class="svg-l" fill="var(--ink)">Raw queries</text>
+  <text x="435" y="281" text-anchor="middle" class="svg-n" fill="var(--muted)">read_parquet(&hellip;)</text>
+  <line x1="435" y1="178" x2="435" y2="234" stroke="var(--cool)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#a)"/>
+  <text x="447" y="212" class="svg-n" fill="var(--cool)">always available</text>
+
+  <rect x="770" y="238" width="160" height="62" rx="6" fill="var(--surface-2)" stroke="var(--rule-strong)" stroke-dasharray="4 3"/>
+  <text x="850" y="262" text-anchor="middle" class="svg-l" fill="var(--ink)">BI / ad-hoc</text>
+  <text x="850" y="281" text-anchor="middle" class="svg-n" fill="var(--muted)">ATTACH the catalog</text>
+  <line x1="850" y1="188" x2="850" y2="234" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#a)"/>
+  <text x="862" y="215" class="svg-n" fill="var(--muted)">between cycles</text>
+
+  <!-- latency ruler -->
+  <line x1="8" y1="40" x2="930" y2="40" stroke="var(--rule-strong)" stroke-width="1"/>
+  <text x="243" y="32" text-anchor="middle" class="svg-n" fill="var(--muted)">&lt; 5 s buffered</text>
+  <text x="435" y="32" text-anchor="middle" class="svg-n" fill="var(--muted)">durable on write</text>
+  <text x="640" y="32" text-anchor="middle" class="svg-n" fill="var(--muted)">~200 ms drain</text>
+  <text x="850" y="32" text-anchor="middle" class="svg-n" fill="var(--muted)">committed</text>
+  <text x="8" y="20" class="svg-l" fill="var(--ink)">Latency budget</text>
+</svg>
+<figcaption><strong>The landing tree is the log, not a workaround.</strong> Every streaming system separates durable ingest from processed state &mdash; Kafka has its log, Spark its checkpoint directory. Here that log is parquet on the same disk, readable by the same DuckDB, inside the same lakehouse. Raw data is queryable the moment the marker lands, without touching the catalog at all.</figcaption>
+</figure>
+
+<div class="col">
+<h2>What changes: the trigger, and only the trigger</h2>
+<p class="kicker">Cron cannot go below a minute. A daemon can go to seconds.</p>
+<p>Today duckstream ships <code>AvailableNow</code> and <code>Once</code> &mdash; both mean &ldquo;drain what is there, then exit&rdquo;. That makes <em>cron</em> the driver, and cron&rsquo;s floor is sixty seconds. That single fact is the whole distance between what exists and a realtime lakehouse.</p>
+<p>The objection to a long-lived daemon was always the catalog lock: one process at a time, and a daemon would hold it forever. Measured on this Pi, that objection dissolves &mdash; <strong><code>DETACH</code> releases the lock</strong>, so a daemon can cycle and still leave the catalog reachable.</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1040 300" role="img" aria-label="Timeline comparing catalog lock held under cron versus under a detaching daemon">
+  <text x="8" y="20" class="svg-l" fill="var(--ink)">Catalog lock, over 60 seconds</text>
+
+  <!-- axis -->
+  <line x1="120" y1="252" x2="1010" y2="252" stroke="var(--rule-strong)"/>
+  <g fill="var(--muted)" class="svg-n" text-anchor="middle">
+    <text x="120" y="270">0s</text><text x="268" y="270">10s</text>
+    <text x="416" y="270">20s</text><text x="565" y="270">30s</text>
+    <text x="713" y="270">40s</text><text x="861" y="270">50s</text>
+    <text x="1008" y="270">60s</text>
+  </g>
+
+  <!-- CRON row -->
+  <text x="8" y="76" class="svg-l" fill="var(--ink)">Cron</text>
+  <text x="8" y="94" class="svg-n" fill="var(--muted)">every 60 s</text>
+  <rect x="120" y="56" width="890" height="46" rx="4" fill="var(--cool-soft)" stroke="var(--cool)" stroke-dasharray="4 3"/>
+  <rect x="120" y="56" width="18" height="46" rx="3" fill="var(--alert)"/>
+  <text x="150" y="76" class="svg-t" fill="var(--ink)">locked ~1 s</text>
+  <text x="150" y="92" class="svg-n" fill="var(--muted)">235 ms cold start + drain</text>
+  <text x="700" y="84" class="svg-t" fill="var(--cool)">free &mdash; but the marts are already up to 60 s stale</text>
+
+  <!-- DAEMON row -->
+  <text x="8" y="176" class="svg-l" fill="var(--ink)">Daemon</text>
+  <text x="8" y="194" class="svg-n" fill="var(--muted)">every 2 s</text>
+  <rect x="120" y="156" width="890" height="46" rx="4" fill="var(--cool-soft)" stroke="var(--cool)" stroke-dasharray="4 3"/>
+  <g fill="var(--alert)">
+    <rect x="120" y="156" width="4" height="46" rx="1"/><rect x="150" y="156" width="4" height="46" rx="1"/>
+    <rect x="179" y="156" width="4" height="46" rx="1"/><rect x="209" y="156" width="4" height="46" rx="1"/>
+    <rect x="238" y="156" width="4" height="46" rx="1"/><rect x="268" y="156" width="4" height="46" rx="1"/>
+    <rect x="297" y="156" width="4" height="46" rx="1"/><rect x="327" y="156" width="4" height="46" rx="1"/>
+    <rect x="357" y="156" width="4" height="46" rx="1"/><rect x="386" y="156" width="4" height="46" rx="1"/>
+    <rect x="416" y="156" width="4" height="46" rx="1"/><rect x="446" y="156" width="4" height="46" rx="1"/>
+    <rect x="475" y="156" width="4" height="46" rx="1"/><rect x="505" y="156" width="4" height="46" rx="1"/>
+    <rect x="535" y="156" width="4" height="46" rx="1"/><rect x="565" y="156" width="4" height="46" rx="1"/>
+    <rect x="594" y="156" width="4" height="46" rx="1"/><rect x="624" y="156" width="4" height="46" rx="1"/>
+    <rect x="654" y="156" width="4" height="46" rx="1"/><rect x="683" y="156" width="4" height="46" rx="1"/>
+    <rect x="713" y="156" width="4" height="46" rx="1"/><rect x="743" y="156" width="4" height="46" rx="1"/>
+    <rect x="772" y="156" width="4" height="46" rx="1"/><rect x="802" y="156" width="4" height="46" rx="1"/>
+    <rect x="832" y="156" width="4" height="46" rx="1"/><rect x="861" y="156" width="4" height="46" rx="1"/>
+    <rect x="891" y="156" width="4" height="46" rx="1"/><rect x="921" y="156" width="4" height="46" rx="1"/>
+    <rect x="950" y="156" width="4" height="46" rx="1"/><rect x="980" y="156" width="4" height="46" rx="1"/>
+  </g>
+  <text x="130" y="228" class="svg-t" fill="var(--ink)">~200 ms locked per 2 s cycle &mdash; 10% of the time</text>
+  <text x="600" y="228" class="svg-t" fill="var(--cool)">marts are never more than ~2 s stale</text>
+
+  <!-- legend -->
+  <rect x="820" y="12" width="11" height="11" rx="2" fill="var(--alert)"/>
+  <text x="838" y="22" class="svg-n" fill="var(--muted)">catalog locked</text>
+  <rect x="932" y="12" width="11" height="11" rx="2" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="950" y="22" class="svg-n" fill="var(--muted)">free</text>
+</svg>
+<figcaption>Both rows hold the catalog exclusively &mdash; that is DuckDB&rsquo;s file lock and neither design escapes it. The difference is duty cycle and staleness. Cron pays a 235&nbsp;ms process start each tick and leaves marts up to a minute behind; a daemon pays ~11&nbsp;ms to re-attach a warm process and keeps them within seconds, while releasing the lock thirty times a minute instead of once.</figcaption>
+</figure>
+
+<div class="col">
+<h3>The loop, in full</h3>
+</div>
+
+<pre><span class="c"># the ProcessingTime trigger — the one unbuilt piece</span>
+engine = Engine(con, catalog=<span class="h">"ducklake:catalog.ducklake"</span>, data_path=<span class="h">"lake_data"</span>)
+
+<span class="h">while</span> running:
+    engine.attach()                      <span class="c"># ~11 ms — warm process, extension already loaded</span>
+    engine.run(trigger=AvailableNow())   <span class="c"># the existing trigger, unchanged</span>
+    engine.detach()                      <span class="w"># releases the catalog lock  ← measured</span>
+    sleep(2.0)                           <span class="c"># everyone else can ATTACH in this window</span>
+</pre>
+
+<div class="col">
+<p>Note what is <em>not</em> new here. <code>AvailableNow</code> already drains until the source is empty; the transaction boundary, the exactly-once commit, the tier routing and the state store are all untouched. What is missing is the surrounding loop and the discipline about when the lock is held.</p>
+</div>
+
+<div class="note">
+  <p class="hd">Why the daemon is safer than it sounds</p>
+  <p>A second writer was never the hazard &mdash; DuckDB&rsquo;s catalog lock makes that structurally impossible, which is what &sect;2.5 was corrected to say in phase 2b. The hazard was a daemon holding the lock <em>indefinitely</em> and locking out the operator&rsquo;s own tools. Releasing on every cycle removes it: measured on this Pi, a reader attached successfully <strong>21 times out of 25</strong> against a writer cycling attach and detach.</p>
+</div>
+
+<div class="col">
+<h2>The measured budget</h2>
+<p class="kicker">Everything here was timed on this Pi 5, not the dev box</p>
+</div>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Stage</th><th>Cost</th><th>What sets it</th></tr></thead>
+  <tbody>
+    <tr><td>MQTT &rarr; landing</td><td class="num">&lt; flush_seconds</td><td>Your choice. 1&ndash;10&nbsp;s trades latency against file count</td></tr>
+    <tr><td>Landing durable</td><td class="num">on write</td><td>Atomic rename, then the marker. Queryable immediately</td></tr>
+    <tr><td><code>ATTACH</code>, warm process</td><td class="num">~11 ms</td><td>Extension already loaded &mdash; the daemon&rsquo;s advantage</td></tr>
+    <tr><td>Cold process start</td><td class="num">~235 ms</td><td>What cron pays on every single tick</td></tr>
+    <tr><td>DuckLake commit floor</td><td class="num">~26 ms</td><td>One snapshot per transaction. Hard floor on this SD card</td></tr>
+    <tr><td>Attach &rarr; commit &rarr; detach</td><td class="num">~207 ms</td><td>The whole cycle, measured end to end</td></tr>
+    <tr><td>Tier&nbsp;3 recompute</td><td class="num">~26 ms + 0.08/file</td><td>Cost follows the <em>window</em>, never the batch</td></tr>
+    <tr><td>Python UDF penalty</td><td class="num">7.5&times; native</td><td>At four threads. Keep tier 3 at the coarsest grain you can</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="col">
+<p>So <strong>two seconds end to end is comfortable</strong> and one second is reachable. Sub-second is not, and the reason is structural rather than fixable: DuckLake commits one snapshot per transaction, and that snapshot is what makes exactly-once nearly free. The guarantee and the floor are the same mechanism.</p>
+
+<h2>How a reading becomes a mart row</h2>
+<p class="kicker">Three tiers, decided at load time</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1040 250" role="img" aria-label="How aggregates route to one of three foldability tiers">
+  <rect x="8" y="96" width="150" height="58" rx="6" fill="var(--surface-2)" stroke="var(--rule-strong)"/>
+  <text x="83" y="120" text-anchor="middle" class="svg-l" fill="var(--ink)">Batch view</text>
+  <text x="83" y="138" text-anchor="middle" class="svg-n" fill="var(--muted)">bound over N files</text>
+
+  <line x1="160" y1="125" x2="196" y2="125" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <rect x="198" y="88" width="164" height="74" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="280" y="112" text-anchor="middle" class="svg-l" fill="var(--accent)">Classifier</text>
+  <text x="280" y="130" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">reads DuckDB&rsquo;s AST</text>
+  <text x="280" y="146" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">refuses at load time</text>
+
+  <!-- three tiers -->
+  <line x1="364" y1="112" x2="420" y2="52" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#a)"/>
+  <line x1="364" y1="125" x2="420" y2="125" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#a)"/>
+  <line x1="364" y1="138" x2="420" y2="198" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#a)"/>
+
+  <rect x="422" y="24" width="250" height="56" rx="6" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="436" y="46" class="svg-l" fill="var(--cool)">Tier 1 &middot; additive</text>
+  <text x="436" y="66" class="svg-n" fill="var(--ink-soft)">count, sum, min, max &mdash; fold the delta</text>
+
+  <rect x="422" y="97" width="250" height="56" rx="6" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="436" y="119" class="svg-l" fill="var(--cool)">Tier 2 &middot; sufficient statistics</text>
+  <text x="436" y="139" class="svg-n" fill="var(--ink-soft)">avg, stddev &mdash; carry (n, mean, M2)</text>
+
+  <rect x="422" y="170" width="250" height="56" rx="6" fill="var(--hot-soft)" stroke="var(--hot)"/>
+  <text x="436" y="192" class="svg-l" fill="var(--hot)">Tier 3 &middot; non-foldable</text>
+  <text x="436" y="212" class="svg-n" fill="var(--ink-soft)">FFT, median &mdash; recompute the window</text>
+
+  <line x1="674" y1="52" x2="726" y2="112" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#a)"/>
+  <line x1="674" y1="125" x2="726" y2="125" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#a)"/>
+  <line x1="674" y1="198" x2="726" y2="138" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#a)"/>
+
+  <rect x="728" y="88" width="180" height="74" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="818" y="112" text-anchor="middle" class="svg-l" fill="var(--accent)">One transaction</text>
+  <text x="818" y="130" text-anchor="middle" class="svg-n" fill="var(--ink-soft)">rows + offset + watermark</text>
+  <text x="818" y="146" text-anchor="middle" class="svg-n" fill="var(--accent)">one snapshot</text>
+</svg>
+<figcaption><strong>This is the part no other engine does.</strong> An incremental merge is only correct when the aggregate forms a monoid over batches. duckstream classifies every aggregate from DuckDB&rsquo;s own parse tree and <em>refuses</em> an additive strategy over a non-foldable one &mdash; at load time, before a single row moves. Two production marts in this repository were computing wrong numbers for exactly this reason.</figcaption>
+</figure>
+
+<div class="col">
+<h2>What exists, and what is left</h2>
+</div>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Piece</th><th>State</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td>Exactly-once commit</td><td><span class="tag built">built</span></td><td>Offsets, watermark and output in one snapshot; proved under real process kills</td></tr>
+    <tr><td>Event time &amp; watermarks</td><td><span class="tag built">built</span></td><td>Tumbling windows, lateness horizon, sealing</td></tr>
+    <tr><td>All three tiers</td><td><span class="tag built">built</span></td><td>Including window-range chunking for tier 3</td></tr>
+    <tr><td>MQTT landing writer</td><td><span class="tag built">built</span></td><td>Acks only once durable &mdash; the inverse of paho&rsquo;s default</td></tr>
+    <tr><td>Quarantine &amp; retry</td><td><span class="tag built">built</span></td><td>A corrupt file no longer stalls the stream silently</td></tr>
+    <tr><td>Both front doors</td><td><span class="tag built">built</span></td><td>Python API and YAML/CLI, parity enforced by the suite</td></tr>
+    <tr><td><code>ProcessingTime</code> daemon</td><td><span class="tag todo">to build</span></td><td><strong>The piece this page is about.</strong> Attach, drain, detach, sleep</td></tr>
+    <tr><td><code>TableSource</code></td><td><span class="tag todo">to build</span></td><td>Would let a model read a DuckLake table rather than files</td></tr>
+    <tr><td>Retention &amp; compaction</td><td><span class="tag todo">half</span></td><td>Phase 4. Until then the landing tree grows without bound</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <p class="hd">The one real limit, stated plainly</p>
+  <p>One process may hold the catalog at a time. That is DuckDB&rsquo;s file lock on the <code>.ducklake</code> file &mdash; which is itself a DuckDB database &mdash; and it applies to <em>attaching</em>, not merely to writing: a second process cannot attach even <code>READ_ONLY</code>. Cycling <code>DETACH</code> makes this workable rather than removing it. The documented escape is a <strong>SQLite or PostgreSQL catalog</strong>, which &sect;2.5 names for multiple local processes and which nobody here has measured yet.</p>
+</div>
+
+<footer>
+  Every figure on this page was measured on this Raspberry&nbsp;Pi&nbsp;5 &mdash; aarch64, 4&nbsp;cores, 4&nbsp;GB, DuckDB&nbsp;1.5.5, ducklake&nbsp;<code>d8a1881e</code> &mdash; on 26&nbsp;August&nbsp;2026. The lock behaviour and the attach/detach cycle cost were measured for this page and correct a claim in <code>PLAN.md</code> that readers attach freely while the engine writes.
+</footer>
+
+</div>
+</body>
+</html>

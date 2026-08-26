@@ -27,7 +27,18 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from mutations import MUTATIONS  # noqa: E402
 
-PYTHON = str(pathlib.Path(__file__).resolve().parents[2] / ".venv" / "Scripts" / "python.exe")
+
+def _venv_python() -> str:
+    """The venv interpreter for this platform. See `run_audit.venv_python`."""
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    for candidate in (repo / ".venv" / "bin" / "python",
+                      repo / ".venv" / "Scripts" / "python.exe"):
+        if candidate.exists():
+            return str(candidate)
+    raise SystemExit(f"no venv interpreter under {repo / '.venv'}")
+
+
+PYTHON = _venv_python()
 SUITES = {
     "fast": ["-m", "not conformance"],
     "conf": ["-m", "conformance"],
@@ -49,6 +60,56 @@ def apply(root: pathlib.Path, spec: dict) -> None:
     path.write_text(text.replace(spec["find"], spec["repl"]), encoding="utf-8", newline="\n")
 
 
+def _can_symlink_directories() -> bool:
+    """Whether this box can create a directory symlink at all.
+
+    The same question `tests/unit/test_file_source.py` asks before its symlink
+    test, and it has to be asked the same way: Windows refuses without a
+    privilege most boxes lack, POSIX does it freely.
+    """
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp) / "probe"
+        target.mkdir()
+        try:
+            os.symlink(target, pathlib.Path(tmp) / "link", target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+        return True
+
+
+def _has_paho() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("paho.mqtt.client") is not None
+
+
+CAPABILITIES = {
+    "dirsymlink": (
+        _can_symlink_directories,
+        "needs a directory symlink, which this platform will not create "
+        "without a privilege; the matching test skips for the same reason",
+    ),
+    "paho": (
+        _has_paho,
+        "needs paho-mqtt, which is an optional dependency and is not "
+        "installed here; the adapter's tests drive the callbacks directly",
+    ),
+}
+
+
+def _missing_capability(spec: dict) -> str | None:
+    """The reason this mutation cannot be audited here, or None if it can."""
+    required = spec.get("requires")
+    if required:
+        probe, reason = CAPABILITIES[required]
+        return None if probe() else reason
+    # An unconditional `skip`, for anything genuinely un-auditable everywhere.
+    return spec.get("skip")
+
+
 def main() -> None:
     index = int(sys.argv[1])
     root = pathlib.Path(sys.argv[2])
@@ -63,9 +124,18 @@ def main() -> None:
                           "verdict": "not-auditable-here",
                           "why": f"inert on os.name={os.name!r}"}))
         return
-    if spec.get("skip"):
-        print(json.dumps({"index": index, "name": spec["name"], "verdict": "skipped",
-                          "why": spec["skip"]}))
+    # `skip` means "the fixture cannot be built **here**" -- that is the
+    # distinction BUILD_GRAPH ratified against `inert_on`, and the word doing
+    # the work is *here*. It was implemented as an unconditional skip, so both
+    # of the mutations carrying one were excused on every platform for ever,
+    # including the platforms that can build the fixture. That is the same
+    # failure a stale anchor produces -- an audit reporting `skipped` for
+    # coverage it could actually have had -- so the capability is probed rather
+    # than assumed, exactly as the matching tests probe it.
+    missing = _missing_capability(spec)
+    if missing is not None:
+        print(json.dumps({"index": index, "name": spec["name"],
+                          "verdict": "skipped", "why": missing}))
         return
 
     apply(root, spec)

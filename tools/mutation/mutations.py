@@ -482,10 +482,7 @@ MUTATIONS = [
         # leaving a survivor that looks like missing coverage.
         # `test_the_walk_does_not_descend_into_symlinked_directories` is red on
         # any platform that can make one.
-        skip=(
-            "needs a directory symlink, which this platform will not create "
-            "without a privilege; the matching test skips for the same reason"
-        ),
+        requires="dirsymlink",
     ),
     dict(
         name="a non-recursive source walks the whole tree anyway",
@@ -657,12 +654,14 @@ MUTATIONS = [
         repl="        client.manual_ack = False",
         suite="fast",
         note=(
-            "Not reachable without paho installed, so it cannot be audited "
-            "here. Declared rather than left to report as a survivor."
-        ),
-        skip=(
-            "needs paho-mqtt, which is an optional dependency and is not "
-            "installed; the adapter's tests drive the callbacks directly"
+            "Was excused as needing paho installed, and is not excused any "
+            "more. When the capability probe first let it run it **survived**: "
+            "`MqttLandingWriter.connect()` had no test at all, because every "
+            "fixture assigns `_client` directly, so the one line carrying the "
+            "at-least-once guarantee was never executed. The test that closes "
+            "it installs a recording client through `sys.modules`, so it needs "
+            "no broker and no paho -- verified by blocking `paho` and watching "
+            "this mutation still turn the suite red. Auditable everywhere now."
         ),
     ),
     dict(
