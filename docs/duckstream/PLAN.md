@@ -420,8 +420,34 @@ From constraint 1: bound rows, not UDF cost.
      `<target>__open_windows` every trigger and deletes from it on every seal,
      so it accumulates both small files and tombstones faster than the target
      does.
-5. **MQTT landing writer.** Fills a genuinely empty slot — no MQTT extension for
-   DuckDB exists. At-least-once into durable storage, replayable downstream.
+5. **MQTT landing writer. Done.** Fills a genuinely empty slot — no MQTT
+   extension for DuckDB exists. At-least-once into durable storage, replayable
+   downstream.
+
+   `duckstream/landing.py` carries the durability and has no MQTT in it:
+   buffer, temp path, `os.replace`, **then** the marker, and an acknowledgement
+   token per record released only once that marker exists.
+   `duckstream/sources/mqtt.py` is the adapter over it. `paho-mqtt` is an
+   **optional** dependency (`duckstream[mqtt]`), imported lazily, so a
+   deployment with no MQTT carries none — and the durability half is therefore
+   tested on every machine, with no broker.
+
+   **The acknowledgement discipline is the whole of the guarantee, and it is
+   the opposite of the default.** `paho` acks a QoS-1 message on arrival, which
+   is at-*most*-once for anything still buffered: the broker is told it was
+   handled, the process dies, and it is gone with nothing to report it. The
+   reference `subscriber.py` in this repository does exactly that. duckstream
+   sets `manual_ack` and releases each message only after it is on disk.
+
+   The price is stated rather than hidden: duplicates. A redelivery lands the
+   same reading in a second file, and duckstream does not de-duplicate it —
+   the two files are genuinely different files. Exactly-once is over **files**,
+   not over readings, and a model that cares needs a merge key. A conformance
+   scenario asserts the duplicate is counted twice, visibly.
+
+   `type: mqtt` remains **refused** as a source, permanently, with the
+   alternative in the message. That refusal has been there since phase 1 and
+   shipping phase 5 did not remove it — it is the design, not a placeholder.
 6. **Validation on a real workload, and a release.** Point it at a real sensor
    pipeline and diff against a full recompute. This repo's accelerometer marts
    are a convenient reference case, exercising all three tiers (counts,

@@ -28,6 +28,11 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+# Optional on purpose. duckstream runs on constrained hardware and a deployment
+# with no MQTT in it should carry no MQTT dependency; `duckstream.sources.mqtt`
+# imports paho lazily so the package imports either way. See that module for why
+# MQTT is a landing writer rather than a source.
+mqtt = ["paho-mqtt>=2.0"]
 
 [project.scripts]
 # duckstream.cli arrives with W3; declaring the entry point now is intentional.

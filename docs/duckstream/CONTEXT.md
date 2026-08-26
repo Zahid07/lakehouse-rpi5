@@ -47,10 +47,15 @@ minimum limit at which the query completed.
 DuckDB materialising the list aggregate inside its buffer manager; the Python
 layer is not the constraint. A faster or native UDF buys **no** memory headroom.
 
-**Consequence for the design.** Memory is controlled by bounding **rows in flight
-per execution** (`max_rows_per_trigger`, window-range chunking), never by
-optimising the UDF. This is the reasoning behind the memory-control section of
-`PLAN.md`.
+**Consequence for the design.** Memory is controlled by bounding what is **in
+flight per execution**, never by optimising the UDF. This is the reasoning
+behind the memory-control section of `PLAN.md`.
+
+**Read that with 1.21, which measured it and narrowed it.** "Rows in flight" is
+the wrong unit: at a fixed 1.92 M rows, a `LIST`-based UDF needs 64 MB over one
+group and **more than 2 GB over 4,000**. It is *groups* that cost, and a group
+is `key x window` — so `max_rows_per_trigger` and window-range chunking each
+bound part of the problem and neither bounds key cardinality at all.
 
 **Historical note.** This finding corrected an earlier wrong conclusion in this
 project: a real out-of-memory failure (`could not allocate block of size 256.0
@@ -916,6 +921,83 @@ mark**, because a file may arrive with an older mtime — a directory-level rule
 gated on the completion marker is a different proposition and has not been
 measured or ruled out.
 
+### 1.21 Memory follows **groups**, not rows — and no knob bounds groups
+
+**Method.** `PLAN.md`'s outstanding performance item: *"bisect `memory_limit`
+against `max_rows_per_trigger` per tier, and publish the ratio so users can size
+the knob."* Measured through the **engine**, not a bare query, because what a
+user sets is a model's limit and what they have is a memory budget. Binary
+search over `16…2048 MB` for the smallest limit at which one trigger completes.
+
+First, per tier, with every row in one window — one group:
+
+| Tier | 200,000 rows | 800,000 | 3,200,000 |
+|---|---|---|---|
+| `additive` | 32 MB | 32 MB | 32 MB |
+| `sufficient_statistics` | 32 MB | 32 MB | 32 MB |
+| `non_foldable` (median) | 32 MB | 32 MB | 32 MB |
+| `non_foldable` (UDF over `LIST`) | 32 MB | 32 MB | 64 MB |
+
+Which reads as "the tier barely matters and rows barely matter" — and would have
+been published as exactly that, except it contradicts 1.1, which measured 256 MB
+for `LIST` at 2.4 M rows. The difference is that 1.1 had **400 groups** and the
+table above has **one**. So the group count was varied at a *fixed* 1,920,000
+rows:
+
+| Groups | `additive` | `non_foldable` (UDF over `LIST`) |
+|---|---|---|
+| 1 | 32 MB | 64 MB |
+| 40 | 48 MB | 256 MB |
+| 400 | 48 MB | 384 MB |
+| 4,000 | 96 MB | **>2048 MB** |
+
+**Conclusion.** Rows are close to free; **groups are what cost**. Same row count,
+64 MB to over 2 GB, from key cardinality alone. It reconciles with 1.1 — 400
+groups needing 256 MB there and 384 MB here is the same measurement twice — and
+it means the obvious reading of 1.1 was incomplete.
+
+**Consequence, and this is a gap rather than a tuning note.** 1.1 says memory is
+controlled by "bounding rows in flight per execution (`max_rows_per_trigger`,
+window-range chunking)". Neither of those bounds **groups**. A group is
+`key x window`: chunking bounds the *window* half, and nothing bounds the *key*
+half at all. A model with 4,000 sensors materialises 4,000 lists in every chunk
+however small the chunk is, and `max_rows_per_trigger` cannot help — a batch of
+few rows spread thinly across many keys is strictly worse than a batch of many
+rows in one.
+
+So the honest sizing rule for tier three is **per group, not per row**: budget
+roughly 0.1 MB per concurrently materialised group for a `LIST`-based UDF on
+this box, and treat key cardinality as the number to watch. Bounding it would
+need a knob duckstream does not have — chunking by key range as well as by
+window range — and that is a design question, not a setting.
+
+### 1.22 A Python UDF costs ~3x the available parallelism, and 4.2x native
+
+**Method.** `PLAN.md`'s other outstanding item: *"quantify the single-thread
+penalty (2.1) so the docs can state when to split across processes."* 2.1 is
+*researched* (duckdb#14817), not measured. 1,920,000 rows in 480 groups, the
+same query shape run at 1, 2 and 4 threads, interleaved, median of five.
+
+| Threads | Native SQL | Speedup | Arrow UDF | Speedup |
+|---|---|---|---|---|
+| 1 | 30 ms | 1.00x | 52 ms | 1.00x |
+| 2 | 16 ms | 1.90x | 45 ms | 1.15x |
+| 4 | 10 ms | **3.18x** | 40 ms | **1.31x** |
+
+**Conclusion.** 2.1 is confirmed and now has a number. Native SQL scales
+essentially linearly — 3.18x on four threads. The same query with a Python UDF
+in it reaches **1.31x**, which by Amdahl puts roughly **two thirds of it on one
+thread**. It is not *fully* serial: the scan and the `GROUP BY` still
+parallelise, and that residual is the whole 1.31x. At four threads the UDF query
+costs **4.2x** the native one.
+
+**Consequence.** On a four-core Pi, one pipeline containing a UDF leaves about
+three quarters of the machine idle, and adding cores buys almost nothing. The
+lever is **processes, not threads**: run independent models in separate
+processes, each with its own catalog connection. And it is a direct argument for
+keeping tier three off the hot path wherever a foldable tier will do — the
+4.2x is on top of the recompute's own re-reading of the window (1.19).
+
 ---
 
 ## 2. Researched constraints
@@ -1140,7 +1222,7 @@ Do not re-litigate these without new evidence.
 | Guarantee | **Exactly-once via atomic commit** — offsets and data in one transaction. | Measurement 1.4 makes this nearly free, and it is a structural advantage over bolting a sink onto Spark, where offset and output stores are separate systems. |
 | Storage | **DuckLake, from phase 1.** Not an optional backend. The plain-DuckDB `StateStore` exists only to keep unit tests fast, and is never the sole test gate. | The deliverable is a streaming engine *for a lakehouse* — parquet data, a SQL catalog, snapshots, time travel, schema evolution. The bugs in 2.3 are in inlining and the change feed, not in core storage, so they are avoided by disabling those two features (1.7) rather than by avoiding DuckLake. Measurement 1.6 independently rules out a shared single-file DuckDB. |
 | Inlining | **Explicitly disabled** (`= 0`). | It defaults to 10 rows and silently captures small batches into the buggiest path (1.7). Accept small files, compact instead. |
-| MQTT modelling | **Landing writer, not a source.** | MQTT has no replayable offset; once a message is acked it is gone. Exactly-once is impossible directly, so land durably first and treat that as the source. |
+| MQTT modelling | **Landing writer, not a source.** Built in phase 5; `type: mqtt` on a model is still refused, permanently. | MQTT has no replayable offset; once a message is acked it is gone. Exactly-once is impossible directly, so land durably first and treat that as the source. **The acknowledgement discipline is the guarantee and it inverts the client's default**: `paho` acks a QoS-1 message on arrival, which loses the buffer on a crash while the broker believes it was delivered. `LandingWriter` releases a token per record only after the completion marker is on disk. The price is duplicates — exactly-once is over *files*, not over readings — and a model that cares needs a merge key. `paho-mqtt` is an optional extra so a deployment with no MQTT carries none. |
 | Entry points | **Both**: a Python API and a config-driven CLI, built together in phase 1 over one canonical `Model`. | A cron-driven framework wants the CLI; library users want the API. Retrofitting config onto a Python-shaped API costs far more than building both at once. The loader is a deserialiser only — no parallel validation, no parallel execution path, no override or precedence semantics, which is where config layers usually rot. Drift is prevented mechanically by a config round-trip test and by running every conformance scenario through both doors. |
 | Config format | **YAML** via `pyyaml`, parsing isolated in `config.py`. | Nested model declarations read far better than the alternatives, and YAML is the norm for data tooling. Isolating the parser keeps stdlib `tomllib` a cheap swap if the dependency becomes unwelcome on a constrained device. |
 | Callables in config | **Registry with dotted-path resolution.** | Config expresses declarative structure but cannot express functions. Built-in names (`file`, `mqtt`, `table`) plus `my_pkg.mod:obj` for user sources, sinks and UDFs keeps config fully capable without turning it into a programming language. |
