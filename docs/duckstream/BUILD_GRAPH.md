@@ -795,6 +795,66 @@ reason the tier-three index widening is.
 
 ---
 
+## Phase 5, the MQTT landing writer — ratified
+
+**Durability lives in `landing.py`, which has no MQTT in it.** That seam is the
+main decision. The write order and the acknowledgement discipline are the whole
+guarantee, and putting them behind a network client would make them testable
+only where a broker exists — which is nowhere in CI, and nowhere on a laptop.
+`LandingWriter` is exercised on every machine; the adapter is thin enough to
+read in one sitting and is driven through the same callbacks `paho` calls.
+
+**`paho-mqtt` is optional, imported lazily.** duckstream runs on constrained
+hardware and a deployment with no MQTT in it should carry no MQTT dependency.
+The missing-dependency error names the extra rather than surfacing a bare
+`ImportError` from a lazy import, which is the sort of thing that gets reported
+as "duckstream is broken".
+
+**Tokens, not timestamps.** `flush` returns an acknowledgement token per record
+and returns them **only after the marker is on disk**. A caller that acks what
+it is given cannot lose an acked message. This inverts `paho`'s default and the
+reference `subscriber.py`'s behaviour, both of which ack on arrival — which is
+at-most-once for the buffer, and silent, because from the broker's side nothing
+went wrong.
+
+**One directory per flush, `mkdir(exist_ok=False)`.** A marker means "complete",
+so a landed directory must never gain a file — the file source's scan is
+entitled to rely on it and phase 4's scan work does. A collision is an error
+rather than two batches quietly sharing one marker.
+
+**A failed write keeps the buffer.** Nothing is acked and the records stay, so
+the next flush retries them. That is what makes a full disk a delay instead of a
+loss.
+
+**The union of keys is computed before writing.** `pa.Table.from_pylist` infers
+its schema from the *first record only*, so a field appearing later in a batch
+is **silently dropped** — the write succeeds and the column is simply absent.
+Found by a test, not by review.
+
+**`type: mqtt` is still refused as a source.** Shipping phase 5 did not remove
+the refusal, it improved the message. MQTT cannot be a source in the
+exactly-once sense and no amount of implementation changes that.
+
+### Notes the next phase must not rediscover
+
+1. **Exactly-once is over files, not over readings.** At-least-once means the
+   broker re-delivers what was never acked, so the same reading can land in two
+   files. duckstream does not de-duplicate and cannot — the files genuinely
+   differ. A model that cares needs a merge key and `mode='update'`. Asserted in
+   `test_landing_handover.py` rather than left to be discovered.
+2. **A quiet topic needs its own flush.** No messages means nothing calls
+   `_on_message`, so nothing notices `flush_seconds` passing. `run_forever`
+   polls `tick()` on its own thread; anything embedding the writer in another
+   event loop must call `tick` itself, or a sensor that goes silent holds its
+   last readings for ever.
+3. **The adapter has two threads and the writer has one.** `paho`'s network
+   thread delivers while the caller's thread drives the time trigger, so the
+   lock lives in `MqttLandingWriter`. `LandingWriter` stays single-threaded by
+   design — a lock in it would advertise a promise nothing needs and callers
+   would come to rely on.
+
+---
+
 ## Phase 1 definition of done (from PLAN.md, not negotiable)
 
 - one file source, one `additive` model, `AvailableNow` trigger

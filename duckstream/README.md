@@ -425,6 +425,75 @@ missing or stale entry costs time and never an answer. Files consumed before the
 index existed, or by a model that was not tier three at the time, carry no
 bounds and are read by every recompute.
 
+## Ingesting from MQTT
+
+MQTT cannot be a duckstream source. Once a message is acknowledged it is gone
+from the broker, so there is nothing to resume from and nothing to replay — and
+replayability is what exactly-once rests on. Declaring `type: mqtt` on a model is
+refused, with the alternative in the error.
+
+The alternative is two processes and a directory between them:
+
+```
+broker  ->  MqttLandingWriter  ->  landing/  ->  file source  ->  engine
+              at least once                       exactly once
+```
+
+```python
+# subscriber.py -- a daemon, under systemd or supervisor
+from duckstream.sources.mqtt import MqttLandingWriter
+
+MqttLandingWriter(
+    "landing/",
+    "sensors/#",
+    host="broker.local",
+    qos=1,                       # 1 or 2: at QoS 0 the broker never re-delivers
+    client_id="duckstream-accel",  # stable, so the broker keeps your session
+    flush_rows=10_000,
+    flush_seconds=60,
+).run_forever()
+```
+
+The model then reads the landing tree like any other file source, under cron:
+
+```yaml
+source: {type: file, path: "landing/", marker: _READY}
+```
+
+`pip install duckstream[mqtt]` — `paho-mqtt` is an **optional** dependency, so a
+deployment with no MQTT in it carries none.
+
+### What "at least once" costs you, exactly
+
+Every message is acknowledged **only after** the completion marker is on disk.
+That is the guarantee, and it is the opposite of what an MQTT client does by
+default: `paho` acks a QoS-1 message the moment it arrives, so anything still
+buffered when a process dies is gone with the broker believing it was delivered.
+duckstream sets `manual_ack` and releases each message only once it is durable.
+
+The price is duplicates. After a crash the broker re-delivers whatever was never
+acked, so the same reading can land **twice, in two different files**. duckstream
+does not de-duplicate that and cannot: the two files are genuinely different
+files holding genuinely different rows, and nothing marks one as a repeat.
+
+So "exactly-once" is exactly-once over **files**, not over sensor readings. If a
+duplicate reading matters, give the model a merge key and `mode="update"`, which
+converges to one row per key however many times a reading arrives. A windowed
+`append` model will count it twice, correctly and visibly.
+
+### Two things to get right
+
+**Run it as its own process.** The writer must stay connected; the engine is a
+drain-and-exit job under cron. Fusing them would put a long-lived network loop
+inside the process holding the catalog, which is what the trigger model exists to
+avoid — and a DuckDB *file* held open locks every other reader out.
+
+**A quiet topic still needs flushing.** `run_forever` polls the time trigger on
+its own thread, so a sensor that stops reporting still lands what it was holding.
+Embedding the writer in your own event loop instead? Call `tick()` on a timer —
+otherwise the last readings before a sensor went silent sit in memory until a
+message that never comes.
+
 ## When the data will not process
 
 Exactly-once says what happens when the *process* dies. It says nothing about
@@ -695,7 +764,12 @@ keeps one tick from outrunning the next when catching up.
   because it defaults to capturing any write under 10 rows into the code path
   carrying DuckLake's open correctness bugs — which would make behaviour depend
   on batch size. The cost is small files; compaction is phase 4.
-- **No MQTT source yet.** Phase 5.
+- **MQTT is a landing writer, not a source, and never will be one.** Once a
+  message is acked it is gone from the broker, so there is no offset to resume
+  from and nothing to replay — exactly-once is unformable directly. duckstream
+  subscribes, writes durably to disk, and acknowledges only once the data is on
+  disk; a `file` source then reads that tree replayably. `type: mqtt` on a model
+  is refused with the alternative spelled out. See "Ingesting from MQTT".
 
 And the small honest ones:
 

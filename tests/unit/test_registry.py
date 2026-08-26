@@ -184,19 +184,30 @@ def test_resolution_is_what_triggers_the_import(plugin, tmp_path, monkeypatch):
     sys.modules.pop("duckstream_lazy_probe", None)
 
 
-def test_mqtt_is_reserved_for_phase_five():
+def test_mqtt_is_refused_as_a_source_and_says_what_to_use_instead():
+    """Phase 5 shipped, and `mqtt` is *still* refused here. That is the design.
+
+    ``CONTEXT.md`` section 4: MQTT has no replayable offset, so it cannot be a
+    source in the exactly-once sense at all. Phase 5 built the landing writer,
+    not an MQTT source, and this refusal is what stops somebody reaching for the
+    thing that cannot exist. The message therefore has to name the thing that
+    does -- a refusal an operator cannot act on is barely better than none.
+    """
     with pytest.raises(ConfigError) as caught:
         reg.resolve_source("mqtt")
     message = str(caught.value)
-    assert "phase 5" in message
+    assert "MqttLandingWriter" in message, "the refusal must name the alternative"
     assert "landing writer" in message
+    assert "no offset to resume from" in message, "and say why"
+    assert "type: file" in message, "and show the model declaration that works"
 
 
 def test_mqtt_is_listed_as_available_but_annotated():
+    """Listed so a typo is not the first explanation an operator reaches for."""
     assert "mqtt" in reg.available_sources()
     with pytest.raises(ConfigError) as caught:
         reg.resolve_source("nope")
-    assert "'mqtt' (not implemented until phase 5)" in str(caught.value)
+    assert "'mqtt' (not a source, and never will be)" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
