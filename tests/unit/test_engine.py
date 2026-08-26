@@ -231,12 +231,29 @@ def test_once_never_continues():
     assert Once().should_continue(batches=1, has_more=True) is False
 
 
-def test_processing_time_refuses_construction_with_a_useful_message():
-    with pytest.raises(DuckstreamError) as caught:
-        ProcessingTime(interval="10s")
-    message = str(caught.value)
-    assert "post-v1" in message
-    assert "cron" in message
+def test_processing_time_is_no_longer_a_trigger_and_no_longer_refuses():
+    """It used to raise "post-v1"; it now exists, and it is not a trigger.
+
+    Kept as a test rather than deleted because both halves are load-bearing.
+    It moved to :mod:`duckstream.daemon` because a trigger is asked "another
+    batch right now?" *after* a non-empty batch commits, so it can never
+    express "nothing is there, wait and look again" -- and expressing it as one
+    would mean blocking inside ``should_continue``, holding the catalog across
+    the wait, which is what ``CONTEXT.md`` 1.6 and 1.25 forbid. The old import
+    path still resolves, because that is what anyone who read the previous
+    docstring will type.
+    """
+    from duckstream.daemon import ProcessingTime as FromDaemon
+
+    assert ProcessingTime is FromDaemon
+    schedule = ProcessingTime("2 seconds")
+    assert schedule.seconds == 2.0
+    assert not hasattr(schedule, "should_continue"), (
+        "a schedule is not a trigger; giving it should_continue would invite "
+        "somebody to pass it to Engine.run, which cannot loop"
+    )
+    with pytest.raises(DuckstreamError, match="interval"):
+        ProcessingTime(interval="10s")   # the grammar wants '10 seconds'
 
 
 # ---------------------------------------------------------------------------
