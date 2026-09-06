@@ -18,10 +18,18 @@ file source never reads, and the broker redelivers everything unacked.
 The price is stated rather than hidden: duplicates. At-least-once means the same
 reading can land in two files, and duckstream does not de-duplicate -- the two
 files genuinely differ and nothing marks one as a repeat. **Exactly-once is over
-files, not over readings.** The marts key on (window, location) and merge, so a
-redelivered reading folds into the window it belonged to; the fact table is an
-unwindowed append and would show it twice, which is the honest outcome for a
-row-level log.
+files, not over readings.**
+
+What saves the tables is that every model is keyed and merges. The marts key on
+(window, location), so a redelivered reading folds into the window it belonged
+to; `fact_accelerometer` is `mode: update` keyed on (timestamp, location), so a
+redelivered reading overwrites the row it already wrote rather than appearing
+twice. A duplicate therefore costs work, not correctness.
+
+Contrast `engine_pipeline`, whose fact is `mode: append`: there a duplicate
+really does show up twice. That is a deliberate trade -- at 500 Hz a keyed
+MERGE against a 43-million-row target is O(table) per batch -- and it is why
+that pipeline surfaces `seq_deficit` on the page instead.
 
 Run it under systemd or a supervisor::
 
