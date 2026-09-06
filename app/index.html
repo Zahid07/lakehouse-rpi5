@@ -240,7 +240,7 @@
   <div class="empty" id="factEmpty">No readings yet.</div>
 </section>
 
-<footer id="foot">read-only · attaches per request so the pipeline is never locked out</footer>
+<footer id="foot">read-only · the catalog is read once per refresh by one background thread; HTTP requests never touch it</footer>
 </div>
 
 <script>
@@ -655,7 +655,7 @@ async function refresh() {
     renderThroughput(throughput);
     renderFact(recent);
     $("foot").textContent =
-      `read-only · attaches per request so the pipeline is never locked out · refreshed ${new Date().toTimeString().slice(0, 8)}`;
+      `read-only · the catalog is read once per refresh by one background thread; HTTP requests never touch it · refreshed ${new Date().toTimeString().slice(0, 8)}`;
   } catch (err) {
     if (err.busy) {
       // Expected: the pipeline holds the catalog for a fraction of each cycle.
