@@ -1,0 +1,22 @@
+# Line endings for duckstream.
+#
+# The package and its suites are LF, declared rather than assumed. They were
+# mixed -- 52 LF against 19 CRLF across the repository, with one file mixed
+# internally -- and that cost real time twice: a batch of edits written back
+# through Python's text mode silently rewrote LF files as CRLF, inflating one
+# review diff from ~2,000 lines to 4,600, and it later made a mutation audit's
+# integrity check ambiguous between "a mutation leaked" and "the endings
+# changed". Neither is a hard failure, which is exactly why it kept happening.
+#
+# Deliberately scoped to duckstream's own directories. The rest of this
+# repository is somebody else's pipeline and normalising it here would be churn
+# nobody asked for; `duckstream/` is destined to be extracted to its own
+# repository, where this becomes a plain `* text=auto eol=lf`.
+
+duckstream/** text=auto eol=lf
+tests/** text=auto eol=lf
+docs/duckstream/** text=auto eol=lf
+
+# Parquet fixtures are written by the suites at runtime and never committed,
+# but say so anyway: a text=auto that guessed wrong on binary would corrupt it.
+*.parquet binary

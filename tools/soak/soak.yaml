@@ -1,0 +1,100 @@
+# duckstream soak configuration -- phase 6.
+#
+# Drives the two numbers PLAN.md phase 6 says are owed and that no session can
+# produce in an afternoon:
+#
+#   * the state store beyond CONTEXT.md 1.3's 6,000 rows. 1.3 measured a plain
+#     DuckDB table flat to 6,000 and said in terms: "if state reaches millions of
+#     open windows, re-measure". Two rows per committed trigger, three with a
+#     horizon, at a trigger a minute, is how you get there.
+#   * the **open-window accumulator**, which has never been measured at all.
+#     Only a windowed `append` model with a lateness horizon builds one, and it
+#     is bounded by the horizon rather than by the age of the stream -- so the
+#     claim to check is that it stays bounded, not that it stays small.
+#
+# `soak_seconds` is deliberately a *minute* grain with a short horizon, so
+# windows seal every few minutes rather than every few hours: the accumulator
+# has to be observed filling and draining many times over, and an hourly grain
+# would give a handful of observations across a whole day.
+
+catalog: "ducklake:${DUCKSTREAM_SOAK}/catalog.ducklake"
+data_path: "${DUCKSTREAM_SOAK}/data"
+
+settings:
+  # 1.7: inlining defaults to 10 rows and captures small batches into DuckLake's
+  # buggiest path. The engine sets this itself; stating it here is documentation.
+  ducklake_default_data_inlining_row_limit: 0
+  memory_limit: "1200MB"
+  threads: 4
+  # 1.24, measured on this Pi: DuckDB otherwise spills to `.tmp` in the process's
+  # CWD -- under cron, wherever the job happened to cd -- on the SD card, up to
+  # 90% of the disk. That turns "over the memory limit" from a loud failure into
+  # a pipeline that is mysteriously slow while it burns card endurance, and it
+  # repeals 1.1's conclusion that memory is bounded by rows in flight. Empty
+  # disables spilling, so the limit is a limit again.
+  temp_directory: ""
+
+models:
+  # ---- tier 1: additive, update mode. Grows the state store. ----------------
+  - name: soak_counts
+    source:
+      type: file
+      path: "${DUCKSTREAM_SOAK}/landing"
+      marker: _READY
+      max_files_per_trigger: 20
+    time_column: timestamp
+    grain: minute
+    key: [window_ts, location]
+    aggregates:
+      n: "count(*)"
+      sum_x: "sum(x)"
+      max_z: "max(z)"
+    sink:
+      type: table
+      table: marts.soak_counts
+      mode: update
+
+  # ---- tier 2: sufficient statistics. Exercises the (n, mean, M2) merge -----
+  # over a genuinely long fold -- thousands of batches rather than the four a
+  # conformance scenario runs. 1.14 is why the state is not (sum, sum_sq, count),
+  # and a soak is the only place accumulated drift would show up.
+  - name: soak_stats
+    source:
+      type: file
+      path: "${DUCKSTREAM_SOAK}/landing"
+      marker: _READY
+      max_files_per_trigger: 20
+    time_column: timestamp
+    grain: minute
+    key: [window_ts, location]
+    aggregates:
+      avg_x: "avg(x)"
+      sd_x: "stddev_samp(x)"
+    sink:
+      type: table
+      table: marts.soak_stats
+      mode: update
+
+  # ---- the accumulator: windowed append with a horizon ---------------------
+  # This is the model the soak exists for. `append` with a `grain` requires a
+  # lateness horizon (refused at load without one, phase 2) because each window
+  # is folded in an open-window accumulator beside the target and written to the
+  # target exactly **once**, when the watermark passes its end. The accumulator
+  # is what has never been measured.
+  - name: soak_sealed
+    source:
+      type: file
+      path: "${DUCKSTREAM_SOAK}/landing"
+      marker: _READY
+      max_files_per_trigger: 20
+    time_column: timestamp
+    grain: minute
+    lateness: "2 minutes"
+    key: [window_ts, location]
+    aggregates:
+      n: "count(*)"
+      avg_x: "avg(x)"
+    sink:
+      type: table
+      table: marts.soak_sealed
+      mode: append
