@@ -39,3 +39,12 @@ metadata.ducklake.files/
 # Keep env templates/versioned config if needed
 # (ignore local overrides only)
 config/*.local.env
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# The mutation audit writes its results here; the worktrees it uses live in
+# the system temp directory, not in the repository. See tools/mutation/README.md.
+tools/mutation/audit_results.json

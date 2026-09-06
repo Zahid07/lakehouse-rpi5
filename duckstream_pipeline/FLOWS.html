@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How the accelerometer pipeline works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+  :root{
+    --ground:#F6F7F9; --surface:#FFFFFF; --surface-2:#EDF0F4;
+    --ink:#161B22; --ink-soft:#3A4553; --muted:#626E7E;
+    --rule:#DCE2EA; --rule-strong:#C3CCD8;
+    --accent:#0B6E78; --accent-soft:#E1EFF0;
+    --hot:#9A6414; --hot-soft:#F6EDDC;
+    --cool:#3A6F4F; --cool-soft:#E4EFE7;
+    --alert:#9B3F52; --alert-soft:#F7E7EA;
+    --code-bg:#F0F3F7;
+    --shadow:0 1px 2px rgba(22,27,34,.05),0 8px 24px rgba(22,27,34,.06);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#10141A; --surface:#171C24; --surface-2:#1E242E;
+      --ink:#E6EAF0; --ink-soft:#BDC6D2; --muted:#8B97A6;
+      --rule:#2A323D; --rule-strong:#3B4451;
+      --accent:#48B7C1; --accent-soft:#15323A;
+      --hot:#D7A34F; --hot-soft:#332715;
+      --cool:#6FBF8D; --cool-soft:#17301F;
+      --alert:#DE8496; --alert-soft:#351C22;
+      --code-bg:#1B212A;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#10141A; --surface:#171C24; --surface-2:#1E242E;
+    --ink:#E6EAF0; --ink-soft:#BDC6D2; --muted:#8B97A6;
+    --rule:#2A323D; --rule-strong:#3B4451;
+    --accent:#48B7C1; --accent-soft:#15323A;
+    --hot:#D7A34F; --hot-soft:#332715;
+    --cool:#6FBF8D; --cool-soft:#17301F;
+    --alert:#DE8496; --alert-soft:#351C22;
+    --code-bg:#1B212A;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.28);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:0 1.5rem 6rem;background:var(--ground);color:var(--ink);
+    font-family:"Source Serif 4",Georgia,serif;font-size:17px;line-height:1.62;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1120px;margin:0 auto}
+  .col{max-width:68ch}
+  header{padding:4rem 0 2.2rem;border-bottom:2px solid var(--ink);margin-bottom:2.4rem}
+  .eyebrow{font-family:"Archivo",sans-serif;font-size:.72rem;font-weight:600;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 1rem}
+  h1{font-family:"Archivo",sans-serif;font-weight:700;font-size:clamp(2rem,4.8vw,2.9rem);
+    line-height:1.07;letter-spacing:-.022em;text-wrap:balance;margin:0 0 1rem}
+  .standfirst{font-size:1.14rem;color:var(--ink-soft);max-width:62ch;margin:0}
+  h2{font-family:"Archivo",sans-serif;font-weight:600;font-size:1.5rem;
+    letter-spacing:-.012em;text-wrap:balance;margin:3.2rem 0 .3rem;padding-top:1.4rem;
+    border-top:1px solid var(--rule)}
+  h3{font-family:"Archivo",sans-serif;font-weight:600;font-size:1.05rem;margin:1.9rem 0 .5rem}
+  .kicker{font-family:"Archivo",sans-serif;font-size:.7rem;font-weight:600;
+    letter-spacing:.13em;text-transform:uppercase;color:var(--muted);margin:0 0 1.4rem}
+  p{margin:0 0 1.05rem}
+  code{font-family:"JetBrains Mono",ui-monospace,monospace;font-size:.85em;
+    background:var(--code-bg);padding:.1em .36em;border-radius:3px}
+  figure{margin:1.9rem 0 1rem;background:var(--surface);border:1px solid var(--rule);
+    border-radius:8px;padding:1.5rem 1.3rem 1.1rem;box-shadow:var(--shadow);overflow-x:auto}
+  figcaption{font-family:"Archivo",sans-serif;font-size:.75rem;color:var(--muted);
+    margin-top:1rem;padding-top:.85rem;border-top:1px solid var(--rule);line-height:1.5}
+  svg{display:block;max-width:100%;height:auto}
+  .l{font-family:"Archivo",sans-serif;font-size:11px;font-weight:600;
+    letter-spacing:.06em;text-transform:uppercase}
+  .m{font-family:"JetBrains Mono",monospace;font-size:11px}
+  .s{font-family:"JetBrains Mono",monospace;font-size:10px}
+  .tablewrap{overflow-x:auto;margin:1.4rem 0}
+  table{width:100%;border-collapse:collapse;font-family:"Archivo",sans-serif;
+    font-size:.86rem;font-variant-numeric:tabular-nums}
+  th{text-align:left;font-size:.68rem;font-weight:600;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--muted);padding:0 .8rem .55rem 0;
+    border-bottom:1.5px solid var(--rule-strong);white-space:nowrap}
+  td{padding:.66rem .8rem .66rem 0;border-bottom:1px solid var(--rule);
+    vertical-align:top;color:var(--ink-soft)}
+  td:first-child{color:var(--ink);font-weight:500}
+  pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:5px;
+    padding:.95rem 1.1rem;overflow-x:auto;margin:.9rem 0 1.3rem;
+    font-family:"JetBrains Mono",monospace;font-size:.78rem;line-height:1.6;color:var(--ink)}
+  pre .c{color:var(--muted)} pre .h{color:var(--accent);font-weight:600}
+  .note{border-left:3px solid var(--accent);background:var(--surface);
+    padding:1.05rem 1.25rem;margin:1.6rem 0;border-radius:0 5px 5px 0}
+  .note.warn{border-left-color:var(--alert)}
+  .note .hd{font-family:"Archivo",sans-serif;font-size:.68rem;font-weight:600;
+    letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 .4rem}
+  .note.warn .hd{color:var(--alert)}
+  .note p:last-child{margin-bottom:0}
+  ul{margin:0 0 1.05rem;padding-left:1.25rem} li{margin-bottom:.4rem}
+  footer{margin-top:3.5rem;padding-top:1.4rem;border-top:1px solid var(--rule);
+    font-family:"Archivo",sans-serif;font-size:.78rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">duckstream_pipeline &middot; accelerometer &middot; Raspberry Pi 5</p>
+  <h1>How the pipeline works</h1>
+  <p class="standfirst">Two processes, one landing tree, three models and a star schema. Every number on this page was measured on this machine.</p>
+</header>
+
+<div class="col">
+<h2>The whole thing, end to end</h2>
+<p class="kicker">Sensor to queryable table</p>
+<p>Two processes that never talk to each other directly. They meet at the landing tree &mdash; ordinary parquet files on disk &mdash; and that meeting point is what makes the whole design work.</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1080 300" role="img" aria-label="End-to-end flow from sensor through ingest and the landing tree into the lakehouse">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/></marker></defs>
+
+  <rect x="6" y="104" width="104" height="66" rx="6" fill="var(--surface-2)" stroke="var(--rule-strong)"/>
+  <text x="58" y="130" text-anchor="middle" class="l" fill="var(--ink)">Sensor</text>
+  <text x="58" y="149" text-anchor="middle" class="s" fill="var(--muted)">~100 / second</text>
+  <line x1="112" y1="137" x2="146" y2="137" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="129" y="128" text-anchor="middle" class="s" fill="var(--muted)">MQTT</text>
+
+  <!-- process 1 -->
+  <rect x="148" y="70" width="188" height="134" rx="7" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+  <text x="242" y="60" text-anchor="middle" class="l" fill="var(--accent)">Process 1</text>
+  <text x="242" y="96" text-anchor="middle" class="l" fill="var(--accent)">ingest.py</text>
+  <text x="242" y="118" text-anchor="middle" class="s" fill="var(--ink-soft)">buffer in memory</text>
+  <text x="242" y="134" text-anchor="middle" class="s" fill="var(--ink-soft)">2,000 rows or 5 s</text>
+  <text x="242" y="153" text-anchor="middle" class="s" fill="var(--ink-soft)">temp &rarr; rename</text>
+  <text x="242" y="169" text-anchor="middle" class="s" fill="var(--ink-soft)">&rarr; _READY marker</text>
+  <text x="242" y="190" text-anchor="middle" class="s" fill="var(--accent)">ack only when durable</text>
+
+  <line x1="338" y1="137" x2="372" y2="137" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- landing -->
+  <rect x="374" y="86" width="150" height="102" rx="7" fill="var(--cool-soft)" stroke="var(--cool)" stroke-width="2"/>
+  <text x="449" y="76" text-anchor="middle" class="l" fill="var(--cool)">The seam</text>
+  <text x="449" y="112" text-anchor="middle" class="l" fill="var(--cool)">landing/</text>
+  <text x="449" y="133" text-anchor="middle" class="s" fill="var(--ink-soft)">data.parquet</text>
+  <text x="449" y="148" text-anchor="middle" class="s" fill="var(--ink-soft)">_READY</text>
+  <text x="449" y="170" text-anchor="middle" class="s" fill="var(--cool)">replayable</text>
+
+  <line x1="526" y1="137" x2="560" y2="137" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- process 2 -->
+  <rect x="562" y="70" width="196" height="134" rx="7" fill="var(--hot-soft)" stroke="var(--hot)" stroke-width="2"/>
+  <text x="660" y="60" text-anchor="middle" class="l" fill="var(--hot)">Process 2</text>
+  <text x="660" y="96" text-anchor="middle" class="l" fill="var(--hot)">pipeline.py</text>
+  <text x="660" y="118" text-anchor="middle" class="s" fill="var(--ink-soft)">every 3 seconds</text>
+  <text x="660" y="134" text-anchor="middle" class="s" fill="var(--ink-soft)">3 models + SCD2</text>
+  <text x="660" y="153" text-anchor="middle" class="s" fill="var(--ink-soft)">one transaction</text>
+  <text x="660" y="169" text-anchor="middle" class="s" fill="var(--ink-soft)">one snapshot</text>
+  <text x="660" y="190" text-anchor="middle" class="s" fill="var(--hot)">exactly-once</text>
+
+  <line x1="760" y1="137" x2="794" y2="137" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a)"/>
+
+  <!-- lakehouse -->
+  <rect x="796" y="70" width="180" height="134" rx="7" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+  <text x="886" y="96" text-anchor="middle" class="l" fill="var(--accent)">DuckLake</text>
+  <text x="886" y="118" text-anchor="middle" class="s" fill="var(--ink-soft)">fact_accelerometer</text>
+  <text x="886" y="134" text-anchor="middle" class="s" fill="var(--ink-soft)">accel_hourly_summary</text>
+  <text x="886" y="150" text-anchor="middle" class="s" fill="var(--ink-soft)">accel_minute_spectrum</text>
+  <text x="886" y="166" text-anchor="middle" class="s" fill="var(--ink-soft)">location_dim</text>
+  <text x="886" y="190" text-anchor="middle" class="s" fill="var(--accent)">+ 3 views</text>
+
+  <!-- guarantees band -->
+  <text x="242" y="240" text-anchor="middle" class="m" fill="var(--accent)">at-least-once</text>
+  <text x="242" y="258" text-anchor="middle" class="s" fill="var(--muted)">may repeat, never loses</text>
+  <text x="660" y="240" text-anchor="middle" class="m" fill="var(--hot)">exactly-once</text>
+  <text x="660" y="258" text-anchor="middle" class="s" fill="var(--muted)">never repeats, never loses</text>
+  <line x1="148" y1="216" x2="336" y2="216" stroke="var(--accent)" stroke-width="2"/>
+  <line x1="562" y1="216" x2="976" y2="216" stroke="var(--hot)" stroke-width="2"/>
+  <text x="449" y="222" text-anchor="middle" class="s" fill="var(--cool)">files convert one into the other</text>
+</svg>
+<figcaption><strong>Why the seam exists.</strong> MQTT cannot be replayed &mdash; once a message is acknowledged the broker has thrown it away, so there is no position to resume from after a crash. Files can be re-read. Landing durably to disk first is what turns an unrepeatable stream into a replayable source, and only then can the second half promise exactly-once.</figcaption>
+</figure>
+
+<div class="col">
+<h2>Why two processes and not one</h2>
+<p class="kicker">They have different jobs and different uptime requirements</p>
+<p>The sensor sends about a hundred readings a second. A DuckLake commit costs <strong>~26&nbsp;ms</strong> on this machine, so writing each reading straight to the database caps out around 35 a second &mdash; you would fall behind immediately and never recover. And every commit writes its own parquet file and catalog snapshot, so you would also produce millions of tiny files a day.</p>
+<p>Ingest absorbs that: it holds readings in memory and writes them out in batches, turning 2,000 readings into one file instead of 2,000 writes.</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1080 210" role="img" aria-label="What happens when each process stops">
+  <text x="6" y="24" class="l" fill="var(--ink)">If one stops</text>
+
+  <rect x="6" y="44" width="516" height="140" rx="7" fill="var(--alert-soft)" stroke="var(--alert)"/>
+  <text x="26" y="72" class="l" fill="var(--alert)">ingest stops</text>
+  <text x="26" y="100" class="m" fill="var(--ink)">Every reading published meanwhile is gone.</text>
+  <text x="26" y="122" class="s" fill="var(--ink-soft)">MQTT discards anything nobody is subscribed for. There is</text>
+  <text x="26" y="138" class="s" fill="var(--ink-soft)">no backlog on the broker to catch up from later.</text>
+  <text x="26" y="166" class="m" fill="var(--alert)">&rarr; must run continuously</text>
+
+  <rect x="546" y="44" width="528" height="140" rx="7" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="566" y="72" class="l" fill="var(--cool)">pipeline stops</text>
+  <text x="566" y="100" class="m" fill="var(--ink)">Nothing is lost. Files pile up in landing.</text>
+  <text x="566" y="122" class="s" fill="var(--ink-soft)">On restart it reads its committed offset, drains the backlog</text>
+  <text x="566" y="138" class="s" fill="var(--ink-soft)">and catches up. The marts are simply behind for a while.</text>
+  <text x="566" y="166" class="m" fill="var(--cool)">&rarr; safe to restart any time</text>
+</svg>
+<figcaption><strong>This asymmetry is the reason they are separate.</strong> Restarting the pipeline to change a mart, fix SQL or deploy a new model must never risk dropping live readings &mdash; and because ingest is a different process, it cannot.</figcaption>
+</figure>
+
+<div class="col">
+<h2>One pipeline cycle, step by step</h2>
+<p class="kicker">What happens every three seconds</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1080 300" role="img" aria-label="The six steps of one pipeline cycle">
+  <defs><marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/></marker></defs>
+
+  <g class="s" fill="var(--muted)">
+    <text x="86" y="30" text-anchor="middle">~11 ms</text>
+    <text x="256" y="30" text-anchor="middle">the work</text>
+    <text x="600" y="30" text-anchor="middle">only if new locations</text>
+    <text x="800" y="30" text-anchor="middle">only if missing</text>
+    <text x="940" y="30" text-anchor="middle">releases the lock</text>
+  </g>
+
+  <rect x="18" y="44" width="136" height="74" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="86" y="72" text-anchor="middle" class="l" fill="var(--accent)">1 &middot; Attach</text>
+  <text x="86" y="94" text-anchor="middle" class="s" fill="var(--ink-soft)">open the catalog</text>
+  <text x="86" y="109" text-anchor="middle" class="s" fill="var(--ink-soft)">take the lock</text>
+  <line x1="156" y1="81" x2="184" y2="81" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#b)"/>
+
+  <rect x="186" y="44" width="330" height="150" rx="6" fill="var(--hot-soft)" stroke="var(--hot)"/>
+  <text x="351" y="72" text-anchor="middle" class="l" fill="var(--hot)">2 &middot; Drain &mdash; three models</text>
+  <rect x="202" y="86" width="298" height="26" rx="4" fill="var(--surface)" stroke="var(--rule)"/>
+  <text x="212" y="103" class="s" fill="var(--ink)">fact_accelerometer &mdash; every reading, merged by key</text>
+  <rect x="202" y="118" width="298" height="26" rx="4" fill="var(--surface)" stroke="var(--rule)"/>
+  <text x="212" y="135" class="s" fill="var(--ink)">accel_hourly_summary &mdash; folds into the hour</text>
+  <rect x="202" y="150" width="298" height="26" rx="4" fill="var(--surface)" stroke="var(--rule)"/>
+  <text x="212" y="167" class="s" fill="var(--ink)">accel_minute_spectrum &mdash; rebuilds the minute</text>
+  <line x1="518" y1="81" x2="546" y2="81" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#b)"/>
+
+  <rect x="548" y="44" width="152" height="74" rx="6" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="624" y="72" text-anchor="middle" class="l" fill="var(--cool)">3 &middot; Dimension</text>
+  <text x="624" y="94" text-anchor="middle" class="s" fill="var(--ink-soft)">new keys, SCD2</text>
+  <text x="624" y="109" text-anchor="middle" class="s" fill="var(--ink-soft)">skipped if nothing new</text>
+  <line x1="702" y1="81" x2="730" y2="81" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#b)"/>
+
+  <rect x="732" y="44" width="132" height="74" rx="6" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="798" y="72" text-anchor="middle" class="l" fill="var(--cool)">4 &middot; Views</text>
+  <text x="798" y="94" text-anchor="middle" class="s" fill="var(--ink-soft)">create if absent</text>
+  <text x="798" y="109" text-anchor="middle" class="s" fill="var(--ink-soft)">else skipped</text>
+  <line x1="866" y1="81" x2="894" y2="81" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#b)"/>
+
+  <rect x="896" y="44" width="166" height="74" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="979" y="72" text-anchor="middle" class="l" fill="var(--accent)">5 &middot; Detach</text>
+  <text x="979" y="94" text-anchor="middle" class="s" fill="var(--ink-soft)">close the catalog</text>
+  <text x="979" y="109" text-anchor="middle" class="s" fill="var(--ink-soft)">others can read</text>
+
+  <path d="M979 122 L979 214 L86 214 L86 126" fill="none" stroke="var(--muted)"
+        stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#b)"/>
+  <rect x="452" y="198" width="180" height="32" rx="5" fill="var(--surface)" stroke="var(--rule-strong)"/>
+  <text x="542" y="219" text-anchor="middle" class="m" fill="var(--ink)">6 &middot; sleep the remainder</text>
+
+  <text x="18" y="268" class="s" fill="var(--muted)">Idle cycle ~540 ms &middot; cycle with data ~1.5 s &middot; catalog held only during steps 1&ndash;5,</text>
+  <text x="18" y="284" class="s" fill="var(--muted)">so at a 2-second interval an outside reader got in on 33 of 38 attempts &mdash; about 86% of the time.</text>
+</svg>
+<figcaption><strong>Steps 3 and 4 are conditional, and that matters.</strong> An earlier version ran them unconditionally: <code>CREATE TABLE IF NOT EXISTS</code>, <code>CREATE OR REPLACE VIEW</code> and an empty SCD2 transaction each write a catalog snapshot <em>even when nothing changes</em>. That was three snapshots per idle cycle &mdash; about 130,000 a day on a pipeline doing nothing. Now an idle cycle writes zero.</figcaption>
+</figure>
+
+<div class="col">
+<h2>The three models</h2>
+<p class="kicker">Same data, three different problems</p>
+<p>Each model reads the same landing files and produces a different table. What separates them is whether their maths can be <em>folded</em> &mdash; whether a new batch can be combined into an existing answer without re-reading what came before.</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1080 330" role="img" aria-label="How each of the three models handles a new batch">
+  <rect x="6" y="126" width="132" height="70" rx="6" fill="var(--surface-2)" stroke="var(--rule-strong)"/>
+  <text x="72" y="154" text-anchor="middle" class="l" fill="var(--ink)">New batch</text>
+  <text x="72" y="174" text-anchor="middle" class="s" fill="var(--muted)">from landing</text>
+
+  <g stroke="var(--muted)" stroke-width="1.3" fill="none">
+    <path d="M140 150 L186 62"/><path d="M140 161 L186 161"/><path d="M140 172 L186 262"/>
+  </g>
+
+  <!-- tier 1 -->
+  <rect x="188" y="30" width="880" height="66" rx="6" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="206" y="54" class="l" fill="var(--cool)">fact_accelerometer &nbsp;&middot;&nbsp; additive</text>
+  <text x="206" y="76" class="s" fill="var(--ink-soft)">Every reading kept. Merged on (timestamp, location), so a message the broker sends twice becomes one row.</text>
+  <text x="900" y="60" class="m" fill="var(--cool)">no re-reading</text>
+
+  <!-- tier 2 -->
+  <rect x="188" y="128" width="880" height="66" rx="6" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="206" y="152" class="l" fill="var(--cool)">accel_hourly_summary &nbsp;&middot;&nbsp; sufficient statistics</text>
+  <text x="206" y="174" class="s" fill="var(--ink-soft)">Keeps a running count, mean and spread per hour, so a new batch folds in. The hour is never read again.</text>
+  <text x="900" y="158" class="m" fill="var(--cool)">no re-reading</text>
+
+  <!-- tier 3 -->
+  <rect x="188" y="226" width="880" height="80" rx="6" fill="var(--hot-soft)" stroke="var(--hot)"/>
+  <text x="206" y="250" class="l" fill="var(--hot)">accel_minute_spectrum &nbsp;&middot;&nbsp; non-foldable</text>
+  <text x="206" y="272" class="s" fill="var(--ink-soft)">An FFT cannot be folded: two half-spectra do not combine into the spectrum of the whole. So the entire</text>
+  <text x="206" y="288" class="s" fill="var(--ink-soft)">minute is re-read from the files it came from and recomputed.</text>
+  <text x="880" y="262" class="m" fill="var(--hot)">reads the whole window</text>
+</svg>
+<figcaption><strong>This is why the log sometimes shows the spectrum reading more rows than the others.</strong> A batch of 400 readings landing in a busy minute makes it re-read that whole minute &mdash; perhaps 1,900 rows. That is correct: its cost follows the <em>window</em>, not the batch. Turning the batch size down makes it worse, not better, because the same minute gets rebuilt more often.</figcaption>
+</figure>
+
+<div class="note warn">
+  <p class="hd">The mistake this prevents</p>
+  <p>Before duckstream, the FFT mart transformed only the rows in the current batch. A one-minute window fed by 30-second dumps produced a spectrum over <em>half</em> a window &mdash; <strong>51 frequency bins where the truth was 201</strong> &mdash; and it never raised an error. It was simply wrong. duckstream refuses to fold an FFT at load time, before a single row moves, which is why that mart now has to recompute the window.</p>
+</div>
+
+<div class="col">
+<h2>Where the keys live</h2>
+<p class="kicker">The star schema, and why the fact does not carry the surrogate key</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1080 300" role="img" aria-label="Natural keys in the tables, surrogate keys joined on by the views">
+  <defs><marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/></marker></defs>
+
+  <text x="10" y="26" class="l" fill="var(--muted)">What duckstream writes</text>
+  <rect x="10" y="40" width="320" height="86" rx="6" fill="var(--surface-2)" stroke="var(--rule-strong)"/>
+  <text x="26" y="64" class="m" fill="var(--ink)">curated.fact_accelerometer</text>
+  <text x="26" y="86" class="s" fill="var(--ink-soft)">timestamp, <tspan fill="var(--accent)">location</tspan>, x, y, z, magnitude</text>
+  <text x="26" y="108" class="s" fill="var(--muted)">natural key only &mdash; the location name</text>
+
+  <rect x="10" y="146" width="320" height="86" rx="6" fill="var(--surface-2)" stroke="var(--rule-strong)"/>
+  <text x="26" y="170" class="m" fill="var(--ink)">marts.accel_hourly_summary</text>
+  <text x="26" y="192" class="s" fill="var(--ink-soft)">window_ts, <tspan fill="var(--accent)">location</tspan>, sample_count, avg_…</text>
+  <text x="26" y="214" class="s" fill="var(--muted)">natural key only</text>
+
+  <text x="392" y="26" class="l" fill="var(--muted)">What the SCD2 step writes</text>
+  <rect x="392" y="86" width="264" height="106" rx="6" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="408" y="110" class="m" fill="var(--cool)">curated.location_dim</text>
+  <text x="408" y="132" class="s" fill="var(--ink-soft)"><tspan fill="var(--cool)">location_key</tspan>, location_name,</text>
+  <text x="408" y="148" class="s" fill="var(--ink-soft)">city, country, is_current,</text>
+  <text x="408" y="164" class="s" fill="var(--ink-soft)">valid_from, valid_to, oper</text>
+  <text x="408" y="184" class="s" fill="var(--cool)">the surrogate key lives here</text>
+
+  <line x1="332" y1="83" x2="388" y2="120" stroke="var(--muted)" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#c)"/>
+  <line x1="332" y1="189" x2="388" y2="160" stroke="var(--muted)" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#c)"/>
+
+  <line x1="658" y1="139" x2="712" y2="139" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#c)"/>
+  <text x="685" y="130" text-anchor="middle" class="s" fill="var(--muted)">join</text>
+
+  <text x="716" y="26" class="l" fill="var(--muted)">What you query</text>
+  <rect x="716" y="40" width="352" height="86" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+  <text x="732" y="64" class="m" fill="var(--accent)">curated.v_fact_accelerometer</text>
+  <text x="732" y="86" class="s" fill="var(--ink-soft)">timestamp, <tspan fill="var(--accent)">location_key</tspan>, location_name,</text>
+  <text x="732" y="102" class="s" fill="var(--ink-soft)">x, y, z, magnitude</text>
+
+  <rect x="716" y="146" width="352" height="106" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+  <text x="732" y="170" class="m" fill="var(--accent)">marts.v_accel_hourly_summary</text>
+  <text x="732" y="192" class="s" fill="var(--ink-soft)">hour_ts, <tspan fill="var(--accent)">location_key</tspan>, location_name, city,</text>
+  <text x="732" y="208" class="s" fill="var(--ink-soft)">country, sample_count, avg_… (rounded)</text>
+  <text x="732" y="232" class="s" fill="var(--accent)">exactly your old mart's columns</text>
+
+  <text x="10" y="272" class="s" fill="var(--muted)">Always query the views. The raw mart also carries duckstream's running-average state in columns named _ds_…;</text>
+  <text x="10" y="288" class="s" fill="var(--muted)">that is how it folds a new batch into an existing hour, and it is not meant to be read directly.</text>
+</svg>
+<figcaption><strong>Two reasons the key is joined rather than stored.</strong> duckstream commits rows and the source position in one transaction &mdash; that is what makes exactly-once work &mdash; and a key assigned by a different process in a different transaction cannot join that commit. And a view is always current: the old mart copied <code>city</code> into every row, so correcting a city left every finished hour stale for ever. This one picks up the correction immediately.</figcaption>
+</figure>
+
+<div class="col">
+<h2>Where the timings come from</h2>
+<p class="kicker">Nothing is instrumented &mdash; the engine already records it</p>
+<p>The dashboard's throughput table adds no timers of its own. Both halves of every figure come from tables duckstream writes as part of committing a batch, and they only needed joining.</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1080 250" role="img" aria-label="How batch timings and chunk sizes are joined into throughput figures">
+  <defs><marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/></marker></defs>
+
+  <rect x="10" y="34" width="330" height="82" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="28" y="58" class="m" fill="var(--accent)">duckstream.batches</text>
+  <text x="28" y="80" class="s" fill="var(--ink-soft)">model_name, batch_id,</text>
+  <text x="28" y="95" class="s" fill="var(--ink-soft)">started_at, committed_at, rows_in, rows_out</text>
+  <text x="28" y="110" class="s" fill="var(--accent)">one row per batch per model</text>
+
+  <rect x="10" y="134" width="330" height="82" rx="6" fill="var(--cool-soft)" stroke="var(--cool)"/>
+  <text x="28" y="158" class="m" fill="var(--cool)">duckstream.consumed_files</text>
+  <text x="28" y="180" class="s" fill="var(--ink-soft)">model_name, batch_id,</text>
+  <text x="28" y="195" class="s" fill="var(--ink-soft)">relpath, size (bytes), n_rows</text>
+  <text x="28" y="210" class="s" fill="var(--cool)">one row per chunk per model</text>
+
+  <path d="M344 75 L410 110" fill="none" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#m1)"/>
+  <path d="M344 175 L410 140" fill="none" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#m1)"/>
+  <text x="378" y="100" text-anchor="middle" class="s" fill="var(--muted)">join on</text>
+  <text x="378" y="160" text-anchor="middle" class="s" fill="var(--muted)">(model, batch_id)</text>
+
+  <rect x="414" y="88" width="270" height="74" rx="6" fill="var(--surface-2)" stroke="var(--rule-strong)"/>
+  <text x="549" y="112" text-anchor="middle" class="l" fill="var(--ink)">one row per batch</text>
+  <text x="549" y="133" text-anchor="middle" class="s" fill="var(--muted)">chunks = count(relpath)</text>
+  <text x="549" y="148" text-anchor="middle" class="s" fill="var(--muted)">bytes = sum(size)</text>
+
+  <line x1="686" y1="125" x2="724" y2="125" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#m1)"/>
+
+  <rect x="728" y="60" width="340" height="130" rx="6" fill="var(--hot-soft)" stroke="var(--hot)"/>
+  <text x="898" y="84" text-anchor="middle" class="l" fill="var(--hot)">the throughput table</text>
+  <text x="748" y="108" class="s" fill="var(--ink-soft)">TOOK   = committed_at &minus; started_at</text>
+  <text x="748" y="126" class="s" fill="var(--ink-soft)">rows/s = rows_in &divide; TOOK</text>
+  <text x="748" y="144" class="s" fill="var(--ink-soft)">MB/s   = bytes &divide; TOOK</text>
+  <text x="748" y="170" class="s" fill="var(--hot)">the engine's own numbers, not the page's</text>
+</svg>
+<figcaption><strong>No timers were added and nothing runs in the hot path.</strong> duckstream records <code>started_at</code> and <code>committed_at</code> because it keeps a batch history anyway, and <code>consumed_files</code> carries each chunk&rsquo;s <code>size</code> because the file source needs it to detect a rewrite. Throughput is a join over two tables that already existed.</figcaption>
+</figure>
+
+<div class="col">
+<h3>What <code>TOOK</code> includes &mdash; and the two things it does not</h3>
+</div>
+
+<figure>
+<svg viewBox="0 0 1080 260" role="img" aria-label="Timeline of one batch showing what the TOOK measurement spans">
+  <text x="10" y="24" class="l" fill="var(--ink)">One batch, one model</text>
+
+  <line x1="140" y1="150" x2="1000" y2="150" stroke="var(--rule-strong)" stroke-width="1"/>
+
+  <rect x="140" y="60" width="700" height="46" rx="4" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.6"/>
+  <text x="490" y="88" text-anchor="middle" class="l" fill="var(--accent)">TOOK &mdash; what the column reports</text>
+
+  <g class="s" fill="var(--ink-soft)">
+    <text x="152" y="128">bind view</text>
+    <text x="290" y="128">scan counts</text>
+    <text x="440" y="128">aggregate</text>
+    <text x="590" y="128">write sink</text>
+    <text x="716" y="128">record rows</text>
+  </g>
+  <g stroke="var(--rule-strong)" stroke-dasharray="3 3">
+    <line x1="282" y1="106" x2="282" y2="150"/><line x1="430" y1="106" x2="430" y2="150"/>
+    <line x1="580" y1="106" x2="580" y2="150"/><line x1="706" y1="106" x2="706" y2="150"/>
+  </g>
+
+  <line x1="140" y1="150" x2="140" y2="182" stroke="var(--accent)" stroke-width="2"/>
+  <text x="140" y="200" text-anchor="middle" class="m" fill="var(--accent)">started_at</text>
+  <text x="140" y="216" text-anchor="middle" class="s" fill="var(--muted)">after planning,</text>
+  <text x="140" y="230" text-anchor="middle" class="s" fill="var(--muted)">before binding</text>
+
+  <line x1="840" y1="150" x2="840" y2="182" stroke="var(--accent)" stroke-width="2"/>
+  <text x="840" y="200" text-anchor="middle" class="m" fill="var(--accent)">committed_at</text>
+  <text x="840" y="216" text-anchor="middle" class="s" fill="var(--muted)">inside the transaction,</text>
+  <text x="840" y="230" text-anchor="middle" class="s" fill="var(--muted)">just before COMMIT</text>
+
+  <rect x="844" y="60" width="156" height="46" rx="4" fill="var(--alert-soft)" stroke="var(--alert)" stroke-dasharray="4 3"/>
+  <text x="922" y="80" text-anchor="middle" class="l" fill="var(--alert)">COMMIT</text>
+  <text x="922" y="98" text-anchor="middle" class="s" fill="var(--alert)">~26 ms &mdash; NOT counted</text>
+
+  <text x="10" y="252" class="s" fill="var(--muted)">A transaction cannot know when it finished, so the only timestamp available from inside it is the moment COMMIT was issued. TOOK is therefore a slight under-estimate of wall clock.</text>
+</svg>
+<figcaption><strong>Two exclusions, both worth knowing.</strong> The DuckLake commit &mdash; measured at ~26&nbsp;ms on this Pi and often the largest single term &mdash; falls outside the number, because nothing inside a transaction can stamp the moment it ends. And <code>TOOK</code> is <em>per model</em>: one chunk produces three rows, so a whole cycle is roughly the three plus three commits. That is why the pipeline log shows ~1,000&nbsp;ms for a cycle while the batches read 70&ndash;120&nbsp;ms each &mdash; the gap is the commit floor, three times over.</figcaption>
+</figure>
+
+<div class="col">
+<h2>The dashboard, and the bug that shaped it</h2>
+<p class="kicker">A reader that starved the writer</p>
+<p>The catalog admits one process at a time, so a dashboard reading it competes with the pipeline writing it. The obvious design &mdash; attach per request &mdash; lost that competition in the wrong direction.</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1080 300" role="img" aria-label="Attach-per-request starved the pipeline; a cached snapshot with push does not">
+  <text x="10" y="24" class="l" fill="var(--alert)">First attempt &mdash; attach per request</text>
+  <rect x="10" y="36" width="1058" height="96" rx="7" fill="var(--alert-soft)" stroke="var(--alert)"/>
+  <text x="30" y="62" class="m" fill="var(--ink)">one open page = 4 requests every 3 s = 4 attaches. Two pages = 8.</text>
+  <text x="30" y="84" class="s" fill="var(--ink-soft)">The reader retried on conflict; the pipeline has no retry at all, so every collision went the reader&rsquo;s way.</text>
+  <text x="30" y="110" class="m" fill="var(--alert)">Measured: API 60/60 succeeded &nbsp;&middot;&nbsp; pipeline 6 of 8 cycles FAILED</text>
+
+  <text x="10" y="164" class="l" fill="var(--cool)">Now &mdash; one cached read, pushed by the pipeline</text>
+  <rect x="10" y="176" width="1058" height="112" rx="7" fill="var(--cool-soft)" stroke="var(--cool)"/>
+
+  <rect x="30" y="196" width="150" height="52" rx="5" fill="var(--surface)" stroke="var(--rule-strong)"/>
+  <text x="105" y="218" text-anchor="middle" class="s" fill="var(--ink)">browsers</text>
+  <text x="105" y="236" text-anchor="middle" class="s" fill="var(--muted)">any number</text>
+  <line x1="182" y1="222" x2="216" y2="222" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#m1)"/>
+
+  <rect x="220" y="196" width="170" height="52" rx="5" fill="var(--surface)" stroke="var(--rule-strong)"/>
+  <text x="305" y="218" text-anchor="middle" class="s" fill="var(--ink)">cached snapshot</text>
+  <text x="305" y="236" text-anchor="middle" class="s" fill="var(--muted)">no catalog contact</text>
+  <line x1="392" y1="222" x2="426" y2="222" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#m1)"/>
+
+  <rect x="430" y="196" width="190" height="52" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="525" y="218" text-anchor="middle" class="s" fill="var(--accent)">one refresher thread</text>
+  <text x="525" y="236" text-anchor="middle" class="s" fill="var(--muted)">single attach, then detach</text>
+
+  <path d="M760 248 L640 232" fill="none" stroke="var(--cool)" stroke-width="1.6" marker-end="url(#m1)"/>
+  <rect x="764" y="196" width="290" height="52" rx="5" fill="var(--surface)" stroke="var(--cool)"/>
+  <text x="909" y="216" text-anchor="middle" class="s" fill="var(--cool)">pipeline: POST /api/refresh after each cycle</text>
+  <text x="909" y="234" text-anchor="middle" class="s" fill="var(--muted)">fired after DETACH &mdash; the catalog is provably free</text>
+</svg>
+<figcaption><strong>Push is about the lock, not about freshness.</strong> A timer picks its moment blindly and can attach mid-write, which on a single-attach catalog is not a slow read but a failed pipeline cycle. The notification fires from <code>on_cycle</code>, which runs after <code>Engine.close()</code> &mdash; so the read it triggers is the one read that cannot collide. Measured: cache age falls to 0.1&ndash;0.6&nbsp;s after each cycle, and the pipeline reports zero errors. The 15&nbsp;s timer remains only for when no notification arrives.</figcaption>
+</figure>
+
+<div class="col">
+<h2>Two numbers that were wrong</h2>
+<p class="kicker">Both read reassuringly while measuring the wrong thing</p>
+</div>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Showed</th><th>Why it was wrong</th><th>Now</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>&ldquo;Waiting in landing&rdquo;</td>
+      <td>Counted <em>every</em> chunk on disk. The pipeline never deletes a consumed chunk &mdash; a tier-three model reads them back to recompute a window &mdash; so it only ever grew. It measured uptime, not backlog.</td>
+      <td><strong>Chunks processed</strong> and <strong>Chunks remaining</strong>. A chunk counts as processed only when <em>every</em> model has taken it; reporting the fastest would show zero while a slower model was still behind.</td>
+    </tr>
+    <tr>
+      <td>Throughput total, 3&times; too high</td>
+      <td>Summed <code>rows_in</code> across models, and every model reads every chunk. 139,928 readings displayed as 419,784 &mdash; disagreeing with the &ldquo;Readings stored&rdquo; tile by exactly the model count.</td>
+      <td>The largest single model&rsquo;s total, with the multiplier stated: <em>&ldquo;258,131 readings &times; 3 models&rdquo;</em>. Labelled <strong>&ldquo;last 120 batches&rdquo;</strong>, since it is a window and will read below the lifetime tile.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="col">
+<p>Both are the same failure in different clothes, and it is the one this project keeps naming: <strong>a display that reads reassuringly while not measuring what it says.</strong> The pipeline log had it too &mdash; it printed only models that committed, so a failed model vanished from the log rather than reporting.</p>
+
+<h2>How long it takes</h2>
+<p class="kicker">Sensor to queryable, measured on this Pi</p>
+</div>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Stage</th><th>Cost</th><th>What sets it</th></tr></thead>
+  <tbody>
+    <tr><td>reading held by ingest</td><td>up to 5 s</td><td><code>--flush-seconds</code>. The biggest part of the delay, and yours to choose</td></tr>
+    <tr><td>waiting for the next cycle</td><td>up to 3 s</td><td><code>--interval</code></td></tr>
+    <tr><td>the cycle itself</td><td>~1.5 s</td><td>with data; ~540 ms when idle</td></tr>
+    <tr><td><strong>total, sensor to mart</strong></td><td><strong>~5&ndash;9 s</strong></td><td></td></tr>
+    <tr><td>raw readings, via <code>read_parquet</code></td><td>as soon as the file lands</td><td>needs no catalog, works while everything runs</td></tr>
+    <tr><td>database commit floor</td><td>~26 ms</td><td>why per-reading writes are impossible, not merely slow</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="col">
+<p>To go faster, lower <code>--flush-seconds</code> first &mdash; that is where most of the delay sits. Below a second or two there is nothing left to win: each commit costs ~26&nbsp;ms and writes its own file and snapshot, so committing more often just means more overhead for less data each time.</p>
+
+<h2>Running it, and reading the log</h2>
+</div>
+
+<pre><span class="c"># terminal 1 — ingest. -u matters, or the log stays empty until it exits.</span>
+.venv/bin/python -u -m duckstream_pipeline.ingest --flush-seconds 5 --flush-rows 2000 \
+  2&gt;&amp;1 | tee -a ~/duckstream-accel/ingest.log
+
+<span class="c"># terminal 2 — the pipeline</span>
+.venv/bin/python -u -m duckstream_pipeline.pipeline --interval "3 seconds" \
+  2&gt;&amp;1 | tee -a ~/duckstream-accel/pipeline.log
+
+<span class="c"># terminal 3 — what went wrong, if anything</span>
+grep -E <span class="h">"FAILED|UNHEALTHY|OVERRUN"</span> ~/duckstream-accel/pipeline.log</pre>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>In the log</th><th>Means</th></tr></thead>
+  <tbody>
+    <tr><td><code>name 466-&gt;1</code></td><td>read 466 rows, wrote 1</td></tr>
+    <tr><td><code>name -</code></td><td>nothing new for that model</td></tr>
+    <tr><td><code>idle</code></td><td>nothing new for any model</td></tr>
+    <tr><td><code>&lt;-- UNHEALTHY</code></td><td>a model did not commit and was not empty; the reason follows on the next line</td></tr>
+    <tr><td><code>FAILED</code></td><td>the whole cycle raised. It will try again next cycle</td></tr>
+    <tr><td><code>OVERRUN</code></td><td>the cycle took longer than the interval &mdash; not keeping up</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note">
+  <p class="hd">One rule</p>
+  <p>Run <strong>one ingest at a time</strong>. Two subscribers on the same topic both receive every message, so both would land it and every reading would be counted twice.</p>
+</div>
+
+<div class="col">
+<h2>Is it right?</h2>
+<p class="kicker">Checked against a full recompute, on real data</p>
+<p>The test that matters is not "does it run" but "does it agree with recomputing everything from scratch" &mdash; especially for windows fed by <em>several</em> separate runs, which is where the old marts went wrong.</p>
+</div>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Checked</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>fact, 420,000 readings over two runs</td><td>exact</td></tr>
+    <tr><td>hourly averages and standard deviation</td><td>0 mismatches, worst error <strong>7.9e-16</strong> (floating-point noise)</td></tr>
+    <tr><td>minute spectra, 70 windows</td><td>0 bin-count mismatches, <strong>exact</strong></td></tr>
+    <tr><td>live MQTT data, same checks</td><td>4.8e-15 and exact</td></tr>
+    <tr><td>240,000 readings, one cycle</td><td>~2.3 s</td></tr>
+  </tbody>
+</table>
+</div>
+
+<footer>
+  Every figure measured on this Raspberry&nbsp;Pi&nbsp;5 &mdash; aarch64, 4&nbsp;cores, 4&nbsp;GB, DuckDB&nbsp;1.5.5 &mdash; on 26&nbsp;August&nbsp;2026. See <code>README.md</code> in this folder for the model definitions, and <code>docs/duckstream/architecture.html</code> for how the framework underneath works.
+</footer>
+
+</div>
+</body>
+</html>
