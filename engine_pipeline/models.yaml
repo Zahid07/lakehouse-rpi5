@@ -1,0 +1,154 @@
+# The engine vibration pipeline, on duckstream.
+#
+# Three models over one landing tree, mirroring `duckstream_pipeline/models.yaml`
+# in shape. Environment is `ENG_*` throughout, never `DS_*`: `app/server.py`
+# reads `DS_ROOT` with no CLI override, so sharing the names would collide the
+# two pipelines on one catalog.
+
+catalog: "ducklake:${ENG_ROOT}/catalog.ducklake"
+data_path: "${ENG_ROOT}/lake_data"
+
+settings:
+  # 1.7: inlining defaults to 10 rows and captures small writes into DuckLake's
+  # buggiest path, making behaviour depend on batch size.
+  ducklake_default_data_inlining_row_limit: 0
+  memory_limit: "${ENG_MEMORY_LIMIT}"
+  # 2 rather than 4: a query containing a Python UDF is forced single-threaded
+  # (CONTEXT.md 2.1), so the spectrogram model cannot use the machine anyway,
+  # and this pipeline is meant to be able to share a Pi with the accelerometer
+  # one. Raise it to 4 if this is the only pipeline running.
+  threads: 2
+  # 1.24, measured on this Pi: without it DuckDB spills to `.tmp` in the
+  # process's CWD -- the SD card -- using up to 90% of the disk, so a model over
+  # its memory limit completes slowly instead of failing.
+  temp_directory: ""
+
+models:
+  # =====================================================================
+  # curated.fact_engine_vibration -- row level, tier 1
+  # =====================================================================
+  # `mode: append`, and this is a deliberate divergence from the accelerometer
+  # fact, which uses `update`. At 500 Hz this table grows by 43.2 M rows a day;
+  # `update` builds a MERGE against the *whole* target, so within hours the join
+  # dominates every cycle. `append` is INSERT ... SELECT ... GROUP BY key --
+  # O(batch) -- and still collapses duplicates *within* a batch.
+  #
+  # What it does not collapse is an MQTT redelivery landing in two files. That
+  # is the honest outcome for a row-level log, and `seq` makes it measurable
+  # rather than invisible: duplicates = count(*) - count(DISTINCT seq).
+  - name: fact_engine_vibration
+    source:
+      type: file
+      path: "${ENG_LANDING}"
+      marker: _READY
+      max_files_per_trigger: 20
+    sink:
+      type: table
+      table: curated.fact_engine_vibration
+      mode: append
+    key: [timestamp, machine]
+    aggregates:
+      # Every duckstream model is a GROUP BY over its key, so a row-level load
+      # is an aggregation with one row per group. `min` rather than `any_value`:
+      # the latter is non-deterministic, classifies non_foldable and is refused
+      # -- correctly, because a replayed batch must reproduce the row it made
+      # the first time. Over a one-row group `min` is the identity.
+      seq:   "min(seq)"
+      vib_r: "min(vib_r)"
+      vib_a: "min(vib_a)"
+      rpm:   "min(rpm)"
+      mode:  "min(mode)"
+
+  # =====================================================================
+  # marts.engine_minute_health -- tiers 1+2, folds incrementally
+  # =====================================================================
+  # The four raw moments are the point of this model. RMS, crest factor,
+  # skewness and kurtosis are all derived from (m1..m4) in the view at read
+  # time, and raw moments are precisely what "sufficient statistics" means --
+  # so a minute touched by six chunks is folded, never re-read.
+  #
+  # Every aggregate is BARE. Arithmetic inside the argument is fine; wrapping
+  # the aggregate is not. `round(avg(x),4)` classifies non_foldable and would
+  # silently demote this whole model to tier three. Rounding lives in the view.
+  - name: engine_minute_health
+    source:
+      type: file
+      path: "${ENG_LANDING}"
+      marker: _READY
+      max_files_per_trigger: 20
+    time_column: timestamp
+    grain: minute
+    key: [window_ts, machine]
+    aggregates:
+      sample_count: "count(*)"
+      seq_lo:       "min(seq)"
+      seq_hi:       "max(seq)"
+      m1_r:         "avg(vib_r)"
+      m2_r:         "avg(vib_r*vib_r)"
+      m3_r:         "avg(vib_r*vib_r*vib_r)"
+      m4_r:         "avg(vib_r*vib_r*vib_r*vib_r)"
+      peak_r:       "max(abs(vib_r))"
+      m2_a:         "avg(vib_a*vib_a)"
+      peak_a:       "max(abs(vib_a))"
+      avg_rpm:      "avg(rpm)"
+      min_rpm:      "min(rpm)"
+      max_rpm:      "max(rpm)"
+      sd_rpm:       "stddev_samp(rpm)"
+      # min/max on a VARCHAR fold as least/greatest. mode_min <> mode_max means
+      # the commanded fault changed inside that minute -- deterministic,
+      # additive, and exactly what marks a transition.
+      mode_min:     "min(mode)"
+      mode_max:     "max(mode)"
+    sink:
+      type: table
+      table: marts.engine_minute_health
+      mode: update
+
+  # =====================================================================
+  # marts.engine_minute_spectrogram -- tier 3, the spectrogram
+  # =====================================================================
+  # duckstream's finest grain is a minute, and one FFT per minute is not a
+  # spectrogram. So the UDF turns one minute into a whole time x frequency grid:
+  # 59 frames of 512 samples at hop 500, flattened frame-major to 15,163
+  # doubles. One column is exactly one second.
+  #
+  # `stft_db` is an unknown function, so it classifies non_foldable -- correctly.
+  # No pair of partial spectrograms combines into the spectrogram of a
+  # concatenation, which is the definition of the tier.
+  - name: engine_minute_spectrogram
+    source:
+      type: file
+      path: "${ENG_LANDING}"
+      marker: _READY
+      max_files_per_trigger: 20
+      # The memory lever. Turning `max_files_per_trigger` *down* makes tier
+      # three worse, not better -- cost follows the window, so a smaller batch
+      # just rebuilds the same minute more often.
+      max_rows_per_trigger: 400000
+    time_column: timestamp
+    grain: minute
+    key: [window_ts, machine]
+    strategy: recompute_window
+    memory_profile: materialising
+    udfs:
+      - "engine_pipeline.udfs:stft_db"
+    aggregates:
+      sample_count: "count(*)"
+      # Stored per row so each row is SELF-DESCRIBING, and that closes a real
+      # correctness hole: n_bins and n_frames are derived at read time from
+      # len(spec_db), so changing ENG_FRAME_SIZE after data exists would reshape
+      # every historical row with the wrong bin count and render a grid of noise
+      # that looks entirely plausible. Three doubles buys immunity.
+      # `min(<literal>)` is a bare additive aggregate over a constant -- verified
+      # to classify `additive`, and it costs no LIST.
+      frame_size:   "min(${ENG_FRAME_SIZE})"
+      hop_size:     "min(${ENG_HOP_SIZE})"
+      sample_rate:  "min(CAST(${ENG_SAMPLE_RATE_HZ} AS DOUBLE))"
+      # No freq_hz column: the axis is b*sample_rate/frame_size, derivable from
+      # columns already on the row. 257 identical doubles x 1,440 rows a day
+      # would be pure redundancy.
+      spec_db:      "stft_db(list(vib_r ORDER BY timestamp))"
+    sink:
+      type: table
+      table: marts.engine_minute_spectrogram
+      mode: update
