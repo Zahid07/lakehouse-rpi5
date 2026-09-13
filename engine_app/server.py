@@ -153,6 +153,14 @@ CACHE: dict = {"state": "starting", "catalog_exists": CATALOG.exists()}
 CACHE_LOCK = threading.Lock()
 
 
+def hostmetrics_active(n: int) -> None:
+    """Tell the host sampler how many producers are publishing."""
+    try:
+        HOST.set_active_machines(n)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def read_landing() -> dict:
     """The fresh end of the pipe. No catalog, so nothing can block it.
 
@@ -223,6 +231,32 @@ def read_landing() -> dict:
                 "latest": mlatest.isoformat() if mlatest else None,
             })
         out["machines_landing"] = breakdown
+
+        # How many producers are actually feeding this Pi, measured from the
+        # DATA rather than from local processes. Producers normally run on a
+        # laptop and publish over MQTT, so the process count on the Pi is 0 no
+        # matter how many are running -- which is the number an operator most
+        # wants and the one the host dashboard was getting wrong.
+        #
+        # "Recently" is generous on purpose: chunks flush every 10 s by default,
+        # so a producer is only visible here once its chunk lands. A 90 s window
+        # tolerates a slow flush without flapping.
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        active = 0
+        for entry in breakdown:
+            if not entry["latest"]:
+                continue
+            try:
+                seen = datetime.fromisoformat(entry["latest"])
+            except ValueError:
+                continue
+            age = (now_utc - seen).total_seconds()
+            entry["seconds_since_seen"] = round(age, 1)
+            entry["active"] = age <= 90
+            active += 1 if entry["active"] else 0
+        out["active_machines"] = active
+        hostmetrics_active(active)
+
         if expected_total:
             out["loss_pct"] = round(100.0 * (1.0 - rows / expected_total), 3)
             out["duplicate_rows"] = dup_total

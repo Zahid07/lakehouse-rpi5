@@ -92,13 +92,14 @@ CREATE TABLE IF NOT EXISTS host_samples (
     throttled         INTEGER,
     producers         INTEGER,
     pipelines         INTEGER,
-    ingests           INTEGER
+    ingests           INTEGER,
+    active_machines   INTEGER
 )
 """
 
 COLUMNS = ("ts", "cpu_pct", "cpu_busiest_pct", "temp_c", "mem_used_pct",
            "mem_available_mb", "swap_used_mb", "load1", "freq_mhz",
-           "throttled", "producers", "pipelines", "ingests")
+           "throttled", "producers", "pipelines", "ingests", "active_machines")
 
 
 def _read(path: Path) -> str | None:
@@ -277,6 +278,24 @@ class HostMetrics:
         self.writes = 0
         self.write_error: str | None = None
         self.db_ready = False
+        # Producers usually run on another machine -- a laptop publishing over
+        # MQTT -- so counting local processes reports 0 for the thing the
+        # operator actually wants to know. Whoever reads the landing tree sets
+        # this to the number of machines that have published recently, which is
+        # the honest measure of "how many producers are feeding this Pi" and is
+        # independent of where they run.
+        self._active_machines = 0
+
+    def set_active_machines(self, n: int) -> None:
+        """Machines seen publishing recently. Set from the catalog refresher.
+
+        Updated on the refresher's cadence, not the sampler's, so it can lag a
+        sample or two behind a producer starting or stopping. That is fine for
+        a trend and is why it is recorded as its own column rather than being
+        blended into the local process count.
+        """
+        with self._lock:
+            self._active_machines = max(0, int(n))
 
     # -- sampling ----------------------------------------------------------
 
@@ -319,6 +338,7 @@ class HostMetrics:
             "producers": counts.get("producers", 0),
             "pipelines": counts.get("pipelines", 0),
             "ingests": counts.get("ingests", 0),
+            "active_machines": self._active_machines,
         }
         with self._lock:
             self.ring.append(row)
@@ -342,6 +362,16 @@ class HostMetrics:
             con = duckdb.connect(str(self.db_path))
             try:
                 con.execute(SCHEMA)
+                # A file written before `active_machines` existed keeps its old
+                # shape -- CREATE TABLE IF NOT EXISTS is a no-op on it, and the
+                # INSERT would then fail forever on column count. Add anything
+                # missing rather than requiring the file be deleted.
+                have = {r[1] for r in con.execute(
+                    "PRAGMA table_info('host_samples')").fetchall()}
+                for column, sqltype in (("active_machines", "INTEGER"),):
+                    if column not in have:
+                        con.execute(f"ALTER TABLE host_samples "
+                                    f"ADD COLUMN {column} {sqltype}")
                 con.executemany(
                     f"INSERT INTO host_samples ({', '.join(COLUMNS)}) "
                     f"VALUES ({', '.join('?' * len(COLUMNS))})", batch)

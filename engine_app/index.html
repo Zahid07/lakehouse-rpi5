@@ -534,7 +534,7 @@ function modeBands(ctx,w,h,rows){
 // Producer count is a MAGNITUDE, not an identity, so it gets one hue at
 // increasing strength rather than a categorical colour per count.
 function loadBands(ctx,w,h,rows){
-  shadeBands(ctx,w,h,rows,r=>r.producers||0,
+  shadeBands(ctx,w,h,rows,r=>(r.active_machines??r.producers)||0,
     ()=>css("--accent"), v=>v?Math.min(.22,.05+v*.045):0,
     v=>v?`${v} producer${v>1?"s":""}`:"idle");
 }
@@ -707,8 +707,13 @@ function renderHost(h){
        warn:L.swap_used_mb>0},
       {k:"CPU clock",v:L.freq_mhz!=null?(L.freq_mhz/1000).toFixed(1)+" GHz":"—",
        sub:"load "+(L.load1!=null?L.load1.toFixed(2):"—")},
-      {k:"Producers",v:fmt.int(L.producers??0),accent:true,
-       sub:`${L.pipelines??0} pipeline · ${L.ingests??0} ingest`},
+      // Machines publishing, not local processes: producers normally run on a
+      // laptop over MQTT, so the Pi's own process count is 0 however many are
+      // feeding it. `producers` stays visible as a sub-line for the case where
+      // one IS run on the Pi.
+      {k:"Producers",v:fmt.int(L.active_machines??0),accent:true,
+       sub:`${L.pipelines??0} pipeline · ${L.ingests??0} ingest`
+           +((L.producers??0)?` · ${L.producers} local`:" · publishing over MQTT")},
     ];
     $("hostTiles").innerHTML=tiles.map(x=>`<div class="tile${x.accent?" accent":""}${x.bad?" bad":x.warn?" warn":""}">
       <div class="k">${x.k}</div><div class="v">${x.v}</div><div class="sub">${x.sub}</div></div>`).join("");
@@ -734,7 +739,7 @@ function renderHost(h){
   $("hostLegend").innerHTML=
     `<span><i style="background:${css("--accent")}"></i>mean across 4 cores</span>`
    +`<span><i style="background:${css("--muted")}"></i>busiest single core (dashed)</span>`
-   +`<span><i style="background:${css("--accent")};opacity:.25"></i>shading = producers running</span>`;
+   +`<span><i style="background:${css("--accent")};opacity:.25"></i>shading = machines publishing</span>`;
 }
 $("hostMins").addEventListener("change",()=>refresh());
 
