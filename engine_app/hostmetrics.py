@@ -52,6 +52,7 @@ from pathlib import Path
 PROC_STAT = Path("/proc/stat")
 PROC_MEM = Path("/proc/meminfo")
 PROC_LOAD = Path("/proc/loadavg")
+PROC_SWAPS = Path("/proc/swaps")
 THERMAL = Path("/sys/class/thermal/thermal_zone0/temp")
 CPUFREQ = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
 
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS host_samples (
     mem_used_pct      DOUBLE,
     mem_available_mb  DOUBLE,
     swap_used_mb      DOUBLE,
+    swap_total_mb     DOUBLE,
     load1             DOUBLE,
     freq_mhz          DOUBLE,
     throttled         INTEGER,
@@ -98,7 +100,7 @@ CREATE TABLE IF NOT EXISTS host_samples (
 """
 
 COLUMNS = ("ts", "cpu_pct", "cpu_busiest_pct", "temp_c", "mem_used_pct",
-           "mem_available_mb", "swap_used_mb", "load1", "freq_mhz",
+           "mem_available_mb", "swap_used_mb", "swap_total_mb", "load1", "freq_mhz",
            "throttled", "producers", "pipelines", "ingests", "active_machines")
 
 
@@ -160,6 +162,47 @@ def _memory() -> dict[str, float]:
         "mem_used_pct": round(100.0 * (1.0 - avail / total), 2) if total else None,
         "mem_available_mb": round(avail / 1024.0, 1) if avail else None,
         "swap_used_mb": round((swap_total - swap_free) / 1024.0, 1),
+        "swap_total_mb": round(swap_total / 1024.0, 1),
+    }
+
+
+def _swap_info() -> dict:
+    """Swap totals, and crucially WHERE it lives.
+
+    On most Pi installs swap is `/dev/zram0`: a compressed block device held in
+    RAM. Pages are compressed rather than written to the SD card, so using some
+    costs CPU, not disk I/O, and wears nothing out. That is an ordinary healthy
+    state -- the kernel squeezing cold pages instead of evicting them.
+
+    Swap on an SD card is a different story entirely: hundreds of times slower
+    than RAM, and a process touching a swapped-out page stalls hard. Reporting
+    both the same way turns a normal reading into a false alarm, or a real
+    problem into a shrug. `/proc/swaps` names the device, so tell them apart.
+    """
+    text = _read(PROC_SWAPS)
+    if not text:
+        return {}
+    devices, total_kb, used_kb = [], 0.0, 0.0
+    for line in text.splitlines()[1:]:          # skip the header
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            total_kb += float(parts[2])
+            used_kb += float(parts[3])
+        except ValueError:
+            continue
+        devices.append(parts[0])
+    if not devices:
+        return {"swap_total_mb": 0.0, "swap_used_mb": 0.0,
+                "swap_compressed": False, "swap_devices": []}
+    return {
+        "swap_total_mb": round(total_kb / 1024.0, 1),
+        "swap_used_mb": round(used_kb / 1024.0, 1),
+        # Only "compressed" when EVERY device is zram. A mixed setup can still
+        # page to the card, so the slow one decides.
+        "swap_compressed": all("zram" in d for d in devices),
+        "swap_devices": devices,
     }
 
 
@@ -322,6 +365,10 @@ class HostMetrics:
         cores = [p for name in counters if name != "cpu"
                  for p in (pct(name),) if p is not None]
         mem = _memory()
+        # /proc/swaps is authoritative and also says where swap lives; meminfo
+        # is the fallback for a kernel that does not expose it.
+        mem.update({k: v for k, v in _swap_info().items()
+                    if k in ("swap_total_mb", "swap_used_mb")})
         counts = _process_counts()
         row = {
             "ts": datetime.now(timezone.utc).replace(tzinfo=None,
@@ -332,6 +379,7 @@ class HostMetrics:
             "mem_used_pct": mem.get("mem_used_pct"),
             "mem_available_mb": mem.get("mem_available_mb"),
             "swap_used_mb": mem.get("swap_used_mb"),
+            "swap_total_mb": mem.get("swap_total_mb"),
             "load1": _load1(),
             "freq_mhz": _frequency_mhz(),
             "throttled": _throttled(),
@@ -368,7 +416,8 @@ class HostMetrics:
                 # missing rather than requiring the file be deleted.
                 have = {r[1] for r in con.execute(
                     "PRAGMA table_info('host_samples')").fetchall()}
-                for column, sqltype in (("active_machines", "INTEGER"),):
+                for column, sqltype in (("active_machines", "INTEGER"),
+                                        ("swap_total_mb", "DOUBLE")):
                     if column not in have:
                         con.execute(f"ALTER TABLE host_samples "
                                     f"ADD COLUMN {column} {sqltype}")
@@ -435,6 +484,8 @@ class HostMetrics:
             "rows_written": self.writes,
             "write_error": self.write_error,
             "cores": len([k for k in self._prev_cpu if k != "cpu"]),
+            "swap": {k: v for k, v in _swap_info().items()
+                     if k in ("swap_compressed", "swap_devices", "swap_total_mb")},
         }
 
     # -- the thread --------------------------------------------------------

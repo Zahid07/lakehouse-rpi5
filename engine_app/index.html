@@ -878,6 +878,7 @@ function renderHost(h){
       +flags.join(", ")+(live.length?"" :" — clears on reboot.");
   } else { tb.className="banner"; }
 
+  const sw=(h&&h.swap)||{};
   if(L){
     const tiles=[
       {k:"CPU",v:L.cpu_pct!=null?L.cpu_pct.toFixed(0)+"%":"—",
@@ -889,9 +890,25 @@ function renderHost(h){
       {k:"Memory",v:L.mem_used_pct!=null?L.mem_used_pct.toFixed(0)+"%":"—",
        sub:L.mem_available_mb!=null?`${fmt.int(Math.round(L.mem_available_mb))} MB free`:"—",
        warn:L.mem_used_pct>85},
-      {k:"Swap",v:L.swap_used_mb!=null?fmt.int(Math.round(L.swap_used_mb))+" MB":"—",
-       sub:L.swap_used_mb>0?"swapping — memory is tight":"unused",
-       warn:L.swap_used_mb>0},
+      // Where swap LIVES decides whether using it matters. zram is compressed
+      // memory held in RAM: pages are squeezed, not written to the SD card, so
+      // some use is an ordinary healthy state and costs CPU rather than I/O.
+      // Swap on an SD card is hundreds of times slower than RAM and a process
+      // touching a swapped-out page stalls hard. Flagging both at >0 MB, as
+      // this tile used to, calls a normal zram reading an alarm.
+      (()=>{
+        const tot=L.swap_total_mb??sw.swap_total_mb;
+        const used=L.swap_used_mb;
+        const pct=(tot&&used!=null)?100*used/tot:null;
+        const zram=sw.swap_compressed===true;
+        return {k:"Swap",
+          v:used!=null?fmt.int(Math.round(used))+" MB":"—",
+          sub:!tot?"none configured"
+              :`${pct.toFixed(0)}% of ${(tot/1024).toFixed(1)} GB · `
+               +(zram?"compressed in RAM":"on disk — slow"),
+          warn: zram ? pct>25 : used>0,
+          bad:  zram ? pct>60 : pct>25};
+      })(),
       {k:"CPU clock",v:L.freq_mhz!=null?(L.freq_mhz/1000).toFixed(1)+" GHz":"—",
        sub:"load "+(L.load1!=null?L.load1.toFixed(2):"—")},
       // Machines publishing, not local processes: producers normally run on a
