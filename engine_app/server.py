@@ -173,7 +173,17 @@ def read_landing() -> dict:
         return out
     # Newest few only: reading every file would make this slower the longer the
     # deployment has run, which is the one thing a status endpoint must not do.
-    flist = "[" + ",".join(f"'{f}'" for f in files[-8:]) + "]"
+    #
+    # Scaled by machine count, because the window is per *file* and the files of
+    # N producers interleave. A fixed 8 covers four chunks each at two machines
+    # and fewer as machines are added -- so a slower producer drops out of the
+    # window entirely and silently vanishes from the loss breakdown and the
+    # waveform list. The count comes from the previous snapshot, which costs
+    # nothing, and the cap keeps this bounded however many machines appear.
+    known = 1
+    with CACHE_LOCK:
+        known = max(1, int(CACHE.get("machine_count") or 1))
+    flist = "[" + ",".join(f"'{f}'" for f in files[-min(40, 8 * known):]) + "]"
     con = duckdb.connect()
     try:
         # Message loss, exactly, from `seq` -- and with no catalog, so this
@@ -219,24 +229,34 @@ def read_landing() -> dict:
         # The live waveform, columnar. 1,250 numbers is ~10 KB; the same rows as
         # objects would be ~90 KB. Legal because the sampling really is uniform,
         # and `seq_deficit` says so if it stops being.
-        # One machine only. Pooling two producers here would interleave two
-        # unrelated vibration signals into a single trace -- which still *looks*
-        # like a waveform, just not like either engine's.
-        wave_machine = (max(breakdown, key=lambda b: b["latest"] or "")["machine"]
-                        if breakdown else None)
-        wave = con.execute(
-            f"SELECT timestamp, vib_r FROM read_parquet({flist}) "
-            f"WHERE machine = ? ORDER BY timestamp DESC LIMIT 1250",
-            [wave_machine],
-        ).fetchall() if wave_machine else []
-        if wave:
+        # One waveform PER MACHINE, keyed by name. Pooling producers into a
+        # single trace would interleave two unrelated vibration signals -- which
+        # still looks like a waveform, just not like either engine's.
+        #
+        # Capped at the four most recently active machines. Each is ~1,250
+        # numbers (~10 KB columnar), and the cap is what stops this endpoint
+        # growing without bound as machines are added.
+        dt_ms = 1000.0 / float(os.environ.get("ENG_SAMPLE_RATE_HZ", "500"))
+        waveforms = {}
+        recent = sorted(breakdown, key=lambda b: b["latest"] or "",
+                        reverse=True)[:4]
+        for entry in recent:
+            wave = con.execute(
+                f"SELECT timestamp, vib_r FROM read_parquet({flist}) "
+                f"WHERE machine = ? ORDER BY timestamp DESC LIMIT 1250",
+                [entry["machine"]],
+            ).fetchall()
+            if not wave:
+                continue
             wave.reverse()
-            out["waveform"] = {
-                "machine": wave_machine,
+            waveforms[entry["machine"]] = {
+                "machine": entry["machine"],
                 "t0": wave[0][0].isoformat(),
-                "dt_ms": 1000.0 / float(os.environ.get("ENG_SAMPLE_RATE_HZ", "500")),
+                "dt_ms": dt_ms,
                 "v": [round(float(r[1]), 5) for r in wave],
             }
+        if waveforms:
+            out["waveforms"] = waveforms
     except Exception as exc:  # noqa: BLE001
         out["landing_error"] = str(exc)[:200]
     finally:
@@ -585,14 +605,15 @@ ROUTES = {
         # polled most often. Leaving it in made /api/status 12 KB when it
         # should be 2.
         if k not in ("health", "spectrogram", "throughput", "machines",
-                     "waveform")
+                     "waveform", "waveforms")
     },
     "/api/health": lambda q: snapshot().get("health", []),
     "/api/spectrogram": lambda q: {
         "db_min": DB_MIN, "db_max": DB_MAX, "encoding": "u8",
         "columns": snapshot().get("spectrogram", []),
     },
-    "/api/waveform": lambda q: snapshot().get("waveform", {}),
+    # A dict keyed by machine name; the page draws whichever is selected.
+    "/api/waveform": lambda q: snapshot().get("waveforms", {}),
     "/api/machines": lambda q: snapshot().get("machines", []),
     "/api/throughput": lambda q: snapshot().get("throughput", []),
     # The only endpoint that reads the catalog live; see `live_readings`.
