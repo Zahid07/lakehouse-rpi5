@@ -58,6 +58,20 @@
     .dot.live{animation:pulse 2.4s ease-in-out infinite}
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
   }
+  /* The delay strip sits above everything: if this is stale, nothing below it
+     means what it appears to mean. */
+  .lagstrip{display:flex;flex-wrap:wrap;gap:0;margin-bottom:1rem;
+    background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+    overflow:hidden;box-shadow:var(--shadow)}
+  .lagstrip .seg{flex:1 1 130px;padding:.65rem .85rem;
+    border-right:1px solid var(--rule)}
+  .lagstrip .seg:last-child{border-right:0}
+  .lagstrip .k{font-size:.62rem;font-weight:650;letter-spacing:.09em;
+    text-transform:uppercase;color:var(--muted);margin-bottom:.2rem}
+  .lagstrip .v{font-size:1.15rem;font-weight:600;font-variant-numeric:tabular-nums;
+    letter-spacing:-.01em}
+  .lagstrip .sub{font-size:.68rem;color:var(--muted);margin-top:.1rem}
+  .lagstrip .seg.warn .v{color:var(--warn)} .lagstrip .seg.bad .v{color:var(--alert)}
   .tiles{display:grid;gap:.8rem;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
     margin-bottom:1.5rem}
   .tile{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
@@ -142,7 +156,23 @@
 </header>
 
 <div class="banner" id="banner"></div>
+
+<div class="lagstrip" id="lagstrip"></div>
+
 <div class="tiles" id="tiles"></div>
+
+<section>
+  <div class="charthead">
+    <div>
+      <h2>Engine condition</h2>
+      <p class="hint">One number per minute: how far this engine has drifted from its own quietest behaviour. Computed entirely in DuckDB (<code>marts.v_engine_minute_anomaly</code>) as a robust median/MAD deviation across five scalars — no single one catches every fault, so they are combined.</p>
+    </div>
+    <span class="pill" id="condPill">—</span>
+  </div>
+  <canvas id="cCond" class="chart"></canvas>
+  <div class="legend" id="condLegend"></div>
+  <div class="empty" id="condEmpty">Waiting for the first minutes…</div>
+</section>
 
 <section>
   <div class="charthead">
@@ -741,6 +771,91 @@ function renderMachines(rows){
     <td>${r.oper??"—"}</td></tr>`).join("");
 }
 
+/* ---------- delay ---------- */
+const secs=(v)=>v==null?"—":(v<90?`${Math.round(v)}s`:v<5400?`${(v/60).toFixed(1)}m`:`${(v/3600).toFixed(1)}h`);
+function renderLag(s){
+  // The pipeline share is what is left after the ingest flush. Clamped at 0:
+  // the two timestamps come from different reads a moment apart, so a tiny
+  // negative is a measurement artefact, not a machine that processed data
+  // before receiving it.
+  const land=s.landing_lag_seconds, fact=s.fact_lag_seconds;
+  const pipe=(land!=null&&fact!=null)?Math.max(0,fact-land):null;
+  const segs=[
+    {k:"End-to-end delay",v:secs(fact),
+     sub:"reading → queryable in the lakehouse",
+     warn:fact>90, bad:fact>300},
+    {k:"Ingest",v:secs(land),sub:"MQTT → landing (flush every 10s)",
+     warn:land>45, bad:land>150},
+    {k:"Pipeline",v:secs(pipe),sub:"landing → fact table",
+     warn:pipe>60, bad:pipe>240},
+    {k:"Newest minute",v:secs(s.mart_lag_seconds),
+     sub:"marts close on the minute boundary"},
+    {k:"Dashboard",v:secs(s.age_seconds),
+     sub:s.stale?"catalog busy — showing last read":"cached snapshot age",
+     warn:s.age_seconds>60},
+  ];
+  $("lagstrip").innerHTML=segs.map(x=>
+    `<div class="seg${x.bad?" bad":x.warn?" warn":""}"><div class="k">${x.k}</div>`
+    +`<div class="v">${x.v}</div><div class="sub">${x.sub}</div></div>`).join("");
+}
+
+/* ---------- engine condition ---------- */
+const COND={normal:"--live",watch:"--warn",alert:"--alert",calibrating:"--muted"};
+function renderCondition(rows){
+  const mine=(rows||[]).filter(forMachine);
+  const has=mine.length>0;
+  $("cCond").style.display=has?"block":"none";
+  $("condEmpty").style.display=has?"none":"block";
+  if(!has){$("condPill").textContent="—";return;}
+  const names=[...new Set(mine.map(r=>r.machine_name))].sort();
+  const last=mine[mine.length-1];
+  $("condPill").textContent=`${last.status.toUpperCase()} · score ${last.score}`
+    +(last.top_driver?` · driven by ${last.top_driver}`:"");
+
+  const canvas=$("cCond"); const {ctx,w,h}=prep(canvas); const pad=18;
+  const scores=mine.map(r=>r.score).filter(v=>v!=null);
+  const hi=Math.max(4,Math.ceil(Math.max(...scores)));
+  const Y=v=>h-pad-(h-pad*2)*(Math.min(v,hi)/hi);
+  // Threshold bands first, so the line reads against them. Fixed thresholds,
+  // never derived from what is on screen -- a band that moved with the data
+  // would make two screenshots incomparable.
+  const bands=[[0,1.5,"--live"],[1.5,3.5,"--warn"],[3.5,hi,"--alert"]];
+  bands.forEach(([a,b,v])=>{ if(b<=a)return;
+    ctx.fillStyle=css(v); ctx.globalAlpha=.10;
+    ctx.fillRect(0,Y(b),w,Y(a)-Y(b)); ctx.globalAlpha=1; });
+  ctx.fillStyle=css("--muted"); ctx.font="9px ui-monospace, monospace";
+  [[1.5,"watch"],[3.5,"alert"]].forEach(([v,lab])=>{ if(v>hi)return;
+    ctx.strokeStyle=css("--rule-strong"); ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(0,Y(v)); ctx.lineTo(w,Y(v)); ctx.stroke();
+    ctx.setLineDash([]); ctx.fillText(lab,3,Y(v)-3); });
+
+  const ts=mine.map(r=>new Date(r.minute_ts).getTime()).filter(isFinite);
+  let t0=Math.min(...ts), t1=Math.max(...ts); if(t1<=t0)t1=t0+60000;
+  const X=r=>((new Date(r.minute_ts).getTime()-t0)/(t1-t0))*w;
+  names.forEach((n,gi)=>{
+    const g=mine.filter(r=>r.machine_name===n);
+    ctx.beginPath(); let started=false;
+    g.forEach(r=>{ if(r.score==null)return;
+      started?ctx.lineTo(X(r),Y(r.score)):(ctx.moveTo(X(r),Y(r.score)),started=true); });
+    ctx.strokeStyle=names.length>1?css(SERIES_VARS[gi%SERIES_VARS.length]):css("--ink");
+    ctx.lineWidth=2; ctx.stroke();
+    // A dot per minute, coloured by status -- the point where it crosses is
+    // the point someone will want to read off.
+    g.forEach(r=>{ if(r.score==null)return;
+      ctx.fillStyle=css(COND[r.status]||"--muted");
+      ctx.beginPath(); ctx.arc(X(r),Y(r.score),3,0,6.284); ctx.fill(); });
+  });
+  ctx.fillStyle=css("--muted");
+  ctx.fillText(hi.toFixed(0),2,12); ctx.fillText("0",2,h-4);
+
+  const drivers=[...new Set(mine.slice(-6).map(r=>r.top_driver))];
+  $("condLegend").innerHTML=
+    Object.entries({normal:"normal",watch:"watch",alert:"alert"}).map(([k,lab])=>
+      `<span><i style="background:${css(COND[k])}"></i>${lab}</span>`).join("")
+   +`<span>recent driver: ${drivers.join(", ")||"—"}</span>`
+   +(last.baseline_minutes!=null?`<span>baseline: ${last.baseline_minutes} quietest minutes</span>`:"");
+}
+
 /* ---------- Raspberry Pi resources ---------- */
 // Pi 5 soft-throttles at 80 C and hard-throttles at 85, so those are the
 // thresholds the tiles colour against -- not arbitrary round numbers.
@@ -855,7 +970,7 @@ async function refresh(){
     const s=await get("/api/status"); busy=0;
     if(!s.catalog_exists){setState("busy","waiting for the first commit");
       banner("busy","The pipeline has not written anything yet. Start it and this page fills in on its own.");
-      renderTiles(s,null);
+      renderTiles(s,null); renderLag(s);
       get("/api/host?minutes="+encodeURIComponent($("hostMins").value))
         .then(renderHost).catch(()=>{});
       return;}
@@ -864,6 +979,7 @@ async function refresh(){
       get("/api/health").catch(()=>[]), get("/api/spectrogram").catch(()=>({columns:[]})),
       get("/api/waveform").catch(()=>({})), get("/api/throughput").catch(()=>[]),
       get("/api/machines").catch(()=>[])]);
+    const anomaly=await get("/api/anomaly").catch(()=>[]);
     // Host metrics come from the sampler's own ring, never the catalog, so
     // this one still answers while the pipeline is mid-write.
     get("/api/host?minutes="+encodeURIComponent($("hostMins").value))
@@ -877,6 +993,7 @@ async function refresh(){
     ].filter(Boolean))].sort();
     syncMachines(names);
     const hrows=health.filter(forMachine);
+    renderLag(s); renderCondition(anomaly);
     renderTiles(s,hrows); renderHealth(hrows);
     renderSpectrogram(spec,hrows); renderWave(wave);
     renderThroughput(thru); renderMachines(machines);

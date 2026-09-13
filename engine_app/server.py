@@ -231,6 +231,10 @@ def read_landing() -> dict:
                 "latest": mlatest.isoformat() if mlatest else None,
             })
         out["machines_landing"] = breakdown
+        if latest:
+            out["landing_lag_seconds"] = round(
+                (datetime.now(timezone.utc).replace(tzinfo=None)
+                 - latest).total_seconds(), 1)
 
         # How many producers are actually feeding this Pi, measured from the
         # DATA rather than from local processes. Producers normally run on a
@@ -423,6 +427,32 @@ def read_catalog(r: Reader) -> dict:
                       "axial_ratio", "mode_max"):
                 out[f"latest_{k}"] = latest.get(k)
 
+    if r.table_exists("marts.v_engine_minute_anomaly"):
+        out["anomaly"] = list(reversed(r.query(
+            "SELECT minute_ts, machine_name, score, status, top_driver, "
+            "z_rms, z_crest, z_kurtosis, z_axial, z_skew, baseline_minutes, "
+            "mode_max, mode_changed FROM l.marts.v_engine_minute_anomaly "
+            "QUALIFY row_number() OVER (PARTITION BY machine_name "
+            "                           ORDER BY minute_ts DESC) <= 90 "
+            "ORDER BY minute_ts DESC")))
+
+    # End-to-end delay, computed in SQL. `now()` is TIMESTAMP WITH TIME ZONE and
+    # fetching one needs pytz, which is not a dependency (trap 5) -- so the
+    # subtraction happens inside DuckDB and only an integer crosses into Python.
+    if r.table_exists("curated.fact_engine_vibration"):
+        lag = r.query(
+            "SELECT date_diff('second', max(timestamp), "
+            "                 (get_current_timestamp() AT TIME ZONE 'UTC')) AS fact_lag_s "
+            "FROM l.curated.fact_engine_vibration")[0]
+        out["fact_lag_seconds"] = lag["fact_lag_s"]
+
+    if r.table_exists("marts.engine_minute_health"):
+        lag = r.query(
+            "SELECT date_diff('second', max(window_ts), "
+            "                 (get_current_timestamp() AT TIME ZONE 'UTC')) AS mart_lag_s "
+            "FROM l.marts.engine_minute_health")[0]
+        out["mart_lag_seconds"] = lag["mart_lag_s"]
+
     if r.table_exists("marts.v_engine_minute_spectrogram"):
         out["spectrogram"] = read_spectrogram(r)
 
@@ -514,7 +544,8 @@ def refresh_once() -> None:
             # exists to show.
             for key in ("readings", "locations", "latest_reading", "hours",
                         "minutes", "spectrograms", "machines", "machine_count",
-                        "health", "spectrogram", "throughput",
+                        "health", "spectrogram", "throughput", "anomaly",
+                        "fact_lag_seconds", "mart_lag_seconds",
                         "latest_rms_r", "latest_crest_r", "latest_kurtosis_r",
                         "latest_avg_rpm", "latest_axial_ratio", "latest_mode_max",
                         "chunks_processed", "models_consuming"):
@@ -639,9 +670,10 @@ ROUTES = {
         # polled most often. Leaving it in made /api/status 12 KB when it
         # should be 2.
         if k not in ("health", "spectrogram", "throughput", "machines",
-                     "waveform", "waveforms")
+                     "waveform", "waveforms", "anomaly")
     },
     "/api/health": lambda q: snapshot().get("health", []),
+    "/api/anomaly": lambda q: snapshot().get("anomaly", []),
     "/api/spectrogram": lambda q: {
         "db_min": DB_MIN, "db_max": DB_MAX, "encoding": "u8",
         "columns": snapshot().get("spectrogram", []),
