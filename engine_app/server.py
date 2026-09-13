@@ -180,27 +180,59 @@ def read_landing() -> dict:
         # number is available even while the pipeline holds the lock. It is the
         # answer to "are we really achieving 500 Hz", which at this rate is the
         # first thing that goes wrong.
-        row = con.execute(
-            f"SELECT count(*), max(timestamp), min(seq), max(seq), "
-            f"count(DISTINCT seq) FROM read_parquet({flist})"
-        ).fetchone()
-        rows, latest, lo, hi, distinct = row
+        # GROUPED BY MACHINE, and that grouping is load-bearing. `seq` is a
+        # per-producer counter that starts at 0, so two producers pooled give
+        # min(seq)=0 and max(seq)=N across twice as many rows -- which reports
+        # -100% loss and N duplicates when nothing at all is wrong. Each
+        # producer's range has to be measured on its own and only then summed.
+        per = con.execute(
+            f"SELECT machine, count(*) AS n, min(seq) AS lo, max(seq) AS hi, "
+            f"count(DISTINCT seq) AS distinct_seq, max(timestamp) AS latest "
+            f"FROM read_parquet({flist}) GROUP BY machine ORDER BY machine"
+        ).fetchall()
+        rows = sum(r[1] for r in per)
+        latest = max((r[5] for r in per if r[5]), default=None)
         out["landing_recent_rows"] = rows
         out["landing_latest"] = latest.isoformat() if latest else None
-        if lo is not None and hi is not None and hi >= lo:
-            expected = hi - lo + 1
-            out["loss_pct"] = round(100.0 * (1.0 - rows / expected), 3)
-            out["duplicate_rows"] = rows - distinct
+
+        expected_total = 0
+        dup_total = 0
+        breakdown = []
+        for machine, n, lo, hi, distinct_seq, mlatest in per:
+            exp = (hi - lo + 1) if (lo is not None and hi is not None
+                                    and hi >= lo) else None
+            dup = n - distinct_seq
+            if exp:
+                expected_total += exp
+                dup_total += dup
+            breakdown.append({
+                "machine": machine,
+                "rows": n,
+                "loss_pct": round(100.0 * (1.0 - n / exp), 3) if exp else None,
+                "duplicate_rows": dup,
+                "latest": mlatest.isoformat() if mlatest else None,
+            })
+        out["machines_landing"] = breakdown
+        if expected_total:
+            out["loss_pct"] = round(100.0 * (1.0 - rows / expected_total), 3)
+            out["duplicate_rows"] = dup_total
         # The live waveform, columnar. 1,250 numbers is ~10 KB; the same rows as
         # objects would be ~90 KB. Legal because the sampling really is uniform,
         # and `seq_deficit` says so if it stops being.
+        # One machine only. Pooling two producers here would interleave two
+        # unrelated vibration signals into a single trace -- which still *looks*
+        # like a waveform, just not like either engine's.
+        wave_machine = (max(breakdown, key=lambda b: b["latest"] or "")["machine"]
+                        if breakdown else None)
         wave = con.execute(
             f"SELECT timestamp, vib_r FROM read_parquet({flist}) "
-            f"ORDER BY timestamp DESC LIMIT 1250"
-        ).fetchall()
+            f"WHERE machine = ? ORDER BY timestamp DESC LIMIT 1250",
+            [wave_machine],
+        ).fetchall() if wave_machine else []
         if wave:
             wave.reverse()
             out["waveform"] = {
+                "machine": wave_machine,
                 "t0": wave[0][0].isoformat(),
                 "dt_ms": 1000.0 / float(os.environ.get("ENG_SAMPLE_RATE_HZ", "500")),
                 "v": [round(float(r[1]), 5) for r in wave],
@@ -324,7 +356,12 @@ def read_catalog(r: Reader) -> dict:
             "peak_r, crest_r, kurtosis_r, skew_r, rms_a, axial_ratio, avg_rpm, "
             "min_rpm, max_rpm, shaft_hz, mode_min, mode_max, mode_changed, "
             "seq_deficit FROM l.marts.v_engine_minute_health "
-            "ORDER BY minute_ts DESC LIMIT 90"
+            # Per machine. A flat LIMIT 90 over two machines is 45 minutes
+            # each, silently halving the history the moment a second producer
+            # starts -- and the charts would interleave them besides.
+            "QUALIFY row_number() OVER (PARTITION BY machine_name "
+            "                           ORDER BY minute_ts DESC) <= 90 "
+            "ORDER BY minute_ts DESC"
         )))
         latest = out["health"][-1] if out["health"] else None
         if latest:
@@ -360,11 +397,17 @@ def read_spectrogram(r: Reader, minutes: int = 15) -> list[dict]:
     """
     import base64
 
+    # Per machine, for the same reason as the health query: a flat LIMIT over
+    # two machines returns half the window each AND alternates between them, so
+    # the heatmap would splice two engines into one picture along the time axis.
+    # The page picks which machine to draw.
     rows = r.query(
         "SELECT window_ts, machine_name, sample_count, n_bins, n_frames, "
         "df_hz, hop_seconds, frame_seconds, sample_rate_hz, spec_db "
         "FROM l.marts.v_engine_minute_spectrogram "
-        "ORDER BY window_ts DESC LIMIT ?", [minutes]
+        "QUALIFY row_number() OVER (PARTITION BY machine_name "
+        "                           ORDER BY window_ts DESC) <= ? "
+        "ORDER BY window_ts DESC", [minutes]
     )
     span = DB_MAX - DB_MIN
     out = []
@@ -377,11 +420,11 @@ def read_spectrogram(r: Reader, minutes: int = 15) -> list[dict]:
         row["window_ts"] = row["window_ts"].isoformat()
         row["data"] = base64.b64encode(u8.tobytes()).decode("ascii")
         out.append(row)
-    if out:
-        # The newest minute is still being recomputed every cycle and its frame
-        # count grows. Saying so beats someone reporting the last column as a
-        # bug once a week for ever.
-        out[-1]["in_progress"] = True
+    # Per machine: each one has its own newest, still-growing minute.
+    for machine in {row["machine_name"] for row in out}:
+        mine = [row for row in out if row["machine_name"] == machine]
+        if mine:
+            mine[-1]["in_progress"] = True
     return out
 
 
