@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from typing import Any
 
 from duckstream.errors import DuckstreamError
@@ -77,6 +78,31 @@ _INSTALL_HINT = (
     "ATTACH autoloads the extension, but autoload still has to fetch it the "
     "first time, so a disconnected deployment fails on its first run."
 )
+
+#: Substrings DuckDB uses when another process holds the catalog file.
+_LOCK_MARKERS = ("conflicting lock", "could not set lock")
+
+#: Total seconds to keep retrying an ATTACH that lost the single-attach race.
+#: A DuckLake catalog admits one process at a time -- not even READ_ONLY is
+#: exempt (``CONTEXT.md`` 1.25) -- so a reader such as a dashboard necessarily
+#: locks out the writer for the length of its read. Measured on a Pi 5 with two
+#: producers: the dashboard's whole catalog read is ~300 ms while a committing
+#: pipeline cycle runs 1.2-1.6 s of a 2 s interval, leaving a gap small enough
+#: that the two regularly meet. Without a retry the writer simply loses that
+#: cycle, which is the wrong outcome: the reader is optional and the writer is
+#: not. The default budget comfortably outlasts a dashboard read without
+#: masking a genuinely stuck holder.
+ATTACH_RETRY_SECONDS = float(os.environ.get("DUCKSTREAM_ATTACH_RETRY_SECONDS", "6"))
+
+#: First backoff, doubling to a 750 ms ceiling. Short: the holder is expected
+#: to be a reader finishing a query, not a long transaction.
+ATTACH_RETRY_INITIAL = 0.12
+ATTACH_RETRY_MAX = 0.75
+
+
+def _is_lock_conflict(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _LOCK_MARKERS)
 
 
 # --------------------------------------------------------------------------
@@ -367,17 +393,43 @@ def attach_lake(
                 _attach_statement(target, alias, None),
             ]
         last_error: Exception | None = None
-        for statement in statements:
-            try:
-                con.execute(statement)
-                last_error = None
+        deadline = time.monotonic() + max(0.0, ATTACH_RETRY_SECONDS)
+        delay = ATTACH_RETRY_INITIAL
+        attempts = 0
+        while True:
+            attempts += 1
+            last_error = None
+            for statement in statements:
+                try:
+                    con.execute(statement)
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+            if last_error is None:
                 break
-            except Exception as exc:
-                last_error = exc
+            # Retry ONLY a lock conflict. Every other attach failure -- a bad
+            # path, a missing extension, a malformed DSN -- is deterministic,
+            # and retrying it just delays the report by the whole budget.
+            if not _is_lock_conflict(last_error) or time.monotonic() >= deadline:
+                break
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(delay * 2, ATTACH_RETRY_MAX)
         if last_error is not None:
+            # The install hint is for an extension that never loaded. Appending
+            # it to a lock conflict sends the reader to fix the wrong thing --
+            # and the lock message already names the holding PID.
+            hint = (
+                (f"A DuckLake catalog admits one process at a time, not even "
+                 f"READ_ONLY. Gave up after {attempts} attempt(s) over "
+                 f"{ATTACH_RETRY_SECONDS:g}s; raise "
+                 f"DUCKSTREAM_ATTACH_RETRY_SECONDS, slow the reader down, or "
+                 f"stop whichever process the message names.")
+                if _is_lock_conflict(last_error) else _INSTALL_HINT
+            )
             raise DuckstreamError(
                 f"could not attach DuckLake catalog {target!r} as {alias!r}: "
-                f"{last_error}. {_INSTALL_HINT}"
+                f"{last_error}. {hint}"
             ) from last_error
 
     con.execute(f"USE {alias_sql}")

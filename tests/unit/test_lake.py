@@ -497,3 +497,121 @@ def test_attach_lake_does_not_hold_the_catalog_open_after_the_caller_closes(
         assert second.execute("SELECT count(*) FROM t").fetchone()[0] == 1
     finally:
         second.close()
+
+
+# ---------------------------------------------------------------------------
+# ATTACH retry under the single-attach lock
+#
+# A DuckLake catalog admits one process at a time -- not even READ_ONLY is
+# exempt (CONTEXT.md 1.25) -- so any reader locks the writer out for the length
+# of its read. Measured on a Pi 5 running two producers: a dashboard's whole
+# catalog read is ~300 ms while a committing pipeline cycle takes 1.2-1.6 s of
+# a 2 s interval, so the two meet often enough to fail ~28% of cycles. The
+# writer must outlast the reader rather than lose the cycle.
+# ---------------------------------------------------------------------------
+
+
+class _LockingConnection:
+    """Fails ``ATTACH`` with a lock conflict the first ``fail_times`` calls."""
+
+    def __init__(self, fail_times, error_text="Could not set lock on file "
+                                              "\"x.ducklake\": Conflicting lock "
+                                              "is held in /usr/bin/python3 (PID 1)"):
+        self.fail_times = fail_times
+        self.error_text = error_text
+        self.attach_attempts = 0
+        self.statements = []
+
+    def execute(self, sql, *args):
+        self.statements.append(sql)
+        if sql.upper().startswith("ATTACH"):
+            self.attach_attempts += 1
+            if self.attach_attempts <= self.fail_times:
+                raise RuntimeError(self.error_text)
+        return self
+
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return [0]
+
+
+def _attach_against(monkeypatch, con, tmp_path, budget=6.0):
+    """Run attach_lake against a fake connection with sleeping stubbed out."""
+    import duckstream.lake as lake
+
+    slept = []
+    monkeypatch.setattr(lake.time, "sleep", slept.append)
+    monkeypatch.setattr(lake, "ATTACH_RETRY_SECONDS", budget)
+    monkeypatch.setattr(lake, "_install_and_load", lambda c: None)
+    monkeypatch.setattr(lake, "_disable_inlining", lambda c: None)
+    monkeypatch.setattr(lake, "_assert_inlining_disabled", lambda c: None)
+    monkeypatch.setattr(lake, "apply_settings", lambda c, s: None)
+    monkeypatch.setattr(lake, "_attached_aliases", lambda c: set())
+    monkeypatch.setattr(lake, "_catalog_exists", lambda t: True)
+    lake.attach_lake(con, tmp_path / "catalog.ducklake")
+    return slept
+
+
+def test_attach_retries_a_lock_conflict_and_succeeds(monkeypatch, tmp_path):
+    """The writer outlasts a reader that held the catalog for a moment."""
+    con = _LockingConnection(fail_times=3)
+    slept = _attach_against(monkeypatch, con, tmp_path)
+    assert con.attach_attempts == 4          # three refusals, then through
+    assert len(slept) == 3
+    # Backoff grows rather than hammering the holder.
+    assert slept == sorted(slept)
+    assert slept[0] == pytest.approx(0.12)
+
+
+def test_attach_does_not_retry_a_non_lock_failure(monkeypatch, tmp_path):
+    """A bad path or missing extension is deterministic; retrying only delays
+    the report by the whole budget."""
+    import duckstream.lake as lake
+
+    con = _LockingConnection(fail_times=99, error_text="IO Error: No such file")
+    slept = []
+    monkeypatch.setattr(lake.time, "sleep", slept.append)
+    monkeypatch.setattr(lake, "ATTACH_RETRY_SECONDS", 6.0)
+    monkeypatch.setattr(lake, "_install_and_load", lambda c: None)
+    monkeypatch.setattr(lake, "_disable_inlining", lambda c: None)
+    monkeypatch.setattr(lake, "_attached_aliases", lambda c: set())
+    monkeypatch.setattr(lake, "_catalog_exists", lambda t: True)
+    with pytest.raises(DuckstreamError) as excinfo:
+        lake.attach_lake(con, tmp_path / "catalog.ducklake")
+    assert con.attach_attempts == 1
+    assert slept == []
+    # ...and it still gets the install hint, which is the right advice here.
+    assert "INSTALL ducklake" in str(excinfo.value)
+
+
+def test_giving_up_on_a_lock_does_not_blame_the_extension(monkeypatch, tmp_path):
+    """The install hint sends the reader to fix the wrong thing.
+
+    This is the message a Pi 5 operator actually saw: a lock conflict that named
+    the holding PID, with "Run `INSTALL ducklake;`" appended to it.
+    """
+    import duckstream.lake as lake
+
+    con = _LockingConnection(fail_times=99)
+    monkeypatch.setattr(lake.time, "sleep", lambda s: None)
+    monkeypatch.setattr(lake, "ATTACH_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(lake, "_install_and_load", lambda c: None)
+    monkeypatch.setattr(lake, "_disable_inlining", lambda c: None)
+    monkeypatch.setattr(lake, "_attached_aliases", lambda c: set())
+    monkeypatch.setattr(lake, "_catalog_exists", lambda t: True)
+    with pytest.raises(DuckstreamError) as excinfo:
+        lake.attach_lake(con, tmp_path / "catalog.ducklake")
+    message = str(excinfo.value)
+    assert "INSTALL ducklake" not in message
+    assert "one process at a time" in message
+    assert "DUCKSTREAM_ATTACH_RETRY_SECONDS" in message
+
+
+def test_a_zero_budget_still_attempts_once(monkeypatch, tmp_path):
+    """Disabling the retry must not disable the attach."""
+    con = _LockingConnection(fail_times=0)
+    slept = _attach_against(monkeypatch, con, tmp_path, budget=0.0)
+    assert con.attach_attempts == 1
+    assert slept == []
