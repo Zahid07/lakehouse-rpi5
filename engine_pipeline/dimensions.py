@@ -201,6 +201,8 @@ VIEWS = (
      (("marts", "engine_minute_spectrogram"), ("curated", "machine_dim"))),
     ("curated", "v_fact_engine_vibration",
      (("curated", "fact_engine_vibration"), ("curated", "machine_dim"))),
+    ("marts", "v_engine_minute_anomaly",
+     (("marts", "engine_minute_health"), ("curated", "machine_dim"))),
 )
 
 
