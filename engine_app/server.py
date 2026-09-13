@@ -55,10 +55,24 @@ from urllib.parse import parse_qs, urlparse
 import duckdb
 import numpy as np
 
+import hostmetrics
+
 HERE = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get("ENG_ROOT", str(Path.home() / "engine-lake")))
 LANDING = Path(os.environ.get("ENG_LANDING", str(ROOT / "landing")))
 CATALOG = ROOT / "catalog.ducklake"
+
+#: Host resource sampling. Its own cadence and its own DuckDB file -- the
+#: DuckLake catalog is single-attach and the pipeline holds it, so metrics
+#: cannot live there without competing with the writer they exist to observe.
+HOST_DB = Path(os.environ.get("ENG_HOST_DB", str(ROOT / "hostmetrics.duckdb")))
+HOST_INTERVAL = float(os.environ.get("ENG_HOST_INTERVAL", "5"))
+HOST_RETAIN_HOURS = float(os.environ.get("ENG_HOST_RETAIN_HOURS", "72"))
+HOST = hostmetrics.HostMetrics(
+    HOST_DB, interval=HOST_INTERVAL,
+    flush_seconds=float(os.environ.get("ENG_HOST_FLUSH", "30")),
+    retain_hours=HOST_RETAIN_HOURS,
+)
 
 #: Fallback timer between catalog reads. Slow on purpose: the pipeline pokes
 #: `/api/refresh` the instant it finishes a cycle, and that poked read is the
@@ -544,6 +558,12 @@ ROUTES = {
         (q.get("before") or [None])[0],
         (q.get("machine") or [None])[0],
     ),
+    # Host resources. Served from the sampler's in-memory ring, so this never
+    # touches the metrics file either -- same discipline as the catalog.
+    "/api/host": lambda q: HOST.series(
+        minutes=float((q.get("minutes") or ["30"])[0]),
+        points=int((q.get("points") or ["240"])[0]),
+    ),
     "/api/all": lambda q: snapshot(),
 }
 
@@ -672,12 +692,23 @@ def main() -> int:
     print(f"refresh : one catalog read every {args.refresh:g}s, cached — HTTP "
           f"requests never touch the catalog")
 
+    print(f"host    : sampling every {HOST_INTERVAL:g}s -> {HOST_DB} "
+          f"(keeping {HOST_RETAIN_HOURS:g}h)")
+
     stop = threading.Event()
     worker = threading.Thread(
         target=refresher, args=(args.refresh, stop), daemon=True,
         name="catalog-refresher",
     )
     worker.start()
+
+    # Separate thread, steady cadence. Sampling from the refresher would tie
+    # the resource trend to catalog activity and leave gaps exactly when the
+    # machine is busiest -- which is when the trend is worth having.
+    sampler = threading.Thread(
+        target=HOST.run, args=(stop,), daemon=True, name="host-sampler",
+    )
+    sampler.start()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
