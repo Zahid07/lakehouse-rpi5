@@ -287,12 +287,17 @@ function setMachine(name){
 function syncMachines(names){
   const sel = $("machineSel");
   if(!names.length){ $("machineWrap").hidden = true; return; }
-  if(!names.includes(MACHINE)) setMachine(names[0]);
+  if(MACHINE!=="" && !names.includes(MACHINE)) setMachine(names[0]);
   // Only rebuild when the set actually changed, or the open dropdown would
   // close under the user every refresh.
+  // "All machines" compares the scalars across engines on one axis. The
+  // spectrogram still needs a single machine -- a heatmap cannot overlay two --
+  // so it falls back to the first and says which it is drawing.
+  const opts = names.length>1 ? ["", ...names] : names;
   const current = [...sel.options].map(o=>o.value).join("\u0000");
-  if(current !== names.join("\u0000")){
-    sel.innerHTML = names.map(n=>`<option value="${n}">${n}</option>`).join("");
+  if(current !== opts.join("\u0000")){
+    sel.innerHTML = opts.map(n=>
+      `<option value="${n}">${n||"All machines"}</option>`).join("");
   }
   sel.value = MACHINE;
   // Hidden for a single machine: a select with one option is furniture.
@@ -332,7 +337,10 @@ function renderTiles(s,hrows){
   // Per machine. The server's latest_* fields are whichever row sorted last
   // across every machine, which with two producers is essentially arbitrary --
   // so prefer the selected machine's own newest minute when we have it.
-  const L=(hrows&&hrows.length)?hrows[hrows.length-1]:null;
+  // Only when a single machine is selected. With "All machines" the last row
+  // belongs to whichever machine happened to sort last, so the server's
+  // combined figures are the honest ones.
+  const L=(MACHINE&&hrows&&hrows.length)?hrows[hrows.length-1]:null;
   const mine=(s.machines_landing||[]).find(b=>b.machine===MACHINE);
   const loss=mine?mine.loss_pct:s.loss_pct;
   const t=[
@@ -392,7 +400,12 @@ function buildLUT(dark){
 let specState={cols:[],dbMin:-90,dbMax:-10,orders:true,minutes:15};
 
 function renderSpectrogram(payload,health){
-  const mine=((payload&&payload.columns)||[]).filter(forMachine);
+  // A heatmap cannot overlay two machines, so "All machines" falls back to the
+  // first and the pill says which one is on screen -- better than silently
+  // splicing two engines along one time axis.
+  const every=(payload&&payload.columns)||[];
+  const drawn=MACHINE||[...new Set(every.map(c=>c.machine_name))].sort()[0];
+  const mine=every.filter(c=>c.machine_name===drawn);
   const cols=mine.slice(-Math.max(1,parseInt($("specMins").value,10)||15));
   specState.cols=cols;
   const canvas=$("spectro");
@@ -403,7 +416,8 @@ function renderSpectrogram(payload,health){
 
   const nBins=cols[0].n_bins, df=cols[0].df_hz;
   const total=cols.reduce((a,c)=>a+c.n_frames,0);
-  $("specPill").textContent=`${cols.length} min · ${total} s · ${nBins} bins · 0–${(df*(nBins-1)).toFixed(0)} Hz`;
+  $("specPill").textContent=`${drawn??""} · ${cols.length} min · ${total} s · `
+    +`${nBins} bins · 0–${(df*(nBins-1)).toFixed(0)} Hz`;
 
   const dark=isDark();
   if(dark&&!LUT_DARK)LUT_DARK=buildLUT(true);
@@ -569,25 +583,83 @@ function lineChart(id,rows,pick,opts={}){
   ctx.fillText(hi.toFixed(opts.dp??3),2,10);
   ctx.fillText(lo.toFixed(opts.dp??3),2,h-3);
 }
+// Several machines on one chart. X is real time, not row index: the machines
+// started at different moments and have different row counts, so indexing by
+// position would slide them against each other and invent a comparison that
+// is not there.
+const SERIES_VARS=["--cat-1","--cat-2","--cat-3","--cat-4","--cat-5"];
+function seriesChart(id,groups,pick,opts={}){
+  const canvas=$(id); const {ctx,w,h}=prep(canvas); const pad=16;
+  const all=groups.flatMap(g=>g.rows);
+  const vals=all.map(pick).filter(v=>v!=null&&isFinite(v));
+  if(!vals.length)return;
+  const ts=all.map(r=>new Date(r.minute_ts).getTime()).filter(isFinite);
+  let t0=Math.min(...ts), t1=Math.max(...ts); if(t1<=t0)t1=t0+60000;
+  let lo=Math.min(...vals),hi=Math.max(...vals);
+  if(hi-lo<1e-9){hi+=1;lo-=1;} const q=(hi-lo)*.15; lo-=q; hi+=q;
+  ctx.strokeStyle=css("--rule");ctx.lineWidth=1;
+  for(let i=0;i<=2;i++){const y=pad+(h-pad*2)*(i/2);
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+  const X=r=>((new Date(r.minute_ts).getTime()-t0)/(t1-t0))*w;
+  const Y=v=>h-pad-(h-pad*2)*((v-lo)/(hi-lo));
+  groups.forEach((g,gi)=>{
+    ctx.beginPath();let started=false;
+    g.rows.forEach(r=>{const v=pick(r);if(v==null||!isFinite(v))return;
+      started?ctx.lineTo(X(r),Y(v)):(ctx.moveTo(X(r),Y(v)),started=true);});
+    ctx.strokeStyle=css(SERIES_VARS[gi%SERIES_VARS.length]);ctx.lineWidth=2;ctx.stroke();
+    const lastRow=[...g.rows].reverse().find(r=>{const v=pick(r);return v!=null&&isFinite(v);});
+    if(lastRow){ctx.fillStyle=css(SERIES_VARS[gi%SERIES_VARS.length]);
+      ctx.beginPath();ctx.arc(X(lastRow),Y(pick(lastRow)),3.5,0,6.284);ctx.fill();}
+  });
+  ctx.fillStyle=css("--muted");ctx.font="9px ui-monospace, monospace";
+  ctx.fillText(hi.toFixed(opts.dp??3),2,10);
+  ctx.fillText(lo.toFixed(opts.dp??3),2,h-3);
+}
+
 function renderHealth(rows){
   const has=rows&&rows.length;
   $("healthEmpty").style.display=has?"none":"block";
   ["cRms","cCrest","cKurt","cRpm"].forEach(i=>$(i).style.display=has?"block":"none");
   if(!has){$("healthPill").textContent="—";return;}
-  $("healthPill").textContent=`${MACHINE?MACHINE+" · ":""}`
+  const names=[...new Set(rows.map(r=>r.machine_name))].sort();
+  const multi = !MACHINE && names.length>1;
+  $("healthPill").textContent=(MACHINE?MACHINE+" · ":multi?names.length+" machines · ":"")
     +`${rows.length} minute${rows.length>1?"s":""}`;
-  lineChart("cRms",rows,r=>r.rms_r,{dp:4});
-  lineChart("cCrest",rows,r=>r.crest_r,{dp:2});
-  lineChart("cKurt",rows,r=>r.kurtosis_r,{dp:2});
-  lineChart("cRpm",rows,r=>r.avg_rpm,{dp:0});
-  const L=rows[rows.length-1];
-  $("rmsNow").textContent=fmt.num(L.rms_r,4)+" g";
-  $("crestNow").textContent=fmt.num(L.crest_r,2);
-  $("kurtNow").textContent=fmt.num(L.kurtosis_r,2);
-  $("rpmNow").textContent=fmt.num(L.avg_rpm,0)+" RPM";
-  const seen=[...new Set(rows.map(r=>r.mode_max))];
-  $("modeLegend").innerHTML=MODES.filter(m=>seen.includes(m)).map(m=>
-    `<span><i style="background:${css(MODE_VAR[m])}"></i>${m}</span>`).join("");
+
+  if(multi){
+    // One line per machine on a shared time axis. Mode shading is dropped:
+    // each machine is in its own fault mode, so a single band behind both
+    // would assert something false about whichever it did not describe.
+    const groups=names.map(n=>({name:n,rows:rows.filter(r=>r.machine_name===n)}));
+    seriesChart("cRms",groups,r=>r.rms_r,{dp:4});
+    seriesChart("cCrest",groups,r=>r.crest_r,{dp:2});
+    seriesChart("cKurt",groups,r=>r.kurtosis_r,{dp:2});
+    seriesChart("cRpm",groups,r=>r.avg_rpm,{dp:0});
+    const tail=(g,k)=>{const r=[...g.rows].reverse().find(x=>x[k]!=null);return r?r[k]:null;};
+    const label=(k,d,suffix="")=>groups.map(g=>`${g.name.replace(/^.*_/,"")} ${fmt.num(tail(g,k),d)}${suffix}`).join("  ·  ");
+    $("rmsNow").textContent=label("rms_r",4," g");
+    $("crestNow").textContent=label("crest_r",2);
+    $("kurtNow").textContent=label("kurtosis_r",2);
+    $("rpmNow").textContent=label("avg_rpm",0," RPM");
+    $("modeLegend").innerHTML=groups.map((g,i)=>{
+      const m=tail(g,"mode_max");
+      return `<span><i style="background:${css(SERIES_VARS[i%SERIES_VARS.length])}"></i>`
+           +`${g.name}${m?` · now ${m}`:""}</span>`;
+    }).join("");
+  } else {
+    lineChart("cRms",rows,r=>r.rms_r,{dp:4});
+    lineChart("cCrest",rows,r=>r.crest_r,{dp:2});
+    lineChart("cKurt",rows,r=>r.kurtosis_r,{dp:2});
+    lineChart("cRpm",rows,r=>r.avg_rpm,{dp:0});
+    const L=rows[rows.length-1];
+    $("rmsNow").textContent=fmt.num(L.rms_r,4)+" g";
+    $("crestNow").textContent=fmt.num(L.crest_r,2);
+    $("kurtNow").textContent=fmt.num(L.kurtosis_r,2);
+    $("rpmNow").textContent=fmt.num(L.avg_rpm,0)+" RPM";
+    const seen=[...new Set(rows.map(r=>r.mode_max))];
+    $("modeLegend").innerHTML=MODES.filter(m=>seen.includes(m)).map(m=>
+      `<span><i style="background:${css(MODE_VAR[m])}"></i>${m}</span>`).join("");
+  }
   const body=document.querySelector("#health tbody");
   body.innerHTML=rows.slice().reverse().slice(0,20).map(r=>`<tr>
     <td class="mono">${fmt.time(r.minute_ts).slice(0,16)}</td><td>${r.machine_name??"—"}</td>
