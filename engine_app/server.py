@@ -81,6 +81,16 @@ HOST = hostmetrics.HostMetrics(
 #: without `--notify`, or a lost request.
 DEFAULT_REFRESH = 15.0
 
+#: Floor between two catalog reads, however many notifications arrive.
+#: `--notify` pokes after EVERY pipeline cycle, so on a busy pipeline that is a
+#: poke every 2 seconds -- and every refresh takes the single-attach lock the
+#: writer needs. Measured on a Pi 5 with two producers: committing cycles run
+#: 1.2-1.6 s of a 2 s interval, so honouring every poke put this reader into
+#: the writer's small remaining gap over and over and failed ~28% of cycles.
+#: Coalescing pokes to one read every few seconds costs a little freshness on
+#: a page a human reads, and hands the gap back to the writer.
+MIN_POKE_SECONDS = float(os.environ.get("ENG_MIN_POKE_SECONDS", "5"))
+
 #: Extra wait after losing the race to the pipeline. Longer than the refresh
 #: interval on purpose: the writer has no retry of its own, so the reader is
 #: the one that has to give ground.
@@ -593,12 +603,22 @@ def refresher(interval: float, stop: threading.Event) -> None:
         # Yield harder after losing the race: the pipeline has no retry of its
         # own, so competing on equal terms means the writer loses.
         wait = YIELD_SECONDS if busy else interval
-        remaining = max(0.5, wait - (time.monotonic() - started))
+
+        # Hold the floor first, ignoring pokes. Pokes arriving inside it are
+        # coalesced into the single read that follows -- the page still ends up
+        # showing the newest commit, it just does not take the lock once per
+        # cycle to do it.
+        floor_left = MIN_POKE_SECONDS - (time.monotonic() - started)
+        if floor_left > 0:
+            if stop.wait(floor_left):
+                return
+            WAKE.clear()
 
         # Wake early if the pipeline says it has just finished a cycle. The
         # flag is cleared before the next read rather than after, so a poke
         # arriving *during* a read still schedules one more.
-        if WAKE.wait(remaining):
+        remaining = max(0.0, wait - (time.monotonic() - started))
+        if remaining > 0 and WAKE.wait(remaining):
             WAKE.clear()
         if stop.is_set():
             return
