@@ -46,6 +46,10 @@
   h1{font-size:1.4rem;font-weight:650;letter-spacing:-.015em;margin:0}
   h1 span{color:var(--muted);font-weight:400}
   .statusline{display:flex;align-items:center;gap:.55rem;font-size:.82rem;color:var(--muted)}
+  .statusline select{font:inherit;font-size:.8rem;padding:.2em .45em;margin-left:.3em;
+    border-radius:5px;border:1px solid var(--rule-strong);background:var(--surface);
+    color:var(--ink);cursor:pointer}
+  .statusline select:hover{border-color:var(--accent);color:var(--accent)}
   .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
   .dot.live{background:var(--live);box-shadow:0 0 0 3px var(--live-soft)}
   .dot.busy{background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
@@ -129,6 +133,9 @@
 <header>
   <h1>Engine vibration <span>lakehouse</span></h1>
   <div class="statusline">
+    <label id="machineWrap" hidden>Machine
+      <select id="machineSel"></select>
+    </label>
     <span class="dot" id="dot"></span><span id="state">connecting…</span>
     <span aria-hidden="true">·</span><span id="clock">—</span>
   </div>
@@ -266,6 +273,33 @@
 const $ = (id) => document.getElementById(id);
 const REFRESH_MS = 3000;
 const MODES = ["healthy","imbalance","misalignment","bearing","looseness"];
+
+// Which machine the page is showing. Every producer publishes its own
+// `machine`, so two producers are two machines in one catalog -- and a
+// spectrogram is per machine by nature: splicing two engines along one time
+// axis would produce a picture of nothing real.
+let MACHINE = null;
+try { MACHINE = localStorage.getItem("engine.machine") || null; } catch(e) {}
+function setMachine(name){
+  MACHINE = name;
+  try { localStorage.setItem("engine.machine", name); } catch(e) {}
+}
+function syncMachines(names){
+  const sel = $("machineSel");
+  if(!names.length){ $("machineWrap").hidden = true; return; }
+  if(!names.includes(MACHINE)) setMachine(names[0]);
+  // Only rebuild when the set actually changed, or the open dropdown would
+  // close under the user every refresh.
+  const current = [...sel.options].map(o=>o.value).join("\u0000");
+  if(current !== names.join("\u0000")){
+    sel.innerHTML = names.map(n=>`<option value="${n}">${n}</option>`).join("");
+  }
+  sel.value = MACHINE;
+  // Hidden for a single machine: a select with one option is furniture.
+  $("machineWrap").hidden = names.length < 2;
+}
+$("machineSel").addEventListener("change", (e)=>{ setMachine(e.target.value); refresh(); });
+const forMachine = (r) => !MACHINE || (r.machine_name ?? r.machine) === MACHINE;
 const MODE_VAR = {healthy:"--cat-3", imbalance:"--cat-1", misalignment:"--cat-4",
                   bearing:"--cat-2", looseness:"--cat-5"};
 
@@ -294,17 +328,23 @@ function prep(c){const dpr=window.devicePixelRatio||1;
   return {ctx:x,w,h};}
 
 /* ---------- tiles ---------- */
-function renderTiles(s){
-  const loss=s.loss_pct;
+function renderTiles(s,hrows){
+  // Per machine. The server's latest_* fields are whichever row sorted last
+  // across every machine, which with two producers is essentially arbitrary --
+  // so prefer the selected machine's own newest minute when we have it.
+  const L=(hrows&&hrows.length)?hrows[hrows.length-1]:null;
+  const mine=(s.machines_landing||[]).find(b=>b.machine===MACHINE);
+  const loss=mine?mine.loss_pct:s.loss_pct;
   const t=[
-    {k:"Mode",v:s.latest_mode_max??"—",sub:"commanded by the simulator",accent:true},
-    {k:"Shaft speed",v:s.latest_avg_rpm?Math.round(s.latest_avg_rpm):"—",sub:"RPM, last minute"},
-    {k:"RMS",v:s.latest_rms_r!=null?Number(s.latest_rms_r).toFixed(4):"—",sub:"g, last minute"},
-    {k:"Crest",v:s.latest_crest_r!=null?Number(s.latest_crest_r).toFixed(2):"—",sub:"peak / RMS"},
-    {k:"Kurtosis",v:s.latest_kurtosis_r!=null?Number(s.latest_kurtosis_r).toFixed(2):"—",sub:"impulsiveness"},
-    {k:"Readings",v:fmt.int(s.readings??0),sub:"fact_engine_vibration"},
+    {k:"Mode",v:(L?L.mode_max:s.latest_mode_max)??"—",sub:"commanded by the simulator",accent:true},
+    {k:"Shaft speed",v:(L?.avg_rpm??s.latest_avg_rpm)?Math.round(L?.avg_rpm??s.latest_avg_rpm):"—",sub:"RPM, last minute"},
+    {k:"RMS",v:(L?.rms_r??s.latest_rms_r)!=null?Number(L?.rms_r??s.latest_rms_r).toFixed(4):"—",sub:"g, last minute"},
+    {k:"Crest",v:(L?.crest_r??s.latest_crest_r)!=null?Number(L?.crest_r??s.latest_crest_r).toFixed(2):"—",sub:"peak / RMS"},
+    {k:"Kurtosis",v:(L?.kurtosis_r??s.latest_kurtosis_r)!=null?Number(L?.kurtosis_r??s.latest_kurtosis_r).toFixed(2):"—",sub:"impulsiveness"},
+    {k:"Readings",v:fmt.int(s.readings??0),
+     sub:(s.machines_landing||[]).length>1?"all machines":"fact_engine_vibration"},
     {k:"Message loss",v:loss==null?"—":loss.toFixed(2)+"%",
-     sub:loss==null?"—":(loss>1?"dropping messages":"keeping up"),
+     sub:loss==null?"—":(mine?MACHINE:"all machines")+(loss>1?" · dropping":" · keeping up"),
      warn:loss!=null&&loss>1, bad:loss!=null&&loss>5},
     {k:"Chunks remaining",v:fmt.int(s.chunks_remaining??0),
      sub:`of ${fmt.int(s.chunks_total??0)} landed`, warn:(s.chunks_remaining??0)>3},
@@ -352,8 +392,8 @@ function buildLUT(dark){
 let specState={cols:[],dbMin:-90,dbMax:-10,orders:true,minutes:15};
 
 function renderSpectrogram(payload,health){
-  const all=(payload&&payload.columns)||[];
-  const cols=all.slice(-Math.max(1,parseInt($("specMins").value,10)||15));
+  const mine=((payload&&payload.columns)||[]).filter(forMachine);
+  const cols=mine.slice(-Math.max(1,parseInt($("specMins").value,10)||15));
   specState.cols=cols;
   const canvas=$("spectro");
   canvas.style.display=cols.length?"block":"none";
@@ -534,7 +574,8 @@ function renderHealth(rows){
   $("healthEmpty").style.display=has?"none":"block";
   ["cRms","cCrest","cKurt","cRpm"].forEach(i=>$(i).style.display=has?"block":"none");
   if(!has){$("healthPill").textContent="—";return;}
-  $("healthPill").textContent=`${rows.length} minute${rows.length>1?"s":""}`;
+  $("healthPill").textContent=`${MACHINE?MACHINE+" · ":""}`
+    +`${rows.length} minute${rows.length>1?"s":""}`;
   lineChart("cRms",rows,r=>r.rms_r,{dp:4});
   lineChart("cCrest",rows,r=>r.crest_r,{dp:2});
   lineChart("cKurt",rows,r=>r.kurtosis_r,{dp:2});
@@ -560,13 +601,17 @@ function renderHealth(rows){
 }
 
 /* ---------- waveform ---------- */
-function renderWave(wf){
+function renderWave(all){
+  // `all` is {machine: waveform}. Fall back to any available trace rather than
+  // showing nothing when the selected machine has not landed a chunk yet.
+  const wf=(all&&(all[MACHINE]||all[Object.keys(all)[0]]))||null;
   const has=wf&&wf.v&&wf.v.length>1;
   $("wave").style.display=has?"block":"none";
   $("waveEmpty").style.display=has?"none":"block";
   if(!has){$("wavePill").textContent="—";return;}
   const v=wf.v;
-  $("wavePill").textContent=`${v.length} samples · ${(v.length*wf.dt_ms/1000).toFixed(1)} s`;
+  $("wavePill").textContent=`${wf.machine??""} · ${v.length} samples · `
+    +`${(v.length*wf.dt_ms/1000).toFixed(1)} s`;
   const {ctx,w,h}=prep($("wave"));const pad=14;
   const m=Math.max(...v.map(Math.abs))*1.1||1;
   ctx.strokeStyle=css("--rule");ctx.beginPath();
@@ -733,7 +778,7 @@ async function refresh(){
     const s=await get("/api/status"); busy=0;
     if(!s.catalog_exists){setState("busy","waiting for the first commit");
       banner("busy","The pipeline has not written anything yet. Start it and this page fills in on its own.");
-      renderTiles(s);
+      renderTiles(s,null);
       get("/api/host?minutes="+encodeURIComponent($("hostMins").value))
         .then(renderHost).catch(()=>{});
       return;}
@@ -746,8 +791,17 @@ async function refresh(){
     // this one still answers while the pipeline is mid-write.
     get("/api/host?minutes="+encodeURIComponent($("hostMins").value))
       .then(renderHost).catch(()=>{});
-    renderTiles(s); renderHealth(health);
-    renderSpectrogram(spec,health); renderWave(wave);
+    // Build the machine list from every source, so a machine that has landed
+    // data but not yet been folded into a minute still appears.
+    const names=[...new Set([
+      ...(s.machines_landing||[]).map(b=>b.machine),
+      ...health.map(r=>r.machine_name),
+      ...((spec&&spec.columns)||[]).map(c=>c.machine_name),
+    ].filter(Boolean))].sort();
+    syncMachines(names);
+    const hrows=health.filter(forMachine);
+    renderTiles(s,hrows); renderHealth(hrows);
+    renderSpectrogram(spec,hrows); renderWave(wave);
     renderThroughput(thru); renderMachines(machines);
     if(!readLoaded){readLoaded=true;loadReadings(null);}
     $("foot").textContent=`read-only · the catalog is read once per refresh by one background thread; HTTP requests never touch it · refreshed ${new Date().toTimeString().slice(0,8)}`;
