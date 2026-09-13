@@ -55,10 +55,24 @@ from urllib.parse import parse_qs, urlparse
 import duckdb
 import numpy as np
 
+import hostmetrics
+
 HERE = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get("ENG_ROOT", str(Path.home() / "engine-lake")))
 LANDING = Path(os.environ.get("ENG_LANDING", str(ROOT / "landing")))
 CATALOG = ROOT / "catalog.ducklake"
+
+#: Host resource sampling. Its own cadence and its own DuckDB file -- the
+#: DuckLake catalog is single-attach and the pipeline holds it, so metrics
+#: cannot live there without competing with the writer they exist to observe.
+HOST_DB = Path(os.environ.get("ENG_HOST_DB", str(ROOT / "hostmetrics.duckdb")))
+HOST_INTERVAL = float(os.environ.get("ENG_HOST_INTERVAL", "5"))
+HOST_RETAIN_HOURS = float(os.environ.get("ENG_HOST_RETAIN_HOURS", "72"))
+HOST = hostmetrics.HostMetrics(
+    HOST_DB, interval=HOST_INTERVAL,
+    flush_seconds=float(os.environ.get("ENG_HOST_FLUSH", "30")),
+    retain_hours=HOST_RETAIN_HOURS,
+)
 
 #: Fallback timer between catalog reads. Slow on purpose: the pipeline pokes
 #: `/api/refresh` the instant it finishes a cycle, and that poked read is the
@@ -66,6 +80,16 @@ CATALOG = ROOT / "catalog.ducklake"
 #: cases where no notification arrives -- pipeline not running, started
 #: without `--notify`, or a lost request.
 DEFAULT_REFRESH = 15.0
+
+#: Floor between two catalog reads, however many notifications arrive.
+#: `--notify` pokes after EVERY pipeline cycle, so on a busy pipeline that is a
+#: poke every 2 seconds -- and every refresh takes the single-attach lock the
+#: writer needs. Measured on a Pi 5 with two producers: committing cycles run
+#: 1.2-1.6 s of a 2 s interval, so honouring every poke put this reader into
+#: the writer's small remaining gap over and over and failed ~28% of cycles.
+#: Coalescing pokes to one read every few seconds costs a little freshness on
+#: a page a human reads, and hands the gap back to the writer.
+MIN_POKE_SECONDS = float(os.environ.get("ENG_MIN_POKE_SECONDS", "5"))
 
 #: Extra wait after losing the race to the pipeline. Longer than the refresh
 #: interval on purpose: the writer has no retry of its own, so the reader is
@@ -139,6 +163,14 @@ CACHE: dict = {"state": "starting", "catalog_exists": CATALOG.exists()}
 CACHE_LOCK = threading.Lock()
 
 
+def hostmetrics_active(n: int) -> None:
+    """Tell the host sampler how many producers are publishing."""
+    try:
+        HOST.set_active_machines(n)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def read_landing() -> dict:
     """The fresh end of the pipe. No catalog, so nothing can block it.
 
@@ -159,38 +191,120 @@ def read_landing() -> dict:
         return out
     # Newest few only: reading every file would make this slower the longer the
     # deployment has run, which is the one thing a status endpoint must not do.
-    flist = "[" + ",".join(f"'{f}'" for f in files[-8:]) + "]"
+    #
+    # Scaled by machine count, because the window is per *file* and the files of
+    # N producers interleave. A fixed 8 covers four chunks each at two machines
+    # and fewer as machines are added -- so a slower producer drops out of the
+    # window entirely and silently vanishes from the loss breakdown and the
+    # waveform list. The count comes from the previous snapshot, which costs
+    # nothing, and the cap keeps this bounded however many machines appear.
+    known = 1
+    with CACHE_LOCK:
+        known = max(1, int(CACHE.get("machine_count") or 1))
+    flist = "[" + ",".join(f"'{f}'" for f in files[-min(40, 8 * known):]) + "]"
     con = duckdb.connect()
     try:
         # Message loss, exactly, from `seq` -- and with no catalog, so this
         # number is available even while the pipeline holds the lock. It is the
         # answer to "are we really achieving 500 Hz", which at this rate is the
         # first thing that goes wrong.
-        row = con.execute(
-            f"SELECT count(*), max(timestamp), min(seq), max(seq), "
-            f"count(DISTINCT seq) FROM read_parquet({flist})"
-        ).fetchone()
-        rows, latest, lo, hi, distinct = row
+        # GROUPED BY MACHINE, and that grouping is load-bearing. `seq` is a
+        # per-producer counter that starts at 0, so two producers pooled give
+        # min(seq)=0 and max(seq)=N across twice as many rows -- which reports
+        # -100% loss and N duplicates when nothing at all is wrong. Each
+        # producer's range has to be measured on its own and only then summed.
+        per = con.execute(
+            f"SELECT machine, count(*) AS n, min(seq) AS lo, max(seq) AS hi, "
+            f"count(DISTINCT seq) AS distinct_seq, max(timestamp) AS latest "
+            f"FROM read_parquet({flist}) GROUP BY machine ORDER BY machine"
+        ).fetchall()
+        rows = sum(r[1] for r in per)
+        latest = max((r[5] for r in per if r[5]), default=None)
         out["landing_recent_rows"] = rows
         out["landing_latest"] = latest.isoformat() if latest else None
-        if lo is not None and hi is not None and hi >= lo:
-            expected = hi - lo + 1
-            out["loss_pct"] = round(100.0 * (1.0 - rows / expected), 3)
-            out["duplicate_rows"] = rows - distinct
+
+        expected_total = 0
+        dup_total = 0
+        breakdown = []
+        for machine, n, lo, hi, distinct_seq, mlatest in per:
+            exp = (hi - lo + 1) if (lo is not None and hi is not None
+                                    and hi >= lo) else None
+            dup = n - distinct_seq
+            if exp:
+                expected_total += exp
+                dup_total += dup
+            breakdown.append({
+                "machine": machine,
+                "rows": n,
+                "loss_pct": round(100.0 * (1.0 - n / exp), 3) if exp else None,
+                "duplicate_rows": dup,
+                "latest": mlatest.isoformat() if mlatest else None,
+            })
+        out["machines_landing"] = breakdown
+        if latest:
+            out["landing_lag_seconds"] = round(
+                (datetime.now(timezone.utc).replace(tzinfo=None)
+                 - latest).total_seconds(), 1)
+
+        # How many producers are actually feeding this Pi, measured from the
+        # DATA rather than from local processes. Producers normally run on a
+        # laptop and publish over MQTT, so the process count on the Pi is 0 no
+        # matter how many are running -- which is the number an operator most
+        # wants and the one the host dashboard was getting wrong.
+        #
+        # "Recently" is generous on purpose: chunks flush every 10 s by default,
+        # so a producer is only visible here once its chunk lands. A 90 s window
+        # tolerates a slow flush without flapping.
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        active = 0
+        for entry in breakdown:
+            if not entry["latest"]:
+                continue
+            try:
+                seen = datetime.fromisoformat(entry["latest"])
+            except ValueError:
+                continue
+            age = (now_utc - seen).total_seconds()
+            entry["seconds_since_seen"] = round(age, 1)
+            entry["active"] = age <= 90
+            active += 1 if entry["active"] else 0
+        out["active_machines"] = active
+        hostmetrics_active(active)
+
+        if expected_total:
+            out["loss_pct"] = round(100.0 * (1.0 - rows / expected_total), 3)
+            out["duplicate_rows"] = dup_total
         # The live waveform, columnar. 1,250 numbers is ~10 KB; the same rows as
         # objects would be ~90 KB. Legal because the sampling really is uniform,
         # and `seq_deficit` says so if it stops being.
-        wave = con.execute(
-            f"SELECT timestamp, vib_r FROM read_parquet({flist}) "
-            f"ORDER BY timestamp DESC LIMIT 1250"
-        ).fetchall()
-        if wave:
+        # One waveform PER MACHINE, keyed by name. Pooling producers into a
+        # single trace would interleave two unrelated vibration signals -- which
+        # still looks like a waveform, just not like either engine's.
+        #
+        # Capped at the four most recently active machines. Each is ~1,250
+        # numbers (~10 KB columnar), and the cap is what stops this endpoint
+        # growing without bound as machines are added.
+        dt_ms = 1000.0 / float(os.environ.get("ENG_SAMPLE_RATE_HZ", "500"))
+        waveforms = {}
+        recent = sorted(breakdown, key=lambda b: b["latest"] or "",
+                        reverse=True)[:4]
+        for entry in recent:
+            wave = con.execute(
+                f"SELECT timestamp, vib_r FROM read_parquet({flist}) "
+                f"WHERE machine = ? ORDER BY timestamp DESC LIMIT 1250",
+                [entry["machine"]],
+            ).fetchall()
+            if not wave:
+                continue
             wave.reverse()
-            out["waveform"] = {
+            waveforms[entry["machine"]] = {
+                "machine": entry["machine"],
                 "t0": wave[0][0].isoformat(),
-                "dt_ms": 1000.0 / float(os.environ.get("ENG_SAMPLE_RATE_HZ", "500")),
+                "dt_ms": dt_ms,
                 "v": [round(float(r[1]), 5) for r in wave],
             }
+        if waveforms:
+            out["waveforms"] = waveforms
     except Exception as exc:  # noqa: BLE001
         out["landing_error"] = str(exc)[:200]
     finally:
@@ -310,13 +424,44 @@ def read_catalog(r: Reader) -> dict:
             "peak_r, crest_r, kurtosis_r, skew_r, rms_a, axial_ratio, avg_rpm, "
             "min_rpm, max_rpm, shaft_hz, mode_min, mode_max, mode_changed, "
             "seq_deficit FROM l.marts.v_engine_minute_health "
-            "ORDER BY minute_ts DESC LIMIT 90"
+            # Per machine. A flat LIMIT 90 over two machines is 45 minutes
+            # each, silently halving the history the moment a second producer
+            # starts -- and the charts would interleave them besides.
+            "QUALIFY row_number() OVER (PARTITION BY machine_name "
+            "                           ORDER BY minute_ts DESC) <= 90 "
+            "ORDER BY minute_ts DESC"
         )))
         latest = out["health"][-1] if out["health"] else None
         if latest:
             for k in ("rms_r", "crest_r", "kurtosis_r", "avg_rpm",
                       "axial_ratio", "mode_max"):
                 out[f"latest_{k}"] = latest.get(k)
+
+    if r.table_exists("marts.v_engine_minute_anomaly"):
+        out["anomaly"] = list(reversed(r.query(
+            "SELECT minute_ts, machine_name, score, status, top_driver, "
+            "z_rms, z_crest, z_kurtosis, z_axial, z_skew, baseline_minutes, "
+            "mode_max, mode_changed FROM l.marts.v_engine_minute_anomaly "
+            "QUALIFY row_number() OVER (PARTITION BY machine_name "
+            "                           ORDER BY minute_ts DESC) <= 90 "
+            "ORDER BY minute_ts DESC")))
+
+    # End-to-end delay, computed in SQL. `now()` is TIMESTAMP WITH TIME ZONE and
+    # fetching one needs pytz, which is not a dependency (trap 5) -- so the
+    # subtraction happens inside DuckDB and only an integer crosses into Python.
+    if r.table_exists("curated.fact_engine_vibration"):
+        lag = r.query(
+            "SELECT date_diff('second', max(timestamp), "
+            "                 (get_current_timestamp() AT TIME ZONE 'UTC')) AS fact_lag_s "
+            "FROM l.curated.fact_engine_vibration")[0]
+        out["fact_lag_seconds"] = lag["fact_lag_s"]
+
+    if r.table_exists("marts.engine_minute_health"):
+        lag = r.query(
+            "SELECT date_diff('second', max(window_ts), "
+            "                 (get_current_timestamp() AT TIME ZONE 'UTC')) AS mart_lag_s "
+            "FROM l.marts.engine_minute_health")[0]
+        out["mart_lag_seconds"] = lag["mart_lag_s"]
 
     if r.table_exists("marts.v_engine_minute_spectrogram"):
         out["spectrogram"] = read_spectrogram(r)
@@ -346,11 +491,17 @@ def read_spectrogram(r: Reader, minutes: int = 15) -> list[dict]:
     """
     import base64
 
+    # Per machine, for the same reason as the health query: a flat LIMIT over
+    # two machines returns half the window each AND alternates between them, so
+    # the heatmap would splice two engines into one picture along the time axis.
+    # The page picks which machine to draw.
     rows = r.query(
         "SELECT window_ts, machine_name, sample_count, n_bins, n_frames, "
         "df_hz, hop_seconds, frame_seconds, sample_rate_hz, spec_db "
         "FROM l.marts.v_engine_minute_spectrogram "
-        "ORDER BY window_ts DESC LIMIT ?", [minutes]
+        "QUALIFY row_number() OVER (PARTITION BY machine_name "
+        "                           ORDER BY window_ts DESC) <= ? "
+        "ORDER BY window_ts DESC", [minutes]
     )
     span = DB_MAX - DB_MIN
     out = []
@@ -363,11 +514,11 @@ def read_spectrogram(r: Reader, minutes: int = 15) -> list[dict]:
         row["window_ts"] = row["window_ts"].isoformat()
         row["data"] = base64.b64encode(u8.tobytes()).decode("ascii")
         out.append(row)
-    if out:
-        # The newest minute is still being recomputed every cycle and its frame
-        # count grows. Saying so beats someone reporting the last column as a
-        # bug once a week for ever.
-        out[-1]["in_progress"] = True
+    # Per machine: each one has its own newest, still-growing minute.
+    for machine in {row["machine_name"] for row in out}:
+        mine = [row for row in out if row["machine_name"] == machine]
+        if mine:
+            mine[-1]["in_progress"] = True
     return out
 
 
@@ -403,7 +554,8 @@ def refresh_once() -> None:
             # exists to show.
             for key in ("readings", "locations", "latest_reading", "hours",
                         "minutes", "spectrograms", "machines", "machine_count",
-                        "health", "spectrogram", "throughput",
+                        "health", "spectrogram", "throughput", "anomaly",
+                        "fact_lag_seconds", "mart_lag_seconds",
                         "latest_rms_r", "latest_crest_r", "latest_kurtosis_r",
                         "latest_avg_rpm", "latest_axial_ratio", "latest_mode_max",
                         "chunks_processed", "models_consuming"):
@@ -451,12 +603,22 @@ def refresher(interval: float, stop: threading.Event) -> None:
         # Yield harder after losing the race: the pipeline has no retry of its
         # own, so competing on equal terms means the writer loses.
         wait = YIELD_SECONDS if busy else interval
-        remaining = max(0.5, wait - (time.monotonic() - started))
+
+        # Hold the floor first, ignoring pokes. Pokes arriving inside it are
+        # coalesced into the single read that follows -- the page still ends up
+        # showing the newest commit, it just does not take the lock once per
+        # cycle to do it.
+        floor_left = MIN_POKE_SECONDS - (time.monotonic() - started)
+        if floor_left > 0:
+            if stop.wait(floor_left):
+                return
+            WAKE.clear()
 
         # Wake early if the pipeline says it has just finished a cycle. The
         # flag is cleared before the next read rather than after, so a poke
         # arriving *during* a read still schedules one more.
-        if WAKE.wait(remaining):
+        remaining = max(0.0, wait - (time.monotonic() - started))
+        if remaining > 0 and WAKE.wait(remaining):
             WAKE.clear()
         if stop.is_set():
             return
@@ -528,14 +690,16 @@ ROUTES = {
         # polled most often. Leaving it in made /api/status 12 KB when it
         # should be 2.
         if k not in ("health", "spectrogram", "throughput", "machines",
-                     "waveform")
+                     "waveform", "waveforms", "anomaly")
     },
     "/api/health": lambda q: snapshot().get("health", []),
+    "/api/anomaly": lambda q: snapshot().get("anomaly", []),
     "/api/spectrogram": lambda q: {
         "db_min": DB_MIN, "db_max": DB_MAX, "encoding": "u8",
         "columns": snapshot().get("spectrogram", []),
     },
-    "/api/waveform": lambda q: snapshot().get("waveform", {}),
+    # A dict keyed by machine name; the page draws whichever is selected.
+    "/api/waveform": lambda q: snapshot().get("waveforms", {}),
     "/api/machines": lambda q: snapshot().get("machines", []),
     "/api/throughput": lambda q: snapshot().get("throughput", []),
     # The only endpoint that reads the catalog live; see `live_readings`.
@@ -543,6 +707,12 @@ ROUTES = {
         int(q.get("limit", ["50"])[0]),
         (q.get("before") or [None])[0],
         (q.get("machine") or [None])[0],
+    ),
+    # Host resources. Served from the sampler's in-memory ring, so this never
+    # touches the metrics file either -- same discipline as the catalog.
+    "/api/host": lambda q: HOST.series(
+        minutes=float((q.get("minutes") or ["30"])[0]),
+        points=int((q.get("points") or ["240"])[0]),
     ),
     "/api/all": lambda q: snapshot(),
 }
@@ -672,12 +842,23 @@ def main() -> int:
     print(f"refresh : one catalog read every {args.refresh:g}s, cached — HTTP "
           f"requests never touch the catalog")
 
+    print(f"host    : sampling every {HOST_INTERVAL:g}s -> {HOST_DB} "
+          f"(keeping {HOST_RETAIN_HOURS:g}h)")
+
     stop = threading.Event()
     worker = threading.Thread(
         target=refresher, args=(args.refresh, stop), daemon=True,
         name="catalog-refresher",
     )
     worker.start()
+
+    # Separate thread, steady cadence. Sampling from the refresher would tie
+    # the resource trend to catalog activity and leave gaps exactly when the
+    # machine is busiest -- which is when the trend is worth having.
+    sampler = threading.Thread(
+        target=HOST.run, args=(stop,), daemon=True, name="host-sampler",
+    )
+    sampler.start()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
