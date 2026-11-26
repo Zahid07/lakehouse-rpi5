@@ -207,3 +207,88 @@ SELECT
          ELSE 'normal'
     END                                                            AS status
 FROM z;
+
+
+-- ==========================================================================
+-- Audit views, for comparing this pipeline with the ClickHouse port. Same
+-- names and columns as engine.v_audit_reading / engine.v_audit_minute there;
+-- definitions in ~/clickhouse_implementation/engine_pipeline/research/AUDIT.md.
+--
+-- stored_at is derived, not stored: each landed row carries its chunk (the
+-- landing directory), duckstream.consumed_files records which batch consumed
+-- that chunk for each model, and duckstream.batches records when the batch
+-- committed. All times are naive UTC, like everything else here.
+-- ==========================================================================
+
+-- One row per reading.
+CREATE OR REPLACE VIEW curated.v_audit_reading AS
+WITH commits AS (
+    SELECT split_part(c.relpath, '/', 1) AS chunk, min(b.committed_at) AS committed_at
+    FROM duckstream.consumed_files c
+    JOIN duckstream.batches b
+      ON b.model_name = c.model_name AND b.batch_id = c.batch_id
+    WHERE c.model_name = 'fact_engine_vibration'
+    GROUP BY 1
+)
+SELECT
+    'duckdb'                                              AS implementation,
+    f.run_id,
+    f.machine,
+    f.seq,
+    f.timestamp,
+    f.sent_at,
+    f.received_at,
+    f.landed_at,
+    k.committed_at                                        AS stored_at,
+    date_diff('millisecond', f.timestamp, f.sent_at)      AS producer_lag_ms,   -- sample -> sent
+    date_diff('millisecond', f.sent_at, f.received_at)    AS transport_lag_ms,  -- sent -> received (MQTT, RabbitMQ)
+    date_diff('millisecond', f.received_at, f.landed_at)  AS landing_lag_ms,    -- received -> landed (flush)
+    date_diff('millisecond', f.landed_at, k.committed_at) AS store_lag_ms,      -- landed -> queryable (batch commit)
+    date_diff('millisecond', f.sent_at, k.committed_at)   AS end_to_end_ms,     -- sent -> queryable
+    date_diff('millisecond', f.timestamp, k.committed_at) AS sample_to_stored_ms
+FROM curated.fact_engine_vibration f
+LEFT JOIN commits k ON k.chunk = f.chunk;
+
+
+-- One row per machine-minute. ready_at = when the minute's final value was
+-- committed: the batch (of that model) that consumed the newest chunk
+-- touching the minute. Here a minute is stored when it is committed, so
+-- stored_at = ready_at; *_store_count is NULL (not tracked per row).
+CREATE OR REPLACE VIEW marts.v_audit_minute AS
+WITH commits AS (
+    SELECT c.model_name, split_part(c.relpath, '/', 1) AS chunk,
+           min(b.committed_at) AS committed_at
+    FROM duckstream.consumed_files c
+    JOIN duckstream.batches b
+      ON b.model_name = c.model_name AND b.batch_id = c.batch_id
+    GROUP BY 1, 2
+)
+SELECT
+    'duckdb'                                                   AS implementation,
+    h.run_id,
+    h.machine,
+    h.window_ts                                                AS minute_ts,
+    h.sample_count                                             AS samples,
+    h.seq_hi - h.seq_lo + 1                                    AS expected_samples,
+    h.seq_hi - h.seq_lo + 1 - h.sample_count                   AS missing_samples,
+    h.first_sent_at,
+    h.last_sent_at,
+    h.first_received_at,
+    h.last_received_at,
+    cf.committed_at                                            AS last_stored_at,
+    ch.committed_at                                            AS health_ready_at,
+    ch.committed_at                                            AS health_stored_at,
+    CAST(NULL AS BIGINT)                                       AS health_store_count,
+    cs.committed_at                                            AS spectrogram_ready_at,
+    cs.committed_at                                            AS spectrogram_stored_at,
+    CAST(NULL AS BIGINT)                                       AS spectrogram_store_count,
+    date_diff('millisecond', h.window_ts + INTERVAL 1 MINUTE, ch.committed_at) / 1000.0 AS health_ready_lag_s,
+    date_diff('millisecond', h.window_ts + INTERVAL 1 MINUTE, ch.committed_at) / 1000.0 AS health_stored_lag_s,
+    date_diff('millisecond', h.window_ts + INTERVAL 1 MINUTE, cs.committed_at) / 1000.0 AS spectrogram_ready_lag_s,
+    date_diff('millisecond', h.window_ts + INTERVAL 1 MINUTE, cs.committed_at) / 1000.0 AS spectrogram_stored_lag_s
+FROM marts.engine_minute_health h
+LEFT JOIN marts.engine_minute_spectrogram s
+       ON s.window_ts = h.window_ts AND s.machine = h.machine
+LEFT JOIN commits cf ON cf.model_name = 'fact_engine_vibration'     AND cf.chunk = h.last_chunk
+LEFT JOIN commits ch ON ch.model_name = 'engine_minute_health'      AND ch.chunk = h.last_chunk
+LEFT JOIN commits cs ON cs.model_name = 'engine_minute_spectrogram' AND cs.chunk = s.last_chunk;

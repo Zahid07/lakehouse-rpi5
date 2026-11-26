@@ -33,9 +33,23 @@ Timing
 Sample timestamps are ``t0 + n/fs`` exactly, so the STFT's uniform-sampling
 assumption is true rather than approximately true. The wall clock is only
 consulted to decide *when to sleep*, never to stamp a sample, and sleeps use an
-**absolute** deadline so error cannot accumulate. If the stamp drifts more than
-two seconds from the wall clock it is resynchronised and logged -- the seam is
-visible in the spectrogram, which is honest.
+**absolute** deadline so error cannot accumulate. Timestamps follow the
+monotonic clock from the start instant, so they do NOT follow later wall-clock
+changes: if the system clock is stepped during a run (e.g. an NTP resync),
+timestamps carry on unchanged while `sent_at` jumps. Sync the clock BEFORE
+starting a run. (An earlier version of this note promised a resync on drift;
+no such code exists.)
+
+Audit fields (for the ClickHouse comparison): each message also carries
+`run_id` (--run-id / ENG_RUN_ID) and `sent_at`, the wall clock (UTC) when it
+was published. RabbitMQ requires a login: --user/--password or
+ENG_MQTT_USER / ENG_MQTT_PASSWORD (prompted for if missing).
+
+Batching: readings are still sampled at --rate (500 Hz), but --batch of them
+(default 50 = one 100 ms block) travel in one MQTT message, one JSON reading
+per line; the in-flight window is 10,000 messages. This matches the ClickHouse
+comparison's producer (per-message confirmations capped one-reading messages
+near 400 msg/s on the Pi). --batch 1 restores one reading per message.
 
 `seq` is a monotonic per-run sample index. It costs eight bytes and it is what
 makes "are we actually achieving 500 Hz" an exact measurement rather than a
@@ -46,6 +60,7 @@ guess: `verify --check rate` computes loss as
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import math
 import os
@@ -189,7 +204,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--landing-seconds", type=float, default=10.0,
                         help="with --landing, seconds of data per chunk")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--batch", type=int, default=int(os.environ.get("ENG_BATCH", "50")),
+                        help="readings per MQTT message (default 50; 1 = unbatched)")
+    parser.add_argument("--user", default=os.environ.get("ENG_MQTT_USER", "iot"))
+    parser.add_argument("--password", default=os.environ.get("ENG_MQTT_PASSWORD"))
+    parser.add_argument("--run-id", default=os.environ.get("ENG_RUN_ID")
+                        or datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ"),
+                        help="experiment label carried in every message (audit)")
     args = parser.parse_args(argv)
+    if not args.landing and args.user and args.password is None:
+        args.password = getpass.getpass(f"MQTT password for {args.user}: ")
 
     control = os.environ.get("ENG_CONTROL_FILE")
     control_path = Path(control) if control else None
@@ -210,7 +234,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sink = _LandingSink(Path(args.landing), args.machine, args.rate,
                         args.landing_seconds) if args.landing else \
-        _MqttSink(args.host, args.port, args.topic)
+        _MqttSink(args.host, args.port, args.topic, args.user, args.password,
+                  batch=max(1, args.batch), rate=args.rate)
 
     print(f"machine : {args.machine}")
     print(f"rate    : {args.rate:g} Hz   nominal {args.rpm:g} RPM "
@@ -220,10 +245,17 @@ def main(argv: list[str] | None = None) -> int:
     if control_path:
         print(f"control : echo bearing > {control_path}")
     print(f"sink    : {sink.describe()}")
+    print(f"run_id  : {args.run_id}")
     print()
 
     block_n = max(1, int(round(args.rate * BLOCK_SECONDS)))
-    t0 = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    # Start on the next whole second, so sample timestamps stay on round
+    # boundaries AND are the true generation times. (The original truncated
+    # the current time to the second, stamping every reading up to 1 s
+    # earlier than it was made -- which read as up to 1 s of false delay.)
+    now_wall = datetime.now(timezone.utc).replace(tzinfo=None)
+    t0 = now_wall.replace(microsecond=0) + timedelta(seconds=1)
+    time.sleep((t0 - now_wall).total_seconds())
     started = time.monotonic()
     seq = 0
     emitted = 0
@@ -253,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
                     "vib_a": round(float(axial[i]), 6),
                     "rpm": round(float(rpm[i]), 2),
                     "mode": label,
+                    "run_id": args.run_id,
                 })
             seq += block_n
             emitted += block_n
@@ -283,35 +316,61 @@ def main(argv: list[str] | None = None) -> int:
 
 
 class _MqttSink:
-    """One reading per message, QoS 1.
+    """Readings batched into QoS 1 MQTT messages, one JSON reading per line.
 
     QoS **must** be >= 1: the broker delivers at min(publish, subscribe) qos, so
     publishing at 0 would silently defeat the ingest side's whole acknowledgement
-    discipline. The in-flight window is raised well above paho's default of 20,
-    which is the first thing that bites at 500 msg/s.
+    discipline. Each message is stamped with `sent_at` when it is published.
+    A publish refused because paho's local buffer (5 minutes of readings) is
+    full is counted in `dropped` rather than lost silently.
     """
 
-    def __init__(self, host: str, port: int, topic: str) -> None:
+    def __init__(self, host: str, port: int, topic: str,
+                 user: str | None = None, password: str | None = None,
+                 batch: int = 50, rate: float = 500.0) -> None:
         import paho.mqtt.client as mqtt
 
         self.topic = topic
+        self.batch = batch
+        self.dropped = 0
+        self._pending: list[dict] = []
+        self._err_queue_size = mqtt.MQTT_ERR_QUEUE_SIZE
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-        self.client.max_inflight_messages_set(500)
-        self.client.max_queued_messages_set(20000)
+        if user:
+            self.client.username_pw_set(user, password)
+        self.client.max_inflight_messages_set(10_000)
+        self.client.max_queued_messages_set(max(1000, int(300 * rate / batch)))
         self.client.connect(host, port, keepalive=60)
         self.client.loop_start()
         self._host, self._port = host, port
 
     def describe(self) -> str:
-        return f"mqtt {self._host}:{self._port} topic {self.topic!r} qos 1"
+        return (f"mqtt {self._host}:{self._port} topic {self.topic!r} qos 1, "
+                f"{self.batch} reading(s) per message")
 
     def emit(self, record: dict) -> None:
-        self.client.publish(self.topic, json.dumps(record), qos=1)
+        self._pending.append(record)
+        if len(self._pending) >= self.batch:
+            self._publish()
+
+    def _publish(self) -> None:
+        if not self._pending:
+            return
+        records, self._pending = self._pending, []
+        sent_at = (datetime.now(timezone.utc).replace(tzinfo=None)
+                   .isoformat(sep=" ", timespec="microseconds"))
+        payload = "\n".join(json.dumps({**r, "sent_at": sent_at}) for r in records)
+        if self.client.publish(self.topic, payload, qos=1).rc == self._err_queue_size:
+            self.dropped += len(records)
+            print(f"  DROPPED {len(records)} readings (local buffer full; "
+                  f"{self.dropped:,} so far)", flush=True)
 
     def flush_if_due(self) -> None:
         pass
 
     def close(self) -> None:
+        self._publish()
+        time.sleep(1.0)
         self.client.loop_stop()
         self.client.disconnect()
 
