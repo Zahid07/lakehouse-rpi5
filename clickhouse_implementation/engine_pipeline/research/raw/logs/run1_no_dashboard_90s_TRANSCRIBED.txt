@@ -1,0 +1,14 @@
+# Transcribed verbatim from the session terminal output (the harness printed this run to stdout only).
+# 6 producers x 500 msg/s, 90 s, SQL-DFT STFT, NO dashboard running, near-empty history.
+t=10s  ready      0 unacked     0 deliver/s      0 | stored    27908  rows/s  2791  behind    0.6s | CPU ch 150% rmq  30% producers  20%
+t=20s  ready      0 unacked    76 deliver/s   3001 | stored    57900  rows/s  2999  behind    1.1s | CPU ch 109% rmq  46% producers  27%
+t=30s  ready      0 unacked  3931 deliver/s   3505 | stored    88717  rows/s  2782  behind    1.2s | CPU ch 182% rmq  54% producers  36%
+t=40s  ready      0 unacked  1534 deliver/s   2991 | stored   120052  rows/s  2830  behind    1.2s | CPU ch 118% rmq  18% producers   0%
+t=50s  ready      0 unacked   299 deliver/s   3008 | stored   153800  rows/s  3069  behind    0.5s | CPU ch 220% rmq  10% producers  20%
+t=60s  ready      0 unacked   501 deliver/s   2970 | stored   184120  rows/s  3032  behind    0.8s | CPU ch 158% rmq  50% producers  17%
+t=70s  ready      0 unacked  2723 deliver/s   2999 | stored   214901  rows/s  3078  behind      1s | CPU ch 182% rmq  46% producers  46%
+t=80s  ready      0 unacked   890 deliver/s   3064 | stored   246800  rows/s  2885  behind    0.9s | CPU ch 140% rmq  60% producers  50%
+t=90s  ready      0 unacked  3060 deliver/s   2991 | stored   270300  rows/s  2350  behind    3.6s | CPU ch 150% rmq   0% producers   0%
+t=100s  ready      0 unacked     0 deliver/s      0 | stored   270300  rows/s     0  behind     14s | CPU ch  70% rmq   0% producers   0%
+t=110s  ready      0 unacked     0 deliver/s      0 | stored   270300  rows/s     0  behind   24.4s | CPU ch 127% rmq   9% producers   0%
+Result: 6 machines x 45,050 readings stored of 45,050 sent, loss 0%.

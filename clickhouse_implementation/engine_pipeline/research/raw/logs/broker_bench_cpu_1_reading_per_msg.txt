@@ -1,0 +1,2 @@
+   avg CPU python        18%
+   avg CPU beam.smp      48%

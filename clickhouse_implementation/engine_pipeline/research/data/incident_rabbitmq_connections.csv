@@ -1,0 +1,7 @@
+connection,peer,state,recv_KB_per_s,est_msg_per_s
+producer A,192.168.0.100,running,41,280
+producer B,192.168.0.100,running,37,251
+producer C,192.168.0.100,running,25,173
+producer D,192.168.0.100,running,46,317
+producer E,192.168.0.100,blocked,39,269
+producer F,192.168.0.100,blocked,0,0

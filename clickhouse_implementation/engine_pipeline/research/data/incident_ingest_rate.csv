@@ -1,0 +1,7 @@
+bucket_utc,machine,rows_per_10s,avg_delay_ms_sensor_to_stored
+19:46:30,Karachi_ENG01,2079,90811
+19:46:30,Karachi_ENG02,1742,93221
+19:46:30,Karachi_ENG03,2104,92080
+19:46:30,Karachi_ENG04,1977,91825
+19:46:30,Karachi_ENG05,2054,95431
+19:46:30,Karachi_ENG06,2172,93076

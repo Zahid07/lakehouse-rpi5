@@ -1,0 +1,15 @@
+impl,producers,samples,soft_temp_limit_pct,capped_or_throttled_pct,undervoltage_pct,freq_min_mhz
+clickhouse,0,126,0.0,0.0,0.0,1500.0
+duckdb,0,127,0.0,0.0,0.0,1500.0
+clickhouse,1,360,0.0,0.0,0.0,1900.0
+duckdb,1,360,0.3,0.0,0.0,1500.0
+clickhouse,2,361,0.0,0.0,0.0,1800.0
+duckdb,2,360,0.0,0.0,0.0,1500.0
+clickhouse,3,360,0.0,0.0,0.0,1900.0
+duckdb,3,360,0.0,0.0,0.0,2400.0
+clickhouse,4,360,0.0,0.0,0.0,1900.0
+duckdb,4,360,0.0,0.0,0.0,2400.0
+clickhouse,5,359,0.0,0.0,0.0,1800.0
+duckdb,5,360,1.9,0.0,0.0,2400.0
+clickhouse,6,2520,0.0,0.0,0.0,1700.0
+duckdb,6,2519,48.6,0.6,0.0,2400.0
