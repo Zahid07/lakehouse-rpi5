@@ -1,0 +1,3 @@
+impl,machines,readings,expected,missing,first_minute,last_minute
+clickhouse,6,51300100,51300100,0,2026-10-07 19:54:00,2026-10-08 01:54:00
+duckdb,6,51300100,51300100,0,2026-10-12 12:34:00,2026-10-12 18:34:00

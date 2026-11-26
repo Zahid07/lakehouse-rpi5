@@ -1,0 +1,1071 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engine Vibration ClickHouse</title>
+<style>
+  :root{
+    --ground:#F6F7F9; --surface:#FFFFFF; --surface-2:#EDF0F4;
+    --ink:#161B22; --ink-soft:#3A4553; --muted:#626E7E;
+    --rule:#DCE2EA; --rule-strong:#C3CCD8;
+    --accent:#2a78d6; --accent-soft:#E3EEFB;
+    --live:#0ca30c; --live-soft:#E4EFE7;
+    --warn:#eda100; --warn-soft:#F9EFD6;
+    --alert:#e34948; --alert-soft:#FAE6E6;
+    /* Categorical slots 1-5, reference palette, fixed order. Used for the
+       five fault modes and (first three) for the three models. Every band
+       also carries a text label, so identity is never colour-alone. */
+    --cat-1:#2a78d6; --cat-2:#eb6834; --cat-3:#1baf7a;
+    --cat-4:#eda100; --cat-5:#e87ba4;
+    --shadow:0 1px 2px rgba(22,27,34,.05),0 6px 18px rgba(22,27,34,.05);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#10141A; --surface:#171C24; --surface-2:#1E242E;
+      --ink:#E6EAF0; --ink-soft:#BDC6D2; --muted:#8B97A6;
+      --rule:#2A323D; --rule-strong:#3B4451;
+      --accent:#3987e5; --accent-soft:#16304d;
+      --live:#0ca30c; --live-soft:#17301F;
+      --warn:#c98500; --warn-soft:#332715;
+      --alert:#e66767; --alert-soft:#351C22;
+      --cat-1:#3987e5; --cat-2:#d95926; --cat-3:#199e70;
+      --cat-4:#c98500; --cat-5:#d55181;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.25);
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:0 1.25rem 4rem;background:var(--ground);color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1240px;margin:0 auto}
+  code,.mono{font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace}
+  header{display:flex;flex-wrap:wrap;gap:1rem;align-items:baseline;
+    justify-content:space-between;padding:1.7rem 0 1rem;
+    border-bottom:2px solid var(--ink);margin-bottom:1.4rem}
+  h1{font-size:1.4rem;font-weight:650;letter-spacing:-.015em;margin:0}
+  h1 span{color:var(--muted);font-weight:400}
+  .statusline{display:flex;align-items:center;gap:.55rem;font-size:.82rem;color:var(--muted)}
+  .statusline select{font:inherit;font-size:.8rem;padding:.2em .45em;margin-left:.3em;
+    border-radius:5px;border:1px solid var(--rule-strong);background:var(--surface);
+    color:var(--ink);cursor:pointer}
+  .statusline select:hover{border-color:var(--accent);color:var(--accent)}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
+  .dot.live{background:var(--live);box-shadow:0 0 0 3px var(--live-soft)}
+  .dot.busy{background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
+  .dot.down{background:var(--alert);box-shadow:0 0 0 3px var(--alert-soft)}
+  @media (prefers-reduced-motion:no-preference){
+    .dot.live{animation:pulse 2.4s ease-in-out infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  }
+  /* The delay strip sits above everything: if this is stale, nothing below it
+     means what it appears to mean. */
+  .lagstrip{display:flex;flex-wrap:wrap;gap:0;margin-bottom:1rem;
+    background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+    overflow:hidden;box-shadow:var(--shadow)}
+  .lagstrip .seg{flex:1 1 130px;padding:.65rem .85rem;
+    border-right:1px solid var(--rule)}
+  .lagstrip .seg:last-child{border-right:0}
+  .lagstrip .k{font-size:.62rem;font-weight:650;letter-spacing:.09em;
+    text-transform:uppercase;color:var(--muted);margin-bottom:.2rem}
+  .lagstrip .v{font-size:1.15rem;font-weight:600;font-variant-numeric:tabular-nums;
+    letter-spacing:-.01em}
+  .lagstrip .sub{font-size:.68rem;color:var(--muted);margin-top:.1rem}
+  .lagstrip .seg.warn .v{color:var(--warn)} .lagstrip .seg.bad .v{color:var(--alert)}
+  .tiles{display:grid;gap:.8rem;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    margin-bottom:1.5rem}
+  .tile{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+    padding:.8rem .9rem;box-shadow:var(--shadow)}
+  .tile .k{font-size:.65rem;font-weight:650;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--muted);margin-bottom:.3rem}
+  .tile .v{font-size:1.45rem;font-weight:600;letter-spacing:-.02em;
+    font-variant-numeric:tabular-nums;line-height:1.15}
+  .tile .sub{font-size:.72rem;color:var(--muted);margin-top:.2rem}
+  .tile.accent .v{color:var(--accent)}
+  .tile.warn{border-color:var(--warn)} .tile.warn .v,.tile.warn .sub{color:var(--warn)}
+  .tile.bad{border-color:var(--alert)} .tile.bad .v,.tile.bad .sub{color:var(--alert)}
+  section{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+    padding:1rem 1.1rem 1.2rem;margin-bottom:1.3rem;box-shadow:var(--shadow)}
+  section h2{font-size:.98rem;font-weight:650;margin:0 0 .2rem}
+  section .hint{font-size:.78rem;color:var(--muted);margin:0 0 .8rem}
+  .charthead{display:flex;flex-wrap:wrap;gap:.5rem;align-items:baseline;
+    justify-content:space-between;margin-bottom:.6rem}
+  .pill{display:inline-block;font-size:.68rem;font-weight:650;padding:.2em .6em;
+    border-radius:20px;background:var(--accent-soft);color:var(--accent)}
+  .controls{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center;
+    margin-bottom:.8rem;font-size:.8rem;color:var(--muted)}
+  .controls label{display:inline-flex;align-items:center;gap:.35rem}
+  .controls select,.controls button{font:inherit;font-size:.8rem;padding:.3em .6em;
+    border-radius:5px;border:1px solid var(--rule-strong);background:var(--surface);
+    color:var(--ink);cursor:pointer}
+  .controls button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+  .controls button.on{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+  /* One fixed height per chart class. Without an explicit CSS height the
+     browser derives it from the backing-store aspect ratio, which the render
+     code recomputes from page width -- so charts grow with the window. */
+  .chart{width:100%;height:170px;display:block;border-radius:6px;background:var(--surface-2)}
+  .spectro{width:100%;height:300px;display:block;border-radius:6px;
+    background:var(--surface-2);cursor:crosshair}
+  .small{width:100%;height:96px;display:block;border-radius:6px;background:var(--surface-2)}
+  .specstack .spectro.compact{height:220px}
+  .specblock{margin-bottom:.7rem}
+  .speclab{display:flex;flex-wrap:wrap;gap:.5rem;justify-content:space-between;
+    font-size:.76rem;font-weight:650;color:var(--ink-soft);margin-bottom:.2rem}
+  .speclab .specinfo{font-weight:400;color:var(--muted);font-variant-numeric:tabular-nums}
+  .specblock.sel .specname{color:var(--accent)}
+  @media (max-width:640px){ .chart{height:130px} .spectro,.specstack .spectro.compact{height:180px} .small{height:74px} }
+  .cbar{width:100%;height:14px;display:block;border-radius:3px;margin-top:.4rem}
+  .cbarticks{position:relative;height:1.1em;font-size:.66rem;color:var(--muted);
+    font-variant-numeric:tabular-nums;margin-top:.15rem}
+  .cbarnote{font-size:.68rem;color:var(--muted);margin-top:.1rem}
+  .readout{font-family:ui-monospace,monospace;font-size:.76rem;color:var(--ink);
+    background:var(--surface-2);border-radius:4px;padding:.25em .6em;
+    min-height:1.7em;display:inline-block;margin-top:.4rem}
+  .legend{display:flex;flex-wrap:wrap;gap:.85rem;margin-top:.5rem;font-size:.74rem;color:var(--muted)}
+  .legend i{display:inline-block;width:14px;height:10px;border-radius:2px;
+    margin-right:.35rem;vertical-align:middle}
+  .smallrow{margin-bottom:.5rem}
+  .smallrow .lab{font-size:.72rem;font-weight:650;color:var(--ink-soft);
+    display:flex;justify-content:space-between;margin-bottom:.15rem}
+  .tablewrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:.82rem;font-variant-numeric:tabular-nums}
+  th{text-align:left;font-size:.64rem;font-weight:650;letter-spacing:.08em;
+    text-transform:uppercase;color:var(--muted);padding:0 .7rem .5rem 0;
+    border-bottom:1.5px solid var(--rule-strong);white-space:nowrap}
+  td{padding:.45rem .7rem;border-bottom:1px solid var(--rule);color:var(--ink-soft);white-space:nowrap}
+  td:first-child,th:first-child{color:var(--ink)}
+  tbody tr:hover td{background:var(--surface-2)}
+  .num{text-align:right}
+  .tag{display:inline-block;font-size:.66rem;font-weight:650;padding:.15em .5em;
+    border-radius:3px;color:#fff}
+  .empty{padding:1.4rem 0;text-align:center;color:var(--muted);font-size:.85rem}
+  .banner{border-radius:8px;padding:.75rem 1rem;margin-bottom:1.1rem;font-size:.85rem;display:none}
+  .banner.show{display:block}
+  .banner.busy{background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn)}
+  .banner.down{background:var(--alert-soft);color:var(--alert);border:1px solid var(--alert)}
+  footer{font-size:.75rem;color:var(--muted);text-align:center;margin-top:1.5rem}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Engine vibration <span>on ClickHouse</span></h1>
+  <div class="statusline">
+    <label id="machineWrap" hidden>Machine
+      <select id="machineSel"></select>
+    </label>
+    <span class="dot" id="dot"></span><span id="state">connecting…</span>
+    <span aria-hidden="true">·</span><span id="clock">—</span>
+  </div>
+</header>
+
+<div class="banner" id="banner"></div>
+
+<div class="lagstrip" id="lagstrip"></div>
+
+<div class="tiles" id="tiles"></div>
+
+<section>
+  <div class="charthead">
+    <div>
+      <h2>Engine condition</h2>
+      <p class="hint">One number per minute: how far this engine has drifted from its own quietest behaviour. Computed entirely in ClickHouse (<code>engine.v_engine_minute_anomaly</code>) as a robust median/MAD deviation across five scalars — no single one catches every fault, so they are combined.</p>
+    </div>
+    <span class="pill" id="condPill">—</span>
+  </div>
+  <canvas id="cCond" class="chart"></canvas>
+  <div class="legend" id="condLegend"></div>
+  <div class="empty" id="condEmpty">Waiting for the first minutes…</div>
+</section>
+
+<section>
+  <div class="charthead">
+    <div>
+      <h2>Spectrogram</h2>
+      <p class="hint">One spectrogram per engine, stacked; a new engine appears as soon as its data arrives. One column per second, one row per frequency bin, computed by the <code>stft_db</code> UDF (the original numpy STFT) inside ClickHouse: each minute is stored in <code>engine.engine_minute_spectrogram</code> once it closes, and only the minute still filling is calculated live.</p>
+    </div>
+    <span class="pill" id="specPill">—</span>
+  </div>
+  <div class="controls">
+    <label>Show last <select id="specMins"><option>3</option><option>5</option><option selected>15</option></select> min</label>
+    <button id="specOrders" type="button" class="on">Order lines</button>
+    <span class="readout" id="specRead">hover for engine · time · frequency · level</span>
+  </div>
+  <div id="spectroStack" class="specstack"></div>
+  <canvas id="cbar" class="cbar"></canvas>
+  <div class="cbarticks" id="cbarTicks"></div>
+  <div class="cbarnote">quieter&nbsp;← level →&nbsp;louder · scale is fixed and non-linear (γ&nbsp;1.6), so tick spacing is uneven by design</div>
+  <div class="legend" id="specLegend"></div>
+  <div class="empty" id="specEmpty">No spectrogram windows yet.</div>
+</section>
+
+<section>
+  <div class="charthead">
+    <div>
+      <h2>Health scalars</h2>
+      <p class="hint">Three separate charts sharing one time axis, never one chart with two y-axes — the bearing signature is precisely "kurtosis moves while RMS does not", and a shared axis would hide it. Shading is the commanded fault mode. Minutes older than ~10 minutes come from <code>engine.engine_minute_health</code>; newer ones are calculated live from the raw readings.</p>
+    </div>
+    <span class="pill" id="healthPill">—</span>
+  </div>
+  <div class="smallrow"><div class="lab"><span>RMS (g)</span><span id="rmsNow">—</span></div><canvas id="cRms" class="small"></canvas></div>
+  <div class="smallrow"><div class="lab"><span>Crest factor</span><span id="crestNow">—</span></div><canvas id="cCrest" class="small"></canvas></div>
+  <div class="smallrow"><div class="lab"><span>Kurtosis</span><span id="kurtNow">—</span></div><canvas id="cKurt" class="small"></canvas></div>
+  <div class="smallrow"><div class="lab"><span>Shaft speed (RPM)</span><span id="rpmNow">—</span></div><canvas id="cRpm" class="small"></canvas></div>
+  <div class="legend" id="modeLegend"></div>
+  <div class="empty" id="healthEmpty">No minutes yet.</div>
+</section>
+
+<section>
+  <div class="charthead">
+    <div><h2>Live waveform</h2>
+    <p class="hint">The newest readings, straight from <code>engine.fact_engine_vibration</code>.</p></div>
+    <span class="pill" id="wavePill">—</span>
+  </div>
+  <canvas id="wave" class="chart"></canvas>
+  <div class="empty" id="waveEmpty">No waveform yet.</div>
+</section>
+
+<section>
+  <div class="charthead">
+    <div><h2>Ingest rate</h2>
+    <p class="hint">Readings stored per 10 seconds, per machine, by the time ClickHouse wrote them — RabbitMQ delivers and the queue engine flushes about once a second. A steady machine at 500&nbsp;Hz is 5,000 per bar.</p></div>
+    <span class="pill" id="thruPill">—</span>
+  </div>
+  <canvas id="thru" class="chart"></canvas>
+  <div class="legend" id="thruLegend"></div>
+  <div class="empty" id="thruEmpty">No batches yet.</div>
+</section>
+
+<section>
+  <div class="charthead">
+    <div>
+      <h2>Raspberry Pi resources</h2>
+      <p class="hint">Sampled from <code>/proc</code> and <code>/sys</code> every few seconds and stored in <code>engine.host_samples</code> (72&nbsp;h TTL). Shading is the number of machines publishing, so load and cost can be read together.</p>
+    </div>
+    <span class="pill" id="hostPill">—</span>
+  </div>
+  <div class="banner" id="throttleBanner"></div>
+  <div class="tiles" id="hostTiles"></div>
+  <div class="controls">
+    <label>Window <select id="hostMins">
+      <option>10</option><option selected>30</option><option>120</option><option>360</option>
+    </select> min</label>
+    <span id="hostStore"></span>
+  </div>
+  <div class="smallrow"><div class="lab"><span>CPU (%)</span><span id="cpuNow">—</span></div><canvas id="cCpu" class="small"></canvas></div>
+  <div class="smallrow"><div class="lab"><span>Temperature (°C)</span><span id="tempNow">—</span></div><canvas id="cTemp" class="small"></canvas></div>
+  <div class="smallrow"><div class="lab"><span>Memory used (%)</span><span id="memNow">—</span></div><canvas id="cMem" class="small"></canvas></div>
+  <div class="legend" id="hostLegend"></div>
+  <div class="empty" id="hostEmpty">Waiting for the first samples…</div>
+</section>
+
+<section>
+  <h2>Minute health</h2>
+  <p class="hint">From <code>engine.v_engine_minute_health</code> — stored minutes plus live ones; <em>Src</em> says which.</p>
+  <div class="tablewrap"><table id="health"><thead><tr>
+    <th>Minute</th><th>Machine</th><th class="num">Samples</th><th class="num">Hz</th>
+    <th class="num">RMS</th><th class="num">Peak</th><th class="num">Crest</th>
+    <th class="num">Kurtosis</th><th class="num">Skew</th><th class="num">Axial ratio</th>
+    <th class="num">RPM</th><th>Mode</th><th class="num">Missing</th><th>Src</th>
+  </tr></thead><tbody></tbody></table></div>
+</section>
+
+<section>
+  <div class="charthead">
+    <div><h2>Raw readings</h2>
+    <p class="hint">Straight from <code>engine.fact_engine_vibration</code>. Paged by keyset on <code>timestamp</code>, not OFFSET — at 500&nbsp;Hz a day is 43&nbsp;million rows and an offset scan re-reads every one it skips.</p></div>
+    <span class="pill" id="readPill">—</span>
+  </div>
+  <div class="controls">
+    <button id="readOlder" type="button">← Older</button>
+    <button id="readNewest" type="button">Newest</button>
+    <span id="readSpan"></span>
+  </div>
+  <div class="tablewrap"><table id="readings"><thead><tr>
+    <th>Timestamp</th><th>Machine</th><th class="num">Seq</th>
+    <th class="num">Radial (g)</th><th class="num">Axial (g)</th>
+    <th class="num">RPM</th><th>Mode</th>
+  </tr></thead><tbody></tbody></table></div>
+  <div class="empty" id="readEmpty">No readings yet.</div>
+</section>
+
+<section>
+  <h2>Machines</h2>
+  <p class="hint">Every <code>engine.machine_dim</code> row, not just the current one, so the SCD2 history is visible rather than implied.</p>
+  <div class="tablewrap"><table id="machines"><thead><tr>
+    <th class="num">Key</th><th>Machine</th><th>Site</th><th>Type</th>
+    <th class="num">Nominal RPM</th><th class="num">Balls</th>
+    <th>Current</th><th>Valid from</th><th>Valid to</th><th>Op</th>
+  </tr></thead><tbody></tbody></table></div>
+</section>
+
+<footer id="foot">read-only · ClickHouse is read once per refresh by one background thread</footer>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const REFRESH_MS = 3000;
+const MODES = ["healthy","imbalance","misalignment","bearing","looseness"];
+
+// Which machine the page is showing. Every producer publishes its own
+// `machine`, so two producers are two machines in one table -- and a
+// spectrogram is per machine by nature: splicing two engines along one time
+// axis would produce a picture of nothing real.
+let MACHINE = null;
+try { MACHINE = localStorage.getItem("engine.machine") || null; } catch(e) {}
+function setMachine(name){
+  MACHINE = name;
+  try { localStorage.setItem("engine.machine", name); } catch(e) {}
+}
+function syncMachines(names){
+  const sel = $("machineSel");
+  if(!names.length){ $("machineWrap").hidden = true; return; }
+  if(MACHINE!=="" && !names.includes(MACHINE)) setMachine(names[0]);
+  // Only rebuild when the set actually changed, or the open dropdown would
+  // close under the user every refresh.
+  // "All machines" compares the scalars across engines on one axis. The
+  // spectrogram still needs a single machine -- a heatmap cannot overlay two --
+  // so it falls back to the first and says which it is drawing.
+  const opts = names.length>1 ? ["", ...names] : names;
+  const current = [...sel.options].map(o=>o.value).join("\u0000");
+  if(current !== opts.join("\u0000")){
+    sel.innerHTML = opts.map(n=>
+      `<option value="${n}">${n||"All machines"}</option>`).join("");
+  }
+  sel.value = MACHINE;
+  // Hidden for a single machine: a select with one option is furniture.
+  $("machineWrap").hidden = names.length < 2;
+}
+$("machineSel").addEventListener("change", (e)=>{ setMachine(e.target.value); refresh(); });
+const forMachine = (r) => !MACHINE || (r.machine_name ?? r.machine) === MACHINE;
+const MODE_VAR = {healthy:"--cat-3", imbalance:"--cat-1", misalignment:"--cat-4",
+                  bearing:"--cat-2", looseness:"--cat-5"};
+
+const fmt = {
+  int:(n)=>n==null?"—":n.toLocaleString(),
+  num:(n,d=3)=>n==null?"—":Number(n).toFixed(d),
+  time:(s)=>{if(!s)return"—";const d=new Date(s);return isNaN(d)?s:d.toISOString().replace("T"," ").slice(0,19);},
+  hms:(s)=>fmt.time(s).slice(11,19),
+  ago:(s)=>{if(!s)return"";const q=(Date.now()-new Date(s).getTime())/1000;
+    if(!isFinite(q))return"";if(q<90)return Math.max(0,Math.round(q))+"s ago";
+    if(q<5400)return Math.round(q/60)+"m ago";return Math.round(q/3600)+"h ago";},
+};
+const css=(n)=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+async function get(p){const r=await fetch(p,{cache:"no-store"});
+  if(r.status===503){const e=new Error("busy");e.busy=true;throw e;}
+  if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}
+function banner(k,t){const e=$("banner");if(!k){e.className="banner";return;}
+  e.className="banner show "+k;e.textContent=t;}
+function setState(k,t){$("dot").className="dot "+k;$("state").textContent=t;}
+
+function prep(c){const dpr=window.devicePixelRatio||1;
+  const w=c.clientWidth||600,h=c.clientHeight||150;
+  c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);
+  const x=c.getContext("2d");x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,w,h);
+  return {ctx:x,w,h};}
+
+/* ---------- tiles ---------- */
+function renderTiles(s,hrows){
+  // Per machine. The server's latest_* fields are whichever row sorted last
+  // across every machine, which with two producers is essentially arbitrary --
+  // so prefer the selected machine's own newest minute when we have it.
+  // Only when a single machine is selected. With "All machines" the last row
+  // belongs to whichever machine happened to sort last, so the server's
+  // combined figures are the honest ones.
+  const L=(MACHINE&&hrows&&hrows.length)?hrows[hrows.length-1]:null;
+  const mine=(s.machines_recent||[]).find(b=>b.machine===MACHINE);
+  const loss=mine?mine.loss_pct:s.loss_pct;
+  const t=[
+    {k:"Mode",v:(L?L.mode_max:s.latest_mode_max)??"—",sub:"commanded by the simulator",accent:true},
+    {k:"Shaft speed",v:(L?.avg_rpm??s.latest_avg_rpm)?Math.round(L?.avg_rpm??s.latest_avg_rpm):"—",sub:"RPM, last minute"},
+    {k:"RMS",v:(L?.rms_r??s.latest_rms_r)!=null?Number(L?.rms_r??s.latest_rms_r).toFixed(4):"—",sub:"g, last minute"},
+    {k:"Crest",v:(L?.crest_r??s.latest_crest_r)!=null?Number(L?.crest_r??s.latest_crest_r).toFixed(2):"—",sub:"peak / RMS"},
+    {k:"Kurtosis",v:(L?.kurtosis_r??s.latest_kurtosis_r)!=null?Number(L?.kurtosis_r??s.latest_kurtosis_r).toFixed(2):"—",sub:"impulsiveness"},
+    {k:"Readings",v:fmt.int(s.readings??0),
+     sub:"raw, last 6 h"+((s.machines_recent||[]).length>1?" · all machines":"")},
+    {k:"Message loss",v:loss==null?"—":loss.toFixed(2)+"%",
+     sub:loss==null?"—":(mine?MACHINE:"all machines")+(loss>1?" · dropping":" · keeping up"),
+     warn:loss!=null&&loss>1, bad:loss!=null&&loss>5},
+    {k:"Queue backlog",v:s.queue_ready==null?"—":fmt.int(s.queue_ready),
+     sub:s.queue_ready==null?"set RMQ_PASSWORD to show":`waiting in ${s.queue_name} · ${s.queue_consumers??0} consumer`,
+     warn:(s.queue_ready??0)>5000, bad:(s.queue_ready??0)>50000||s.queue_consumers===0},
+  ];
+  $("tiles").innerHTML=t.map(x=>`<div class="tile${x.accent?" accent":""}${x.bad?" bad":x.warn?" warn":""}">
+    <div class="k">${x.k}</div><div class="v">${x.v}</div><div class="sub">${x.sub}</div></div>`).join("");
+}
+
+/* ---------- the spectrogram ---------- */
+// Sequential single-hue blue ramp, reference palette steps 100..700,
+// interpolated to 256 entries. Light mode runs light->dark so low energy
+// recedes into the panel; dark mode runs dark->light for the same reason.
+// The dB->position mapping is identical in both, so two screenshots in the
+// same theme are always comparable.
+const RAMP_STEPS=["#cde2fb","#b7d3f6","#9ec5f4","#86b6ef","#6da7ec","#5598e7",
+                  "#3987e5","#2a78d6","#256abf","#1c5cab","#184f95","#104281","#0d366b"];
+let LUT=null, LUT_DARK=null;
+function isDark(){return matchMedia("(prefers-color-scheme: dark)").matches;}
+
+// Measured on real windows: the noise floor's median sits at -64 dB, a third
+// of the way up a linear -90..-10 ramp, so a linear LUT paints the *floor* a
+// saturated mid-blue and leaves the lines barely darker than it. GAMMA pushes
+// that bulk down into the pale end and spends the dark steps on the tones.
+// This is a FIXED curve, not a per-refresh autoscale: identical every frame,
+// so two minutes remain directly comparable. The colour bar is built through
+// the same curve and ticked in real dB, so the non-linearity is visible
+// rather than hidden.
+const GAMMA=1.6;
+const curve=(i)=>Math.pow(i/255,GAMMA);
+function rampAt(p,rgb){
+  const q=Math.min(1,Math.max(0,p))*(rgb.length-1);
+  const a=Math.floor(q), b=Math.min(rgb.length-1,a+1), f=q-a;
+  return [0,1,2].map(c=>rgb[a][c]+(rgb[b][c]-rgb[a][c])*f);
+}
+function buildLUT(dark){
+  const steps=dark?RAMP_STEPS.slice().reverse():RAMP_STEPS;
+  const rgb=steps.map(h=>[parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)]);
+  const out=new Uint8ClampedArray(256*3);
+  for(let i=0;i<256;i++){
+    const c=rampAt(curve(i),rgb);
+    out[i*3]=c[0]; out[i*3+1]=c[1]; out[i*3+2]=c[2];
+  }
+  return out;
+}
+let specState={dbMin:-90,dbMax:-10,orders:true};
+const SPEC_HINT="hover for engine · time · frequency · level";
+
+// One block (label + canvas) per engine, created the first time the engine
+// appears and removed when it has no windows any more. Blocks are keyed by
+// machine name so a refresh redraws in place instead of rebuilding the DOM.
+function specBlock(name){
+  const stack=$("spectroStack");
+  let el=[...stack.children].find(c=>c.dataset.machine===name);
+  if(!el){
+    el=document.createElement("div"); el.className="specblock"; el.dataset.machine=name;
+    el.innerHTML='<div class="speclab"><span class="specname"></span><span class="specinfo"></span></div>'
+                +'<canvas class="spectro"></canvas>';
+    el.querySelector(".specname").textContent=name;
+    const cv=el.querySelector("canvas");
+    cv.addEventListener("mousemove",specHover);
+    cv.addEventListener("mouseleave",()=>{$("specRead").textContent=SPEC_HINT;});
+    stack.appendChild(el);
+  }
+  return el;
+}
+
+// Draw one engine's windows (oldest first) into its canvas.
+function drawSpectrogram(canvas,name,cols,health,lut){
+  const nBins=cols[0].n_bins, df=cols[0].df_hz;
+  const total=cols.reduce((a,c)=>a+c.n_frames,0);
+  // One offscreen ImageData, then a single drawImage. A per-cell fillRect loop
+  // would be ~200,000 draw calls per engine per refresh and would stutter.
+  const img=new ImageData(total,nBins);
+  let x0=0;
+  for(const col of cols){
+    const bytes=Uint8Array.from(atob(col.data),ch=>ch.charCodeAt(0));
+    for(let f=0;f<col.n_frames;f++){
+      for(let b=0;b<nBins;b++){
+        const v=bytes[f*nBins+b];
+        // y flipped: 0 Hz at the bottom, where people expect it.
+        const px=((nBins-1-b)*total+(x0+f))*4;
+        img.data[px]=lut[v*3]; img.data[px+1]=lut[v*3+1];
+        img.data[px+2]=lut[v*3+2]; img.data[px+3]=255;
+      }
+    }
+    x0+=col.n_frames;
+  }
+  const off=document.createElement("canvas"); off.width=total; off.height=nBins;
+  off.getContext("2d").putImageData(img,0,0);
+  const {ctx,w,h}=prep(canvas);
+  ctx.imageSmoothingEnabled=false;
+  ctx.drawImage(off,0,0,w,h);
+  canvas._geom={name,w,h,total,nBins,df,cols};
+
+  // Order overlay: turns "there is a bright line" into "that line is 2x".
+  // Each engine uses its OWN shaft speed, so its lines follow its own RPM.
+  const mine=(health||[]).filter(r=>r.machine_name===name);
+  if(specState.orders&&mine.length){
+    const byMin=new Map(mine.map(r=>[String(r.minute_ts).slice(0,16),r]));
+    const marks=[[1,"1×"],[2,"2×"],[3,"3×"],[2.6,"BPFO"]];
+    ctx.save(); ctx.lineWidth=1; ctx.setLineDash([4,4]);
+    for(const [mult,label] of marks){
+      ctx.beginPath(); let started=false, lastY=null, xx=0;
+      for(const col of cols){
+        const rec=byMin.get(String(col.window_ts).slice(0,16));
+        const shaft=rec?(rec.shaft_hz??(rec.avg_rpm?rec.avg_rpm/60:null)):null;
+        for(let f=0;f<col.n_frames;f++,xx++){
+          if(shaft==null)continue;
+          const hz=shaft*mult, b=hz/df;
+          if(b>=nBins)continue;
+          const y=h-(b/(nBins-1))*h, x=(xx/Math.max(1,total-1))*w;
+          started?ctx.lineTo(x,y):(ctx.moveTo(x,y),started=true); lastY=y;
+        }
+      }
+      ctx.strokeStyle=css("--ink"); ctx.globalAlpha=.45; ctx.stroke();
+      if(lastY!=null){ctx.globalAlpha=.8;ctx.setLineDash([]);
+        ctx.font="10px ui-monospace, monospace"; ctx.fillStyle=css("--ink");
+        ctx.fillText(label,w-30,Math.max(10,lastY-3)); ctx.setLineDash([4,4]);}
+    }
+    ctx.restore();
+  }
+  return {nBins,df,total};
+}
+
+function renderSpectrogram(payload,health){
+  const every=(payload&&payload.columns)||[];
+  const minutes=Math.max(1,parseInt($("specMins").value,10)||15);
+  const names=[...new Set(every.map(c=>c.machine_name))].sort();
+  const stack=$("spectroStack");
+  // Engines with no windows any more lose their block.
+  [...stack.children].forEach(el=>{ if(!names.includes(el.dataset.machine)) el.remove(); });
+  $("specEmpty").style.display=names.length?"none":"block";
+  $("cbar").style.display=names.length?"block":"none";
+  if(!names.length){$("specPill").textContent="—";return;}
+  specState.dbMin=payload.db_min; specState.dbMax=payload.db_max;
+
+  const dark=isDark();
+  if(dark&&!LUT_DARK)LUT_DARK=buildLUT(true);
+  if(!dark&&!LUT)LUT=buildLUT(false);
+  const lut=dark?LUT_DARK:LUT;
+
+  let geo=null, anyLive=false;
+  names.forEach(name=>{
+    const el=specBlock(name);
+    stack.appendChild(el);                       // keeps blocks in name order
+    el.classList.toggle("sel",MACHINE===name);
+    const canvas=el.querySelector("canvas");
+    canvas.classList.toggle("compact",names.length>1);
+    const cols=every.filter(c=>c.machine_name===name).slice(-minutes);
+    geo=drawSpectrogram(canvas,name,cols,health,lut);
+    const live=cols[cols.length-1].in_progress; anyLive=anyLive||live;
+    el.querySelector(".specinfo").textContent=
+      `${cols.length} min · ${geo.total} s${live?" · newest minute still filling":""}`;
+  });
+  $("specPill").textContent=`${names.length} engine${names.length>1?"s":""} · last ${minutes} min · `
+    +`${geo.nBins} bins · 0–${(geo.df*(geo.nBins-1)).toFixed(0)} Hz`;
+
+  // Colour bar — one for all engines, since they share one fixed scale.
+  const cb=$("cbar"); const g=prep(cb);
+  const bar=new ImageData(256,1);
+  for(let i=0;i<256;i++){bar.data[i*4]=lut[i*3];bar.data[i*4+1]=lut[i*3+1];
+    bar.data[i*4+2]=lut[i*3+2];bar.data[i*4+3]=255;}
+  const bo=document.createElement("canvas");bo.width=256;bo.height=1;
+  bo.getContext("2d").putImageData(bar,0,0);
+  g.ctx.drawImage(bo,0,0,g.w,g.h);
+  // Ticks at round dB values, placed through the same curve. Evenly spaced
+  // labels here would be a lie -- the spacing IS the transfer function.
+  const ticks=[]; const span=specState.dbMax-specState.dbMin;
+  g.ctx.strokeStyle=css("--surface"); g.ctx.lineWidth=1;
+  for(let d=Math.ceil(specState.dbMin/10)*10; d<=specState.dbMax; d+=10){
+    const x=Math.pow((d-specState.dbMin)/span,GAMMA)*g.w;
+    g.ctx.beginPath(); g.ctx.moveTo(x,0); g.ctx.lineTo(x,g.h); g.ctx.stroke();
+    ticks.push([d,x/g.w]);
+  }
+  $("cbarTicks").innerHTML=ticks.map(([d,f])=>
+    `<span style="position:absolute;left:${(f*100).toFixed(2)}%;transform:translateX(-50%)">${d}</span>`
+  ).join("")+`<span style="position:absolute;right:0;color:var(--muted)">dB re 1 g</span>`;
+
+  $("specLegend").innerHTML =
+    `<span>One fixed −90…−10 dB scale for every engine — never auto-scaled, so minutes and engines can be compared</span>`
+    + (anyLive ? `<span><i style="background:var(--warn)"></i>newest minute still filling</span>` : "");
+}
+
+function specHover(e){
+  const g=e.currentTarget._geom; if(!g)return;
+  const r=e.currentTarget.getBoundingClientRect();
+  const fx=Math.floor((e.clientX-r.left)/r.width*g.total);
+  const by=Math.round((1-(e.clientY-r.top)/r.height)*(g.nBins-1));
+  let acc=0,col=null,fi=0;
+  for(const c of g.cols){ if(fx<acc+c.n_frames){col=c;fi=fx-acc;break;} acc+=c.n_frames; }
+  if(!col){$("specRead").textContent="—";return;}
+  const bytes=Uint8Array.from(atob(col.data),ch=>ch.charCodeAt(0));
+  const v=bytes[fi*g.nBins+by];
+  const db=specState.dbMin+(v/255)*(specState.dbMax-specState.dbMin);
+  const t=new Date(new Date(col.window_ts).getTime()+fi*(col.hop_seconds*1000));
+  $("specRead").textContent=
+    `${g.name} · ${t.toISOString().slice(11,19)} · ${(by*g.df).toFixed(1)} Hz · ${db.toFixed(1)} dB`;
+}
+$("specOrders").addEventListener("click",(e)=>{specState.orders=!specState.orders;
+  e.target.classList.toggle("on",specState.orders);refresh();});
+$("specMins").addEventListener("change",()=>refresh());
+
+/* ---------- small multiples ---------- */
+// Shade contiguous runs of a categorical value behind a chart, and label each
+// run. Colour alone would not carry identity; the label is what does.
+function shadeBands(ctx,w,h,rows,valueOf,colourOf,alphaOf,labelOf){
+  if(!rows.length)return;
+  let start=0;
+  for(let i=1;i<=rows.length;i++){
+    if(i===rows.length||valueOf(rows[i])!==valueOf(rows[start])){
+      const v=valueOf(rows[start]);
+      const x0=(start/rows.length)*w, x1=(i/rows.length)*w;
+      ctx.fillStyle=colourOf(v); ctx.globalAlpha=alphaOf(v);
+      ctx.fillRect(x0,0,x1-x0,h); ctx.globalAlpha=1;
+      const lab=labelOf(v);
+      if(lab&&x1-x0>46){ctx.fillStyle=css("--muted");ctx.font="9px system-ui";
+        ctx.fillText(lab,x0+3,10);}
+      start=i;
+    }
+  }
+}
+function modeBands(ctx,w,h,rows){
+  shadeBands(ctx,w,h,rows,r=>r.mode_max,
+    v=>css(MODE_VAR[v]||"--muted"), ()=>.12, v=>v);
+}
+// Producer count is a MAGNITUDE, not an identity, so it gets one hue at
+// increasing strength rather than a categorical colour per count.
+function loadBands(ctx,w,h,rows){
+  shadeBands(ctx,w,h,rows,r=>(r.active_machines??r.producers)||0,
+    ()=>css("--accent"), v=>v?Math.min(.22,.05+v*.045):0,
+    v=>v?`${v} producer${v>1?"s":""}`:"idle");
+}
+function lineChart(id,rows,pick,opts={}){
+  const canvas=$(id); const {ctx,w,h}=prep(canvas); const pad=16;
+  if(!rows.length)return;
+  (opts.bands||modeBands)(ctx,w,h,rows);
+  const vals=rows.map(pick).filter(v=>v!=null&&isFinite(v));
+  if(!vals.length)return;
+  let lo=Math.min(...vals),hi=Math.max(...vals);
+  if(hi-lo<1e-9){hi+=1;lo-=1;} const p=(hi-lo)*.15; lo-=p; hi+=p;
+  ctx.strokeStyle=css("--rule");ctx.lineWidth=1;
+  for(let i=0;i<=2;i++){const y=pad+(h-pad*2)*(i/2);
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+  const X=i=>rows.length<2?w/2:(i/(rows.length-1))*w;
+  const Y=v=>h-pad-(h-pad*2)*((v-lo)/(hi-lo));
+  ctx.beginPath();let started=false;
+  rows.forEach((r,i)=>{const v=pick(r);if(v==null||!isFinite(v))return;
+    started?ctx.lineTo(X(i),Y(v)):(ctx.moveTo(X(i),Y(v)),started=true);});
+  ctx.strokeStyle=opts.colour||css("--accent");ctx.lineWidth=2;ctx.stroke();
+  if(opts.pick2){
+    ctx.beginPath();started=false;
+    rows.forEach((r,i)=>{const v=opts.pick2(r);if(v==null||!isFinite(v))return;
+      started?ctx.lineTo(X(i),Y(v)):(ctx.moveTo(X(i),Y(v)),started=true);});
+    ctx.strokeStyle=opts.colour2||css("--muted");ctx.lineWidth=1;
+    ctx.setLineDash([3,3]);ctx.stroke();ctx.setLineDash([]);
+  }
+  const last=pick(rows[rows.length-1]);
+  if(last!=null&&isFinite(last)){ctx.fillStyle=opts.colour||css("--accent");
+    ctx.beginPath();ctx.arc(X(rows.length-1),Y(last),3.5,0,6.284);ctx.fill();}
+  ctx.fillStyle=css("--muted");ctx.font="9px ui-monospace, monospace";
+  ctx.fillText(hi.toFixed(opts.dp??3),2,10);
+  ctx.fillText(lo.toFixed(opts.dp??3),2,h-3);
+}
+// Several machines on one chart. X is real time, not row index: the machines
+// started at different moments and have different row counts, so indexing by
+// position would slide them against each other and invent a comparison that
+// is not there.
+const SERIES_VARS=["--cat-1","--cat-2","--cat-3","--cat-4","--cat-5"];
+function seriesChart(id,groups,pick,opts={}){
+  const canvas=$(id); const {ctx,w,h}=prep(canvas); const pad=16;
+  const all=groups.flatMap(g=>g.rows);
+  const vals=all.map(pick).filter(v=>v!=null&&isFinite(v));
+  if(!vals.length)return;
+  const ts=all.map(r=>new Date(r.minute_ts).getTime()).filter(isFinite);
+  let t0=Math.min(...ts), t1=Math.max(...ts); if(t1<=t0)t1=t0+60000;
+  let lo=Math.min(...vals),hi=Math.max(...vals);
+  if(hi-lo<1e-9){hi+=1;lo-=1;} const q=(hi-lo)*.15; lo-=q; hi+=q;
+  ctx.strokeStyle=css("--rule");ctx.lineWidth=1;
+  for(let i=0;i<=2;i++){const y=pad+(h-pad*2)*(i/2);
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+  const X=r=>((new Date(r.minute_ts).getTime()-t0)/(t1-t0))*w;
+  const Y=v=>h-pad-(h-pad*2)*((v-lo)/(hi-lo));
+  groups.forEach((g,gi)=>{
+    ctx.beginPath();let started=false;
+    g.rows.forEach(r=>{const v=pick(r);if(v==null||!isFinite(v))return;
+      started?ctx.lineTo(X(r),Y(v)):(ctx.moveTo(X(r),Y(v)),started=true);});
+    ctx.strokeStyle=css(SERIES_VARS[gi%SERIES_VARS.length]);ctx.lineWidth=2;ctx.stroke();
+    const lastRow=[...g.rows].reverse().find(r=>{const v=pick(r);return v!=null&&isFinite(v);});
+    if(lastRow){ctx.fillStyle=css(SERIES_VARS[gi%SERIES_VARS.length]);
+      ctx.beginPath();ctx.arc(X(lastRow),Y(pick(lastRow)),3.5,0,6.284);ctx.fill();}
+  });
+  ctx.fillStyle=css("--muted");ctx.font="9px ui-monospace, monospace";
+  ctx.fillText(hi.toFixed(opts.dp??3),2,10);
+  ctx.fillText(lo.toFixed(opts.dp??3),2,h-3);
+}
+
+function renderHealth(rows){
+  const has=rows&&rows.length;
+  $("healthEmpty").style.display=has?"none":"block";
+  ["cRms","cCrest","cKurt","cRpm"].forEach(i=>$(i).style.display=has?"block":"none");
+  if(!has){$("healthPill").textContent="—";return;}
+  const names=[...new Set(rows.map(r=>r.machine_name))].sort();
+  const multi = !MACHINE && names.length>1;
+  $("healthPill").textContent=(MACHINE?MACHINE+" · ":multi?names.length+" machines · ":"")
+    +`${rows.length} minute${rows.length>1?"s":""}`;
+
+  if(multi){
+    // One line per machine on a shared time axis. Mode shading is dropped:
+    // each machine is in its own fault mode, so a single band behind both
+    // would assert something false about whichever it did not describe.
+    const groups=names.map(n=>({name:n,rows:rows.filter(r=>r.machine_name===n)}));
+    seriesChart("cRms",groups,r=>r.rms_r,{dp:4});
+    seriesChart("cCrest",groups,r=>r.crest_r,{dp:2});
+    seriesChart("cKurt",groups,r=>r.kurtosis_r,{dp:2});
+    seriesChart("cRpm",groups,r=>r.avg_rpm,{dp:0});
+    const tail=(g,k)=>{const r=[...g.rows].reverse().find(x=>x[k]!=null);return r?r[k]:null;};
+    const label=(k,d,suffix="")=>groups.map(g=>`${g.name.replace(/^.*_/,"")} ${fmt.num(tail(g,k),d)}${suffix}`).join("  ·  ");
+    $("rmsNow").textContent=label("rms_r",4," g");
+    $("crestNow").textContent=label("crest_r",2);
+    $("kurtNow").textContent=label("kurtosis_r",2);
+    $("rpmNow").textContent=label("avg_rpm",0," RPM");
+    $("modeLegend").innerHTML=groups.map((g,i)=>{
+      const m=tail(g,"mode_max");
+      return `<span><i style="background:${css(SERIES_VARS[i%SERIES_VARS.length])}"></i>`
+           +`${g.name}${m?` · now ${m}`:""}</span>`;
+    }).join("");
+  } else {
+    lineChart("cRms",rows,r=>r.rms_r,{dp:4});
+    lineChart("cCrest",rows,r=>r.crest_r,{dp:2});
+    lineChart("cKurt",rows,r=>r.kurtosis_r,{dp:2});
+    lineChart("cRpm",rows,r=>r.avg_rpm,{dp:0});
+    const L=rows[rows.length-1];
+    $("rmsNow").textContent=fmt.num(L.rms_r,4)+" g";
+    $("crestNow").textContent=fmt.num(L.crest_r,2);
+    $("kurtNow").textContent=fmt.num(L.kurtosis_r,2);
+    $("rpmNow").textContent=fmt.num(L.avg_rpm,0)+" RPM";
+    const seen=[...new Set(rows.map(r=>r.mode_max))];
+    $("modeLegend").innerHTML=MODES.filter(m=>seen.includes(m)).map(m=>
+      `<span><i style="background:${css(MODE_VAR[m])}"></i>${m}</span>`).join("");
+  }
+  const body=document.querySelector("#health tbody");
+  body.innerHTML=rows.slice().reverse().slice(0,20).map(r=>`<tr>
+    <td class="mono">${fmt.time(r.minute_ts).slice(0,16)}</td><td>${r.machine_name??"—"}</td>
+    <td class="num mono">${fmt.int(r.sample_count)}</td><td class="num mono">${fmt.num(r.effective_hz,1)}</td>
+    <td class="num mono">${fmt.num(r.rms_r,4)}</td><td class="num mono">${fmt.num(r.peak_r,4)}</td>
+    <td class="num mono">${fmt.num(r.crest_r,2)}</td><td class="num mono">${fmt.num(r.kurtosis_r,2)}</td>
+    <td class="num mono">${fmt.num(r.skew_r,2)}</td><td class="num mono">${fmt.num(r.axial_ratio,2)}</td>
+    <td class="num mono">${fmt.num(r.avg_rpm,0)}</td>
+    <td><span class="tag" style="background:${css(MODE_VAR[r.mode_max]||'--muted')}">${r.mode_max??"—"}</span>${r.mode_changed?" ⟶":""}</td>
+    <td class="num mono">${fmt.int(r.seq_deficit)}</td><td>${r.source??"—"}</td></tr>`).join("");
+}
+
+/* ---------- waveform ---------- */
+function renderWave(all){
+  // `all` is {machine: waveform}. Fall back to any available trace rather than
+  // showing nothing when the selected machine has not landed a chunk yet.
+  const wf=(all&&(all[MACHINE]||all[Object.keys(all)[0]]))||null;
+  const has=wf&&wf.v&&wf.v.length>1;
+  $("wave").style.display=has?"block":"none";
+  $("waveEmpty").style.display=has?"none":"block";
+  if(!has){$("wavePill").textContent="—";return;}
+  const v=wf.v;
+  $("wavePill").textContent=`${wf.machine??""} · ${v.length} samples · `
+    +`${(v.length*wf.dt_ms/1000).toFixed(1)} s`;
+  const {ctx,w,h}=prep($("wave"));const pad=14;
+  const m=Math.max(...v.map(Math.abs))*1.1||1;
+  ctx.strokeStyle=css("--rule");ctx.beginPath();
+  ctx.moveTo(0,h/2);ctx.lineTo(w,h/2);ctx.stroke();
+  ctx.beginPath();
+  v.forEach((y,i)=>{const X=(i/(v.length-1))*w,Y=h/2-(y/m)*(h/2-pad);
+    i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);});
+  ctx.strokeStyle=css("--accent");ctx.lineWidth=1;ctx.stroke();
+  ctx.fillStyle=css("--muted");ctx.font="9px ui-monospace, monospace";
+  ctx.fillText("+"+m.toFixed(3)+" g",2,10);ctx.fillText("−"+m.toFixed(3)+" g",2,h-3);
+}
+
+/* ---------- ingest rate ---------- */
+function renderThroughput(rows){
+  const has=rows&&rows.length;
+  $("thru").style.display=has?"block":"none";
+  $("thruEmpty").style.display=has?"none":"block";
+  if(!has){$("thruPill").textContent="—";$("thruLegend").innerHTML="";return;}
+  const names=[...new Set(rows.map(r=>r.machine))].sort();
+  const buckets=[...new Set(rows.map(r=>r.bucket))].sort();
+  const total=rows.reduce((a,r)=>a+r.rows,0);
+  $("thruPill").textContent=`last ${buckets.length*10}s · ${fmt.int(total)} readings · ${names.length} machine${names.length>1?"s":""}`;
+  const {ctx,w,h}=prep($("thru"));const pad=20;
+  const byKey=new Map(rows.map(r=>[r.bucket+"|"+r.machine,r]));
+  const maxRows=Math.max(...rows.map(r=>r.rows),1);
+  ctx.strokeStyle=css("--rule");
+  for(let i=0;i<=3;i++){const y=pad+(h-pad*2)*(i/3);
+    ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(w-pad,y);ctx.stroke();}
+  const slot=(w-pad*2)/buckets.length, bw=Math.max(1,Math.min(10,slot*.8/names.length));
+  buckets.forEach((b,i)=>names.forEach((n,j)=>{const r=byKey.get(b+"|"+n); if(!r)return;
+    const x=pad+slot*i+(slot-bw*names.length)/2+bw*j, bh=(h-pad*2)*(r.rows/maxRows);
+    ctx.fillStyle=css(SERIES_VARS[j%SERIES_VARS.length]);ctx.fillRect(x,h-pad-bh,bw,bh);}));
+  ctx.fillStyle=css("--muted");ctx.font="10px ui-monospace, monospace";
+  ctx.fillText(fmt.int(maxRows)+" / 10 s",pad,pad-6);
+  // Only full buckets count. The newest is still filling, and a machine's
+  // first bucket is partial because its producer started mid-bucket;
+  // averaging either as a full 10 s under-reports the rate.
+  const done=r=>new Date(r.bucket).getTime()+10000<=Date.now()-1000;
+  $("thruLegend").innerHTML=names.map((n,j)=>{
+    const mine=rows.filter(r=>r.machine===n&&done(r)).slice(1).slice(-6);
+    const rate=mine.reduce((a,r)=>a+r.rows,0)/(mine.length*10||1);
+    const d=mine.length?mine[mine.length-1].delay_ms:null;
+    return `<span><i style="background:${css(SERIES_VARS[j%SERIES_VARS.length])}"></i>${n} · ${fmt.int(Math.round(rate))} rows/s · delay ${d==null?"—":(d/1000).toFixed(1)+"s"}</span>`;
+  }).join("");
+}
+
+function renderMachines(rows){
+  document.querySelector("#machines tbody").innerHTML=(rows||[]).map(r=>`<tr>
+    <td class="num mono">${r.machine_key}</td><td>${r.machine_name}</td><td>${r.site??"—"}</td>
+    <td>${r.asset_type??"—"}</td><td class="num mono">${fmt.int(r.nominal_rpm)}</td>
+    <td class="num mono">${fmt.int(r.bearing_balls)}</td>
+    <td>${r.is_current?"current":"superseded"}</td>
+    <td class="mono">${fmt.time(r.valid_from).slice(0,19)}</td>
+    <td class="mono">${r.valid_to?fmt.time(r.valid_to).slice(0,19):"—"}</td>
+    <td>${r.oper??"—"}</td></tr>`).join("");
+}
+
+/* ---------- delay ---------- */
+const secs=(v)=>v==null?"—":(v<90?`${Math.round(v)}s`:v<5400?`${(v/60).toFixed(1)}m`:`${(v/3600).toFixed(1)}h`);
+function renderLag(s){
+  const delay=s.ingest_delay_ms!=null?s.ingest_delay_ms/1000:null;
+  const segs=[
+    {k:"End-to-end delay",v:secs(s.fact_lag_seconds),
+     sub:"newest reading → queryable in ClickHouse",
+     warn:s.fact_lag_seconds>30, bad:s.fact_lag_seconds>120},
+    {k:"Ingest",v:delay==null?"—":delay.toFixed(1)+"s",sub:"sensor → stored row (MQTT, RabbitMQ, 1 s flush)",
+     warn:delay>5, bad:delay>30},
+    {k:"Newest minute",v:secs(s.mart_lag_seconds),sub:"calculated live from raw readings"},
+    {k:"Stored up to",v:secs(s.stored_lag_seconds),
+     sub:"minutes older than ~10 min are stored", warn:s.stored_lag_seconds>900},
+    {k:"Dashboard",v:secs(s.age_seconds),
+     sub:s.stale?"ClickHouse unreachable — showing last read":"snapshot age",
+     warn:s.age_seconds>30},
+  ];
+  $("lagstrip").innerHTML=segs.map(x=>
+    `<div class="seg${x.bad?" bad":x.warn?" warn":""}"><div class="k">${x.k}</div>`
+    +`<div class="v">${x.v}</div><div class="sub">${x.sub}</div></div>`).join("");
+}
+
+/* ---------- engine condition ---------- */
+const COND={normal:"--live",watch:"--warn",alert:"--alert",calibrating:"--muted"};
+function renderCondition(rows){
+  const mine=(rows||[]).filter(forMachine);
+  const has=mine.length>0;
+  $("cCond").style.display=has?"block":"none";
+  $("condEmpty").style.display=has?"none":"block";
+  if(!has){$("condPill").textContent="—";return;}
+  const names=[...new Set(mine.map(r=>r.machine_name))].sort();
+  const last=mine[mine.length-1];
+  $("condPill").textContent=last.status==="calibrating"
+    ? `CALIBRATING · ${last.baseline_minutes??0} of 3 stored minutes`
+    : `${last.status.toUpperCase()} · score ${last.score}`
+      +(last.top_driver?` · driven by ${last.top_driver}`:"");
+
+  const canvas=$("cCond"); const {ctx,w,h}=prep(canvas); const pad=18;
+  const scores=mine.map(r=>r.score).filter(v=>v!=null);
+  const hi=Math.max(4,Math.ceil(Math.max(...scores)));
+  const Y=v=>h-pad-(h-pad*2)*(Math.min(v,hi)/hi);
+  // Threshold bands first, so the line reads against them. Fixed thresholds,
+  // never derived from what is on screen -- a band that moved with the data
+  // would make two screenshots incomparable.
+  const bands=[[0,1.5,"--live"],[1.5,3.5,"--warn"],[3.5,hi,"--alert"]];
+  bands.forEach(([a,b,v])=>{ if(b<=a)return;
+    ctx.fillStyle=css(v); ctx.globalAlpha=.10;
+    ctx.fillRect(0,Y(b),w,Y(a)-Y(b)); ctx.globalAlpha=1; });
+  ctx.fillStyle=css("--muted"); ctx.font="9px ui-monospace, monospace";
+  [[1.5,"watch"],[3.5,"alert"]].forEach(([v,lab])=>{ if(v>hi)return;
+    ctx.strokeStyle=css("--rule-strong"); ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(0,Y(v)); ctx.lineTo(w,Y(v)); ctx.stroke();
+    ctx.setLineDash([]); ctx.fillText(lab,3,Y(v)-3); });
+
+  const ts=mine.map(r=>new Date(r.minute_ts).getTime()).filter(isFinite);
+  let t0=Math.min(...ts), t1=Math.max(...ts); if(t1<=t0)t1=t0+60000;
+  const X=r=>((new Date(r.minute_ts).getTime()-t0)/(t1-t0))*w;
+  names.forEach((n,gi)=>{
+    const g=mine.filter(r=>r.machine_name===n);
+    ctx.beginPath(); let started=false;
+    g.forEach(r=>{ if(r.score==null)return;
+      started?ctx.lineTo(X(r),Y(r.score)):(ctx.moveTo(X(r),Y(r.score)),started=true); });
+    ctx.strokeStyle=names.length>1?css(SERIES_VARS[gi%SERIES_VARS.length]):css("--ink");
+    ctx.lineWidth=2; ctx.stroke();
+    // A dot per minute, coloured by status -- the point where it crosses is
+    // the point someone will want to read off.
+    g.forEach(r=>{ if(r.score==null)return;
+      ctx.fillStyle=css(COND[r.status]||"--muted");
+      ctx.beginPath(); ctx.arc(X(r),Y(r.score),3,0,6.284); ctx.fill(); });
+  });
+  ctx.fillStyle=css("--muted");
+  ctx.fillText(hi.toFixed(0),2,12); ctx.fillText("0",2,h-4);
+
+  const drivers=[...new Set(mine.slice(-6).map(r=>r.top_driver))];
+  $("condLegend").innerHTML=
+    Object.entries({normal:"normal",watch:"watch",alert:"alert"}).map(([k,lab])=>
+      `<span><i style="background:${css(COND[k])}"></i>${lab}</span>`).join("")
+   +`<span>recent driver: ${drivers.join(", ")||"—"}</span>`
+   +(last.baseline_minutes!=null?`<span>baseline: ${last.baseline_minutes} quietest stored minutes</span>`:"");
+}
+
+/* ---------- Raspberry Pi resources ---------- */
+// Pi 5 soft-throttles at 80 C and hard-throttles at 85, so those are the
+// thresholds the tiles colour against -- not arbitrary round numbers.
+const TEMP_WARN=70, TEMP_BAD=80;
+function renderHost(h){
+  const rows=(h&&h.samples)||[];
+  const has=rows.length>1;
+  ["cCpu","cTemp","cMem"].forEach(i=>$(i).style.display=has?"block":"none");
+  $("hostEmpty").style.display=has?"none":"block";
+
+  const L=h&&h.latest;
+  const flags=(h&&h.throttle_flags)||[];
+  const tb=$("throttleBanner");
+  if(flags.length){
+    // Under-voltage and throttling are the two failure modes that actually
+    // bite a Pi driving several producers, and both are silent otherwise.
+    const live=flags.filter(f=>f.endsWith("now")||f==="currently throttled");
+    tb.className="banner show "+(live.length?"down":"busy");
+    tb.textContent=(live.length?"Throttling right now: ":"Throttled earlier this boot: ")
+      +flags.join(", ")+(live.length?"" :" — clears on reboot.");
+  } else { tb.className="banner"; }
+
+  const sw=(h&&h.swap)||{};
+  if(L){
+    const tiles=[
+      {k:"CPU",v:L.cpu_pct!=null?L.cpu_pct.toFixed(0)+"%":"—",
+       sub:L.cpu_busiest_pct!=null?`busiest core ${L.cpu_busiest_pct.toFixed(0)}%`:"—",
+       warn:L.cpu_pct>85},
+      {k:"Temperature",v:L.temp_c!=null?L.temp_c.toFixed(1)+"°":"—",
+       sub:L.temp_c>=TEMP_BAD?"throttling range":L.temp_c>=TEMP_WARN?"warm":"normal",
+       warn:L.temp_c>=TEMP_WARN, bad:L.temp_c>=TEMP_BAD},
+      {k:"Memory",v:L.mem_used_pct!=null?L.mem_used_pct.toFixed(0)+"%":"—",
+       sub:L.mem_available_mb!=null?`${fmt.int(Math.round(L.mem_available_mb))} MB free`:"—",
+       warn:L.mem_used_pct>85},
+      // Where swap LIVES decides whether using it matters. zram is compressed
+      // memory held in RAM: pages are squeezed, not written to the SD card, so
+      // some use is an ordinary healthy state and costs CPU rather than I/O.
+      // Swap on an SD card is hundreds of times slower than RAM and a process
+      // touching a swapped-out page stalls hard. Flagging both at >0 MB, as
+      // this tile used to, calls a normal zram reading an alarm.
+      (()=>{
+        const tot=L.swap_total_mb??sw.swap_total_mb;
+        const used=L.swap_used_mb;
+        const pct=(tot&&used!=null)?100*used/tot:null;
+        const zram=sw.swap_compressed===true;
+        return {k:"Swap",
+          v:used!=null?fmt.int(Math.round(used))+" MB":"—",
+          sub:!tot?"none configured"
+              :`${pct.toFixed(0)}% of ${(tot/1024).toFixed(1)} GB · `
+               +(zram?"compressed in RAM":"on disk — slow"),
+          warn: zram ? pct>25 : used>0,
+          bad:  zram ? pct>60 : pct>25};
+      })(),
+      {k:"CPU clock",v:L.freq_mhz!=null?(L.freq_mhz/1000).toFixed(1)+" GHz":"—",
+       sub:"load "+(L.load1!=null?L.load1.toFixed(2):"—")},
+      // Machines publishing, not local processes: producers normally run on a
+      // laptop over MQTT, so the Pi's own process count is 0 however many are
+      // feeding it. `producers` stays visible as a sub-line for the case where
+      // one IS run on the Pi.
+      {k:"Producers",v:fmt.int(L.active_machines??0),accent:true,
+       sub:`ClickHouse ${L.clickhouse_procs?"up":"DOWN"} · RabbitMQ ${L.rabbitmq_procs?"up":"DOWN"}`
+           +((L.producers??0)?` · ${L.producers} local`:""),
+       bad:!L.clickhouse_procs||!L.rabbitmq_procs},
+    ];
+    $("hostTiles").innerHTML=tiles.map(x=>`<div class="tile${x.accent?" accent":""}${x.bad?" bad":x.warn?" warn":""}">
+      <div class="k">${x.k}</div><div class="v">${x.v}</div><div class="sub">${x.sub}</div></div>`).join("");
+    $("cpuNow").textContent=(L.cpu_pct??0).toFixed(1)+"%";
+    $("tempNow").textContent=(L.temp_c??0).toFixed(1)+"°C";
+    $("memNow").textContent=(L.mem_used_pct??0).toFixed(1)+"%";
+  }
+  $("hostPill").textContent=rows.length
+    ? `${rows.length} samples · every ${h.interval_seconds}s` : "—";
+  $("hostStore").textContent=h
+    ? `${fmt.int(h.rows_written||0)} rows written · keeping ${h.retain_hours}h`
+      +(h.write_error?` · WRITE ERROR: ${h.write_error}`:"")
+    : "";
+
+  if(!has)return;
+  // Three charts, one shared x axis. CPU %, °C and memory % are three
+  // different units; putting them on one pair of axes would make the
+  // comparison meaningless, which is the point of small multiples.
+  lineChart("cCpu",rows,r=>r.cpu_pct,
+    {dp:0,bands:loadBands,pick2:r=>r.cpu_busiest_pct});
+  lineChart("cTemp",rows,r=>r.temp_c,{dp:1,bands:loadBands,colour:css("--cat-2")});
+  lineChart("cMem",rows,r=>r.mem_used_pct,{dp:0,bands:loadBands,colour:css("--cat-3")});
+  $("hostLegend").innerHTML=
+    `<span><i style="background:${css("--accent")}"></i>mean across 4 cores</span>`
+   +`<span><i style="background:${css("--muted")}"></i>busiest single core (dashed)</span>`
+   +`<span><i style="background:${css("--accent")};opacity:.25"></i>shading = machines publishing</span>`;
+}
+$("hostMins").addEventListener("change",()=>refresh());
+
+/* ---------- raw readings (the one live-query endpoint) ---------- */
+let readCursor=null, readBusy=false;
+async function loadReadings(before){
+  if(readBusy)return; readBusy=true;
+  try{
+    const q="/api/readings?limit=50"+(before?"&before="+encodeURIComponent(before):"");
+    const d=await get(q);
+    const rows=d.rows||[];
+    $("readEmpty").style.display=rows.length?"none":"block";
+    $("readPill").textContent=d.total!=null?fmt.int(d.total)+" rows total":(d.state||"—");
+    $("readSpan").textContent=rows.length
+      ? `showing ${fmt.hms(rows[rows.length-1].timestamp)} → ${fmt.hms(rows[0].timestamp)}`
+      : "";
+    readCursor=rows.length?rows[rows.length-1].timestamp:null;
+    $("readOlder").disabled=!readCursor;
+    document.querySelector("#readings tbody").innerHTML=rows.map(r=>`<tr>
+      <td class="mono">${fmt.time(r.timestamp)}</td><td>${r.machine??"—"}</td>
+      <td class="num mono">${fmt.int(r.seq)}</td>
+      <td class="num mono">${fmt.num(r.vib_r,5)}</td>
+      <td class="num mono">${fmt.num(r.vib_a,5)}</td>
+      <td class="num mono">${fmt.num(r.rpm,0)}</td>
+      <td><span class="tag" style="background:${css(MODE_VAR[r.mode]||'--muted')}">${r.mode??"—"}</span></td>
+      </tr>`).join("");
+  }catch(e){
+    // A 503 here is the pipeline holding the lock, not a failure. Say so and
+    // leave the page alone -- the next click will work.
+    $("readSpan").textContent="could not load readings: "+e.message;
+  }finally{readBusy=false;}
+}
+$("readOlder").addEventListener("click",()=>loadReadings(readCursor));
+$("readNewest").addEventListener("click",()=>loadReadings(null));
+
+/* ---------- refresh ---------- */
+let busy=0, readLoaded=false;
+async function refresh(){
+  $("clock").textContent=new Date().toTimeString().slice(0,8);
+  try{
+    const s=await get("/api/status"); busy=0;
+    if(s.state==="error"&&!s.tables_exist){setState("down","ClickHouse error");
+      banner("down","ClickHouse: "+(s.error||"unreachable")); return;}
+    if(!s.tables_exist){setState("busy","waiting for tables");
+      banner("busy","The engine tables do not exist yet. Run setup.sh and this page fills in on its own.");
+      renderTiles(s,null); renderLag(s);
+      get("/api/host?minutes="+encodeURIComponent($("hostMins").value))
+        .then(renderHost).catch(()=>{});
+      return;}
+    if(s.state==="error"){setState("busy","showing last read");banner("busy","ClickHouse: "+s.error);}
+    else{banner(null); setState("live","live");}
+    const [health,spec,wave,thru,machines]=await Promise.all([
+      get("/api/health").catch(()=>[]), get("/api/spectrogram").catch(()=>({columns:[]})),
+      get("/api/waveform").catch(()=>({})), get("/api/throughput").catch(()=>[]),
+      get("/api/machines").catch(()=>[])]);
+    const anomaly=await get("/api/anomaly").catch(()=>[]);
+    // Host metrics come from the sampler's own in-memory ring, so
+    // this one still answers while the pipeline is mid-write.
+    get("/api/host?minutes="+encodeURIComponent($("hostMins").value))
+      .then(renderHost).catch(()=>{});
+    // Build the machine list from every source, so a machine that has landed
+    // data but not yet been folded into a minute still appears.
+    const names=[...new Set([
+      ...(s.machines_recent||[]).map(b=>b.machine),
+      ...health.map(r=>r.machine_name),
+      ...((spec&&spec.columns)||[]).map(c=>c.machine_name),
+    ].filter(Boolean))].sort();
+    syncMachines(names);
+    const hrows=health.filter(forMachine);
+    renderLag(s); renderCondition(anomaly);
+    renderTiles(s,hrows); renderHealth(hrows);
+    renderSpectrogram(spec,health); renderWave(wave);
+    renderThroughput(thru); renderMachines(machines);
+    if(!readLoaded){readLoaded=true;loadReadings(null);}
+    $("foot").textContent=`read-only · ClickHouse is read once per refresh by one background thread · refreshed ${new Date().toTimeString().slice(0,8)}`;
+  }catch(err){
+    if(err.busy){busy++;setState("busy","pipeline is writing…");
+      if(busy>4)banner("busy","The backend has been busy a while.");}
+    else{setState("down","backend unreachable");
+      banner("down","Cannot reach the backend. Is engine_pipeline/app/server.py running?");}
+  }
+}
+refresh(); setInterval(refresh,REFRESH_MS);
+window.addEventListener("resize",()=>refresh());
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{LUT=LUT_DARK=null;refresh();});
+</script>
+</body>
+</html>

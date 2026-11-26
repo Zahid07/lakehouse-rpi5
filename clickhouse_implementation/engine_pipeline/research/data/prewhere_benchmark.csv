@@ -1,0 +1,14 @@
+test,query_shape,variant,ms,rows_read,bytes_read,cpu_ms
+q1,rows arrived in last 60 s,auto-PREWHERE off,5,0,0 B,3
+q1,rows arrived in last 60 s,default (auto),14,0,0 B,11
+q1,rows arrived in last 60 s,explicit PREWHERE,3,0,0 B,3
+q1,rows arrived in last 60 s,"explicit PREWHERE, 15-min key window",2,0,0 B,3
+q2,ingest-rate chart (inserted_at filter),default (auto),42,200000,3.24 MiB,33
+q2,ingest-rate chart (inserted_at filter),explicit PREWHERE,55,200000,3.24 MiB,40
+q3,one machine's latest rows (primary key),default (auto),17,57344,935.88 KiB,11
+q3,one machine's latest rows (primary key),explicit PREWHERE,15,57344,608.61 KiB,9
+q4,"non-key filter vib_r > 0.02, last hour",auto-PREWHERE off,1003,8640043,263.67 MiB,772
+q4,"non-key filter vib_r > 0.02, last hour",default (auto),777,8634581,263.51 MiB,574
+q4,"non-key filter vib_r > 0.02, last hour",explicit PREWHERE,778,8620928,263.09 MiB,558
+q5,"summary: count, uniqExact(machine), max(ts)",old,435,11000100,94.41 MiB,389
+q5,"summary: count, max(ts) (part metadata)",new,3,8,512 B,2

@@ -1,0 +1,28 @@
+t=10s  ready      0 unacked  2683 deliver/s   3000 | stored    26550  rows/s  2655  behind    1.5s | CPU ch 130% rmq  40% producers  30%
+t=20s  ready      0 unacked  2097 deliver/s   3000 | stored    58650  rows/s  2910  behind    1.3s | CPU ch 182% rmq  46% producers  46%
+t=30s  ready      0 unacked   188 deliver/s   3001 | stored    90552  rows/s  2856  behind    1.2s | CPU ch 173% rmq  46% producers  55%
+t=40s  ready      0 unacked  2314 deliver/s   3005 | stored   121200  rows/s  2760  behind    1.5s | CPU ch 246% rmq  82% producers  36%
+t=50s  ready      0 unacked  2338 deliver/s   3000 | stored   155250  rows/s  3110  behind    0.8s | CPU ch 233% rmq  50% producers  42%
+t=60s  ready      0 unacked  1386 deliver/s   3006 | stored   186200  rows/s  3095  behind      1s | CPU ch 183% rmq  58% producers  42%
+t=70s  ready      0 unacked   724 deliver/s   2992 | stored   216873  rows/s  3067  behind    1.2s | CPU ch 127% rmq  46% producers  46%
+t=80s  ready      0 unacked  2806 deliver/s   2990 | stored   247800  rows/s  2790  behind    1.5s | CPU ch 282% rmq  46% producers  36%
+t=90s  ready      0 unacked  1750 deliver/s   2981 | stored   282000  rows/s  3120  behind    0.8s | CPU ch 227% rmq  46% producers  36%
+t=100s  ready      0 unacked   853 deliver/s   2999 | stored   312900  rows/s  3090  behind      1s | CPU ch 227% rmq  64% producers  55%
+t=110s  ready      0 unacked  3430 deliver/s   3009 | stored   344101  rows/s  3120  behind    1.2s | CPU ch 209% rmq  54% producers  55%
+t=120s  ready      0 unacked   600 deliver/s   1979 | stored   360300  rows/s  1305  behind    6.5s | CPU ch  46% rmq  18% producers   0%
+t=130s  ready      0 unacked     0 deliver/s      0 | stored   360300  rows/s     0  behind   16.9s | CPU ch  30% rmq  10% producers   0%
+t=140s  ready      0 unacked     0 deliver/s      0 | stored   360300  rows/s     0  behind   27.3s | CPU ch  46% rmq   9% producers   0%
+   ┌─machine───────┬─stored─┬──sent─┬─loss_pct─┐
+1. │ L1790454218_1 │  60050 │ 60050 │        0 │
+2. │ L1790454218_2 │  60050 │ 60050 │        0 │
+3. │ L1790454218_3 │  60050 │ 60050 │        0 │
+4. │ L1790454218_4 │  60050 │ 60050 │        0 │
+5. │ L1790454218_5 │  60050 │ 60050 │        0 │
+6. │ L1790454218_6 │  60050 │ 60050 │        0 │
+   └───────────────┴────────┴───────┴──────────┘
+emitted 60,050 readings, 60,050 acknowledged by the broker, 0 mode change(s)
+emitted 60,050 readings, 60,050 acknowledged by the broker, 0 mode change(s)
+emitted 60,050 readings, 60,050 acknowledged by the broker, 0 mode change(s)
+emitted 60,050 readings, 60,050 acknowledged by the broker, 0 mode change(s)
+emitted 60,050 readings, 60,050 acknowledged by the broker, 0 mode change(s)
+emitted 60,050 readings, 60,050 acknowledged by the broker, 0 mode change(s)

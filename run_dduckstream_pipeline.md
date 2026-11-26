@@ -8,6 +8,8 @@
 
 rm -rf ~/duckstream-accel
 
+rm -rf ~/engine-lake
+
 
 
 Pi — terminal 1: ingest
@@ -23,6 +25,8 @@ Pi — terminal 3: dashboard
 
 cd /home/zahid/python_scripts/lakehouse-rpi5
 ENG_ROOT=$HOME/engine-lake .venv/bin/python -u engine_app/server.py --port 8090
+
+
 Laptop — terminal 1: first producer
 
 python engine_producer.py --host 192.168.0.104 \
@@ -33,6 +37,15 @@ Laptop — terminal 2: second producer
 python engine_producer.py --host 192.168.0.104 \
   --machine Karachi_ENG02 --seed 777 \
   --schedule "bearing:120,healthy:90,looseness:120,misalignment:90"
+
+  python engine_producer.py --host 192.168.0.104 \
+  --machine Karachi_ENG03 --seed 777 \
+  --schedule "bearing:110,healthy:100,looseness:120,misalignment:90"
+
+    python engine_producer.py --host 192.168.0.104 \
+  --machine Karachi_ENG06 --seed 777 \
+  --schedule "bearing:110,healthy:100,looseness:120,misalignment:90"
+  
 The --machine values must differ. Both models key on [timestamp, machine], so two producers sharing a name would collide on that key and roughly half the readings would silently disappear into the GROUP BY.
 
 

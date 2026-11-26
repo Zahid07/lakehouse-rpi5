@@ -1,0 +1,7 @@
+run,configuration,producers,msg_per_s_each,duration_s,dashboard,history_in_db,readings_sent,readings_stored,loss_pct,producer_drops,typical_behind_s,clickhouse_query_cpu_s,measurement_window_s,notes
+run1,SQL-DFT STFT,6,500,90,no,~none,270300,270300,0,n/a,0.5-1.2,,,ingest path alone keeps up
+run2,SQL-DFT STFT,6,500,120,yes,1 h x 6 machines (10.8 M rows),360300,360300,0,n/a,0.8-3.0,85,~140,"query_log not yet enabled; query-thread CPU only (excludes RabbitMQ engine threads, ~110% of a core at ~2,400 msg/s)"
+run3,BEFORE: SQL-DFT STFT,6,500,120,yes,1 h x 6 machines,360300,360300,0,n/a,0.2-4.7,98,153,"profiled per query; query-thread CPU only (excludes RabbitMQ engine threads, ~110% of a core at ~2,400 msg/s)"
+run4,STFT as numpy UDF,6,500,120,yes,1 h x 6 machines,360300,360300,0,n/a,0.8-1.5,98,148,"anomaly view now dominant; query-thread CPU only (excludes RabbitMQ engine threads, ~110% of a core at ~2,400 msg/s)"
+run5,AFTER: UDF + fixes 1-5,6,500,120,yes,1 h x 6 machines,360300,360300,0,0,0.1-1.6,16,149,"6x less ClickHouse CPU than run3; query-thread CPU only (excludes RabbitMQ engine threads, ~110% of a core at ~2,400 msg/s)"
+run6,AFTER: UDF + fixes 1-5,6,500,360,yes,1 h x 6 machines + earlier runs,1080000,1080000,0,0,0.5-1.6,53,~390,"~14% of one core incl. ingest; query-thread CPU only (excludes RabbitMQ engine threads, ~110% of a core at ~2,400 msg/s)"

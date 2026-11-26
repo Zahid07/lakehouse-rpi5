@@ -1,0 +1,31 @@
+stage,rank,component,cpu_s,runs,avg_ms,avg_rows_read
+run3_before,1,"dashboard: spectrogram view (live STFT, SQL DFT)",42.4,14,4310,
+run3_before,2,dashboard: anomaly view,16.8,22,1162,
+run3_before,3,job: store spectrogram minutes (SQL DFT),12.4,8,2657,
+run3_before,4,"dashboard: fact summary (count, uniqExact(machine), max)",10.5,22,770,
+run3_before,5,dashboard: health view,5.9,22,417,
+run3_before,6,dashboard: ingest-rate chart,2.1,22,154,
+run3_before,7,dashboard: recent loss per machine,0.8,22,83,
+run3_before,8,dashboard: waveforms,0.8,84,19,
+run3_before,9,job: store health minutes,0.7,2,1108,
+run3_before,10,test harness monitor query,0.4,14,88,
+run3_before,11,job: assign machine keys,0.2,5,193,
+run3_before,12,dashboard: machine_dim,0.2,22,21,
+run3_before,13,dashboard: stored counts,0.2,22,20,
+run4_udf,1,dashboard: anomaly view,51.5,28,2510,
+run4_udf,2,dashboard: health view,17.4,28,868,
+run4_udf,3,"dashboard: fact summary (count, uniqExact(machine), max)",11.8,28,559,
+run4_udf,4,dashboard: ingest-rate chart,5.8,28,297,
+run4_udf,5,"dashboard: spectrogram view (live STFT, UDF)",2.6,14,274,
+run4_udf,6,job: store spectrogram minutes (UDF),1.7,8,446,
+run4_udf,7,dashboard: recent loss per machine,1.0,28,57,
+run5_after,1,"dashboard: spectrogram view (live STFT, UDF)",2.3,15,262,161695
+run5_after,2,dashboard: anomaly view (one-pass stored baseline),1.3,5,338,450998
+run5_after,3,dashboard: recent loss per machine (by arrival),1.2,30,81,264390
+run5_after,4,dashboard: ingest-rate chart,1.1,15,139,419442
+run5_after,5,dashboard: health view,1.1,5,324,450631
+run5_after,6,dashboard: waveforms,1.0,120,14,20470
+run5_after,7,job: store spectrogram minutes (UDF),0.7,8,147,63336
+run5_after,8,job: store health minutes,0.3,3,148,24098
+run5_after,9,test harness monitor query,0.3,14,50,225120
+run5_after,10,dashboard: machine count from machine_hlp,0.1,30,3,8

@@ -58,6 +58,16 @@ models:
       vib_a: "min(vib_a)"
       rpm:   "min(rpm)"
       mode:  "min(mode)"
+      # Audit columns (ClickHouse comparison; see sql/marts/audit.sql). The
+      # reading's stored_at is not a column: it is derived at read time from
+      # `chunk` -> duckstream.consumed_files -> duckstream.batches.committed_at,
+      # because a stored time computed here would be non-deterministic and a
+      # replayed batch must reproduce the row it made the first time.
+      run_id:      "min(run_id)"
+      sent_at:     "min(sent_at)"
+      received_at: "min(received_at)"
+      landed_at:   "min(landed_at)"
+      chunk:       "min(chunk)"
 
   # =====================================================================
   # marts.engine_minute_health -- tiers 1+2, folds incrementally
@@ -99,6 +109,16 @@ models:
       # additive, and exactly what marks a transition.
       mode_min:     "min(mode)"
       mode_max:     "max(mode)"
+      # Audit, all bare min/max, so the model stays tier two. last_chunk is
+      # the newest chunk that touched the minute; the batch that consumed it
+      # is when the minute's final value was committed.
+      run_id:            "max(run_id)"
+      first_sent_at:     "min(sent_at)"
+      last_sent_at:      "max(sent_at)"
+      first_received_at: "min(received_at)"
+      last_received_at:  "max(received_at)"
+      last_landed_at:    "max(landed_at)"
+      last_chunk:        "max(chunk)"
     sink:
       type: table
       table: marts.engine_minute_health
@@ -148,6 +168,10 @@ models:
       # columns already on the row. 257 identical doubles x 1,440 rows a day
       # would be pure redundancy.
       spec_db:      "stft_db(list(vib_r ORDER BY timestamp))"
+      # Audit (see engine_minute_health).
+      run_id:            "max(run_id)"
+      last_received_at:  "max(received_at)"
+      last_chunk:        "max(chunk)"
     sink:
       type: table
       table: marts.engine_minute_spectrogram

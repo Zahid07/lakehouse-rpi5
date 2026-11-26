@@ -1,0 +1,5 @@
+version,scenario,minutes_expected,minutes_stored,time_s,note
+SQL DFT + global high-water mark,1 h history inserted after newer machines,366,126,>600 (stuck),bug: late minutes skipped
+UDF + global high-water mark,"1 h history, empty store",366,366,21,
+UDF + fact_minutes planning,1 h history inserted after newer machines,366,366,36,bug fixed
+UDF + fact_minutes planning,100 late readings for a stored minute,1,1,<80,"recalculated: 30,000 -> 30,100 samples"

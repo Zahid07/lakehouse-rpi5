@@ -1,0 +1,7 @@
+rank,component,cpu_s,runs,max_ms
+1,"dashboard: spectrogram view (live STFT, UDF)",11.7,59,603
+2,ingest: RabbitMQ engine inserts into fact (1.08 M readings),9.2,3,9581
+3,job: store spectrogram minutes (UDF),8.7,46,5577
+4,dashboard: health view,7.8,20,925
+5,dashboard: anomaly view,7.7,20,854
+6,dashboard: ingest-rate chart,7.7,59,564
