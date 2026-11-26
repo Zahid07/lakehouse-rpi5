@@ -1,213 +1,225 @@
-# Lakehouse RPi5 Pipeline
+# Lakehouse RPi5: real-time sensor analytics on a Raspberry Pi 5
 
-End-to-end accelerometer Lakehouse pipeline built on DuckDB + DuckLake, with:
+This repository holds two complete pipelines that turn a stream of engine
+vibration readings into engine health data on a single Raspberry Pi 5, and the
+study that compares them:
 
-- Layered SQL modeling (staging -> curated -> marts)
-- CDC-style file tracking
-- Step-level benchmarking
-- Batch pipeline runner
-- Realtime mini-batch queue worker
+- a **DuckDB + DuckLake** pipeline, driven by **duckstream**, a small
+  micro-batch streaming engine written for this project;
+- a **RabbitMQ + ClickHouse** port of the same pipeline, with identical
+  calculations.
 
-## Overview
+Both were run for six hours on an uncooled Pi 5 under the same load (six
+sensors at 500 readings per second each). Both stored every reading. ClickHouse
+made readings available in about 3 ms and stayed flat for the whole run;
+DuckDB took about 7 s and slowed down as the run went on.
 
-This project ingests parquet accelerometer files, enriches location dimensions, builds fact tables, and publishes analytics marts (hourly summary + FFT).
+Research project at Åbo Akademi University, supervised by Andreas Lundell and
+Fredrik Hellman. The full write-up is the report:
+[DuckDB_vs_ClickHouse_RPi5_report.pdf](clickhouse_implementation/engine_pipeline/research/DuckDB_vs_ClickHouse_RPi5_report.pdf).
 
-Core implementation files:
+## Results at a glance
 
-- [run_pipeline.py](run_pipeline.py): batch orchestration, CDC filtering, benchmarking
-- [realtime_queue_worker.py](realtime_queue_worker.py): cron-safe mini-batch queue worker
-- [sql/staging/stg_accelerometer.sql](sql/staging/stg_accelerometer.sql)
-- [sql/curated/accel_location_hlp.sql](sql/curated/accel_location_hlp.sql)
-- [sql/curated/accel_location_dim.sql](sql/curated/accel_location_dim.sql)
-- [sql/curated/accel_fact.sql](sql/curated/accel_fact.sql)
-- [sql/marts/accel_summary_mart.sql](sql/marts/accel_summary_mart.sql)
-- [sql/marts/accel_fft_mart.sql](sql/marts/accel_fft_mart.sql)
+| Measure (6 sensors, 3,000 readings/s) | DuckDB + duckstream | RabbitMQ + ClickHouse |
+| --- | --- | --- |
+| Readings stored in 6 hours | 51,300,100 of 51,300,100 | 51,300,100 of 51,300,100 |
+| Received → stored, median | 6.9 s | 3 ms |
+| Received → stored, end of run | 16.6 s, still rising | 3 ms |
+| CPU of the pipeline's own processes | 165% of one core | 119% of one core |
+| Memory when idle / at peak | 149 MB / 1,843 MB | 979 MB / 1,201 MB |
+| Highest temperature (no cooling) | 84.8 °C, at the soft limit 49% of the time | 80.4 °C, never at the limit |
+| Disk used for the 6-hour run | 3,304 MiB | 933 MiB |
+| Per-minute health stored, median | about 8 s | 20–600 s (newest minutes are computed live instead) |
 
-## Data Flow
+## What this project is
 
-```mermaid
-flowchart LR
-	A[Parquet files in accel_data/*] --> B[Staging: stg_accelerometer]
-	B --> C[Curated helper: location_hlp]
-	C --> D[Curated SCD2 dim: location_dim]
-	B --> E[Curated fact: fact_accelerometer]
-	D --> E
-	E --> F[Marts: accel_hourly_summary]
-	E --> G[Marts: accel_fft_mart]
-```
+Sensors on an engine send vibration readings over MQTT. A Raspberry Pi 5 next
+to the engines receives them, stores them in a star schema and computes, for
+every machine and minute:
 
-## Batch Pipeline Flow
+- health statistics: RMS, peak, crest factor, kurtosis, skew, axial ratio and
+  RPM statistics;
+- a spectrogram (short-time Fourier transform, 500 Hz, 512-sample Hann window);
+- an anomaly score against the machine's own baseline.
 
-```mermaid
-flowchart TD
-	A[Load env config] --> B[Attach DuckLake]
-	B --> C[Create schemas/tables]
-	C --> D[Register FFT UDFs]
-	D --> E[Scan raw folders/files]
-	E --> F{Any new data?}
-	F -- No --> X[Early exit]
-	F -- Yes --> G[Get unprocessed files]
-	G --> H[Chunk by max_files_per_batch]
-	H --> I[Run 5 SQL steps per chunk]
-	I --> J[Write benchmarking metrics]
-	J --> K[Mark CDC SUCCESS or FAILED]
-	K --> L[Next chunk]
-```
+A dashboard on the Pi shows all of this live, one engine at a time or side by
+side. The aim is to do it all on the device, without a cloud back end.
 
-## Realtime Worker Flow
+## How the work developed
 
-```mermaid
-flowchart TD
-	A[Cron starts worker] --> B[Acquire lock file]
-	B --> C[Find folders with _READY marker]
-	C --> D[Apply settle delay]
-	D --> E[Collect parquet files]
-	E --> F[Upsert queue jobs]
-	F --> G[Pick due queue items]
-	G --> H[Mini-batch run_for_files]
-	H --> I{Batch result}
-	I -- Success --> J[Queue status SUCCESS]
-	I -- Failure --> K[Queue status FAILED + retry backoff]
-```
+1. **Accelerometer lakehouse (first stage).** A batch pipeline on DuckDB and
+   DuckLake: parquet files in, staging → curated → marts, an SCD2 dimension and
+   an FFT mart. Described in
+   [docs/accelerometer_batch_pipeline.md](docs/accelerometer_batch_pipeline.md).
+2. **duckstream.** DuckDB has no built-in way to keep processing data as it
+   arrives, so I wrote [duckstream](duckstream/): an ingest process lands MQTT
+   readings as parquet files, and a pipeline loop picks up new files every few
+   seconds, runs each model incrementally and records what it has consumed.
+   Design notes are in [docs/duckstream/](docs/duckstream/).
+3. **Engine vibration pipeline on DuckDB.** [engine_pipeline/](engine_pipeline/)
+   uses duckstream to build the engine star schema, health, spectrogram and
+   anomaly marts, shown by [engine_app/](engine_app/).
+4. **ClickHouse port.** [clickhouse_implementation/](clickhouse_implementation/)
+   rebuilds the same pipeline on RabbitMQ and ClickHouse, with every calculation
+   checked against the original numpy code.
+5. **Comparison.** Both pipelines got the same audit columns and were run for
+   six hours each under the same load. The data, tools and report are in
+   [clickhouse_implementation/engine_pipeline/research/](clickhouse_implementation/engine_pipeline/research/).
 
-## Star Modeling Schema
+## Architecture
 
-Curated layer exposes the star-model core:
-
-- Fact: `curated.fact_accelerometer`
-- Dimension: `curated.location_dim` (SCD Type 2)
-
-Marts derive analytical aggregates from the curated star.
+Both pipelines share the sensors and the broker. They differ in how a reading
+gets from the broker into the tables.
 
 ```mermaid
-erDiagram
-	LOCATION_DIM ||--o{ FACT_ACCELEROMETER : location_key
+flowchart TB
+    P["Laptop: 6 simulated engine sensors<br/>500 readings/s each, 50 readings per MQTT message"]
+    B["RabbitMQ with the MQTT plugin<br/>(on the Raspberry Pi 5)"]
+    P -->|MQTT, QoS 1| B
 
-	LOCATION_DIM {
-		int location_key PK
-		string location_name
-		string city
-		string country
-		bool is_current
-		datetime valid_from
-		datetime valid_to
-	}
+    subgraph DUCK["DuckDB pipeline"]
+        direction TB
+        I["Ingest process<br/>writes parquet landing files<br/>(5,000 rows or 10 s)"]
+        C["duckstream cycle, every 2 s<br/>finds new files, runs each model,<br/>marks files as consumed"]
+        L[("DuckLake tables<br/>fact, SCD2 dimension,<br/>health, spectrogram, anomaly")]
+        I --> C --> L
+    end
 
-	FACT_ACCELEROMETER {
-		datetime timestamp
-		int location_key FK
-		double x
-		double y
-		double z
-		double magnitude
-		string batch_id
-	}
+    subgraph CHP["ClickHouse pipeline"]
+        direction TB
+        Q["RabbitMQ table engine<br/>inserts each batch as it arrives"]
+        F[("Raw fact table<br/>+ per-minute summary<br/>(materialized views)")]
+        J["Scheduled jobs store finished minutes;<br/>views compute the newest minutes live<br/>(numpy STFT as a UDF)"]
+        Q --> F --> J
+    end
 
-	FACT_ACCELEROMETER ||--o{ ACCEL_HOURLY_SUMMARY : aggregates_to
-	FACT_ACCELEROMETER ||--o{ ACCEL_FFT_MART : transforms_to
-
-	ACCEL_HOURLY_SUMMARY {
-		datetime hour_ts
-		int location_key
-		bigint sample_count
-		double avg_x
-		double avg_y
-		double avg_z
-		double avg_magnitude
-	}
-
-	ACCEL_FFT_MART {
-		datetime window_ts
-		int location_key
-		int sample_count
-		double[] freq_hz
-		double[] fft_magnitude
-	}
+    B -->|MQTT subscription| I
+    B -->|AMQP queue| Q
+    L --> D1["Dashboard<br/>engine_app/"]
+    J --> D2["Dashboard<br/>clickhouse_implementation/engine_pipeline/app/"]
+    M["sysmon.py: CPU, memory, temperature,<br/>throttling and disk, every 10 s"] -.-> DUCK
+    M -.-> CHP
 ```
 
-## Mart Recomputation Semantics
+The ClickHouse design follows one rule: store a result only once it can no
+longer change. Minutes older than 10 minutes, and closed spectrogram minutes,
+are stored by scheduled jobs; anything newer is calculated live from the raw
+readings. duckstream instead stores every model's output in each cycle.
 
-Both marts are **recompute-by-window**, not incremental accumulators:
+## The experiment
 
-- The runner asks the fact table which windows the current batch touched
-  (`get_touched_windows`) and passes a literal `[window_lo, window_hi)` range
-  into the mart SQL. Untouched history is never read.
-- Every window in range is recomputed from all of its fact rows. A 30s dump
-  never fills a 1-minute FFT window, and an hour is touched ~120 times, so
-  folding a batch into a stored average cannot be done correctly without
-  carrying running sums. Recomputing keeps both marts exact and idempotent, so
-  a retried batch converges instead of drifting.
-- `accel_summary_mart` uses streaming aggregates (memory scales with group
-  count) and runs as a single call over the touched hour range.
-- `accel_fft_mart` materializes every row in range into lists for the numpy
-  UDFs, so memory scales with row count. The runner caps it at
-  `fft_windows_per_chunk` minute windows per SQL call. This is the step that
-  previously OOM'd at 19.4M rows.
+- **Device:** Raspberry Pi 5, 4 GB, SD card, Debian 13, with no heatsink, fan
+  or case.
+- **Load:** six simulated engines at 500 readings/s each, sent from a laptop
+  over WiFi. One sensor was added every 30 minutes, so all six ran together
+  for the last 3.5 hours.
+- **Runs:** ClickHouse on 7–8 October 2026, DuckDB on 12 October 2026, six
+  hours each, with the other pipeline switched off.
+- **Measured:** every reading carries `sent_at`, `received_at` and `stored_at`
+  audit columns, and a numbered sequence per sensor to detect loss. A
+  monitoring script sampled the Pi every 10 seconds. Delay is measured from
+  received to stored, on the Pi's clock only, because the laptop clock was
+  not synchronised.
 
-## Operational Tables
+## Results
 
-- `staging.processed_files_cdc`: file-level CDC status and lineage
-- `marts.pipeline_benchmark`: step timings, ingested rows, ingested bytes, errors
-- `staging.realtime_job_queue`: queue/retry state for realtime worker
+**Completeness.** Both pipelines stored all 51,300,100 readings, with no gaps
+and no duplicates, at every sensor count.
 
-## Configuration
+**Delay.** ClickHouse stayed at 3 ms (median) from the first sensor to the
+last hour. DuckDB was about 10 s with one sensor (a landing file closes after
+5,000 rows or 10 s), fell to 1.2 s with three, and then rose steadily while the
+load stayed constant: about 1.9 s per hour, reaching 16.6 s at the end.
 
-Main config files:
+| Sensors | ClickHouse median | DuckDB median | DuckDB 95th percentile |
+| --- | --- | --- | --- |
+| 1 | 3 ms | 10.0 s | 10.1 s |
+| 2 | 3 ms | 4.2 s | 4.7 s |
+| 3 | 3 ms | 1.2 s | 3.5 s |
+| 4 | 3 ms | 4.3 s | 7.0 s |
+| 5 | 3 ms | 4.0 s | 6.2 s |
+| 6 | 3 ms | 6.9 s | 13.1 s |
 
-- [config/dev.env](config/dev.env)
-- [config/prod.env](config/prod.env)
+**Why DuckDB slowed down.** Splitting each duckstream cycle into model work
+and everything else shows that the models took under a second per cycle in
+every hour. The other 90–92% of the cycle went to listing the landing folder
+and tracking which files were new. With load held constant, the cycle grew
+from 7.8 s to 11.6 s as landing files piled up (10,180 by the end). The cost
+is in duckstream's file bookkeeping, not in DuckDB's calculations.
 
-Useful keys:
+**CPU.** ClickHouse jumped to about 105% of a core with the first sensor and
+then rose only to 119% with six, about 3% per extra sensor. DuckDB started at
+61% and added about 21% per sensor, reaching 165%.
 
-- `data_path`
-- `catalog_path`
-- `ducklake_catalog`
-- `ducklake_data_path`
-- `staging_schema`, `curated_schema`, `marts_schema`
-- `max_files_per_batch`
-- `fft_windows_per_chunk`
-- `duckdb_memory_limit`, `duckdb_threads`, `duckdb_preserve_insertion_order`
-- `ready_marker_name`, `worker_settle_seconds`
-- `worker_max_files_per_run`, `worker_max_retry_attempts`, `worker_retry_delay_seconds`
+**Memory.** ClickHouse used a flat ~1 GB whatever the load. DuckDB started at
+149 MB but grew with load and time, peaking at 1.8 GB.
 
-## Run Commands
+**Temperature.** On the bare board, DuckDB's extra CPU kept the Pi at its
+soft thermal limit (about 80 °C) for 49% of the six-sensor phase, peaking at
+84.8 °C. ClickHouse peaked at 80.4 °C and never triggered the limit. Actual
+clock throttling was rare in both runs.
 
-Batch pipeline:
+**Storage.** DuckDB keeps each reading twice (landing file and lake table),
+about 68 bytes per reading against at most 19 for ClickHouse. At 3,000
+readings/s that is about 17.5 GB a day against 5 GB.
+
+**Conclusion.** For continuous real-time work, ClickHouse was the better fit.
+DuckDB remains a good choice where memory is tight or analysis runs
+periodically rather than continuously. Its growing delay comes from the
+duckstream design, which could likely be fixed by compacting or deleting
+consumed landing files (not yet tested). The limits of the study (one run per
+pipeline, minute-level delay samples, different days) are discussed in the
+report.
+
+## Repository layout
+
+| Path | What it is |
+| --- | --- |
+| [duckstream/](duckstream/) | The micro-batch streaming engine for DuckDB / DuckLake |
+| [docs/duckstream/](docs/duckstream/) | duckstream design, plan and status notes |
+| [engine_pipeline/](engine_pipeline/) | Engine vibration pipeline on duckstream (ingest, models, star schema, producer) |
+| [engine_app/](engine_app/) | Live dashboard for the DuckDB pipeline |
+| [duckstream_pipeline/](duckstream_pipeline/) | The accelerometer pipeline rebuilt on duckstream |
+| [clickhouse_implementation/engine_pipeline/](clickhouse_implementation/engine_pipeline/) | ClickHouse port: SQL, STFT UDF, dashboard, producer and launcher |
+| [clickhouse_implementation/engine_pipeline/research/](clickhouse_implementation/engine_pipeline/research/) | Run exports, comparison tables, tools and the report |
+| [clickhouse_implementation/pi_monitor/](clickhouse_implementation/pi_monitor/) | Small Pi CPU / memory / temperature dashboard |
+| [clickhouse_implementation/mqtt_pipeline/](clickhouse_implementation/mqtt_pipeline/) | RabbitMQ MQTT setup and first experiments |
+| [run_pipeline.py](run_pipeline.py), [sql/](sql/), [config/](config/) | The original accelerometer batch pipeline |
+| [tools/](tools/), [tests/](tests/) | Soak and mutation tooling, tests |
+
+## Running it
+
+**DuckDB pipeline** (on the Pi, from the repository root, with the `.venv`
+active). The ingest needs the RabbitMQ MQTT password in `ENG_MQTT_PASSWORD` or
+asks for it.
 
 ```bash
-python run_pipeline.py dev all
+./engine_pipeline/run_ingest.sh                       # MQTT -> landing files (keep running)
+./engine_pipeline/run.sh --interval "2 seconds"       # duckstream cycle
+ENG_ROOT=$HOME/engine-lake .venv/bin/python -u engine_app/server.py --port 8090
 ```
 
-Realtime worker:
+**ClickHouse pipeline** (on the Pi). See
+[clickhouse_implementation/engine_pipeline/README.md](clickhouse_implementation/engine_pipeline/README.md)
+for the full setup, including installing the STFT UDF.
 
 ```bash
-python realtime_queue_worker.py dev
+cd clickhouse_implementation/engine_pipeline
+./setup.sh                                            # creates the database, tables and jobs
+CH_PASSWORD=... RMQ_PASSWORD=... python3 app/server.py   # dashboard on :8090
 ```
 
-With custom lock file:
+**Sensors** (on the laptop). The launcher starts one producer every 30 minutes
+by default and stops them all at the end.
 
 ```bash
-python realtime_queue_worker.py dev --lock-file /tmp/realtime_worker.lock
+python clickhouse_implementation/engine_pipeline/run_producers.py --run-id ch_run1
+python clickhouse_implementation/engine_pipeline/run_producers.py --run-id duck_run1 --topic engine/vibration_duck
 ```
 
-## DuckDB Session Quickstart
+**Rebuild the comparison and the report.**
 
-```sql
-INSTALL ducklake;
-LOAD ducklake;
-ATTACH 'ducklake:metadata.ducklake' AS my_ducklake (DATA_PATH 'ducklake_data');
-USE my_ducklake;
+```bash
+.venv/bin/python clickhouse_implementation/engine_pipeline/research/tools/compare_runs.py
+python3 clickhouse_implementation/engine_pipeline/research/report/build_report.py
 ```
-
-If catalog already exists:
-
-```sql
-ATTACH 'ducklake:metadata.ducklake' AS my_ducklake;
-USE my_ducklake;
-```
-
-## Notes
-
-- Producer should create `_READY` as an empty file after all parquet files are finalized.
-- Realtime worker intentionally ignores folders without marker or without settle delay.
-- Mini-batching improves memory stability for heavy FFT workloads.
