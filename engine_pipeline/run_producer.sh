@@ -15,6 +15,9 @@ export ENG_MACHINE="${ENG_MACHINE:-Karachi_ENG01}"
 export ENG_NOMINAL_RPM="${ENG_NOMINAL_RPM:-1800}"
 export ENG_CONTROL_FILE="${ENG_CONTROL_FILE:-$ENG_ROOT/producer.mode}"
 export ENG_FACT_RETAIN_HOURS="${ENG_FACT_RETAIN_HOURS:-6}"
+# RabbitMQ serves MQTT on the Pi and needs a login; the password comes from
+# ENG_MQTT_PASSWORD or a prompt, never from this file.
+export ENG_MQTT_USER="${ENG_MQTT_USER:-iot}"
 mkdir -p "$ENG_LANDING"
 cd "$REPO" || exit 1
 exec "$REPO/.venv/bin/python" -u -m engine_pipeline.producer "$@"

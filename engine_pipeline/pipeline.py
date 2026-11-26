@@ -185,8 +185,10 @@ def report_cycle(cycle) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--interval", default="2 seconds",
-                        help="time between cycles (default: '2 seconds')")
+    parser.add_argument("--interval",
+                        default=os.environ.get("ENG_PIPELINE_INTERVAL", "2 seconds"),
+                        help="time between cycles (default: ENG_PIPELINE_INTERVAL "
+                             "or '2 seconds'; the shortest accepted is '1 second')")
     parser.add_argument("--once", action="store_true",
                         help="run a single cycle and exit")
     parser.add_argument("--max-cycles", type=int, default=None)

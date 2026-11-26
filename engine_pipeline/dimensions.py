@@ -203,6 +203,14 @@ VIEWS = (
      (("curated", "fact_engine_vibration"), ("curated", "machine_dim"))),
     ("marts", "v_engine_minute_anomaly",
      (("marts", "engine_minute_health"), ("curated", "machine_dim"))),
+    # Audit views (ClickHouse comparison). They read duckstream's own
+    # bookkeeping, which also appears only after the first commit.
+    ("curated", "v_audit_reading",
+     (("curated", "fact_engine_vibration"), ("duckstream", "consumed_files"),
+      ("duckstream", "batches"))),
+    ("marts", "v_audit_minute",
+     (("marts", "engine_minute_health"), ("marts", "engine_minute_spectrogram"),
+      ("duckstream", "consumed_files"), ("duckstream", "batches"))),
 )
 
 
