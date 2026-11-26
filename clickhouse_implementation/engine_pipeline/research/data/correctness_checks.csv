@@ -1,0 +1,10 @@
+check,result,detail
+"minute health vs numpy (rms, peak, crest, kurtosis, skew, axial, sd_rpm, avg_rpm)",42/42 minutes identical,max abs diff 0 on every metric; 28 stored + 14 live
+SQL-DFT spectrogram vs numpy,15163/15163 cells identical,max diff 0.0 dB
+UDF spectrogram vs numpy,15163/15163 cells identical,max diff 0.0 dB
+UDF short input,correct,300 samples -> empty; 1012 samples -> 514 cells (2 frames)
+"end-to-end, real producer, 150 s","61,600/61,600 then 75,050 acked","0 lost, 0 duplicates, delay avg 1110 ms, max 1718 ms"
+SCD2 re-rating 1800 -> 1500 RPM,correct,"old version valid_to set, oper U; new current; views show 1500 for all minutes"
+fact_minutes vs fact row count,"11,000,000 = 11,000,000","after backfill and after re-running setup: 11,000,100 = 11,000,100"
+producer drop counter,900 of 1000 reported dropped,"network paused, 100-message buffer"
+setup.sh password escaping,round-trips exactly,test password p'a\ss&/x$y

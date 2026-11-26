@@ -1,0 +1,8 @@
+"table","on_disk","bytes","rows"
+"engine_minute_spectrogram","59.79 MiB",62689311,1716
+"fact_minutes","57.59 KiB",58975,1717
+"engine_minute_health","53.56 KiB",54846,1716
+"fact_engine_vibration","12.99 KiB",13303,0
+"host_samples","4.06 KiB",4154,7
+"machine_hlp","2.44 KiB",2495,6
+"machine_dim_history","2.43 KiB",2490,6

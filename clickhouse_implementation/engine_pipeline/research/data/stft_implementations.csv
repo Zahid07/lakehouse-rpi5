@@ -1,0 +1,9 @@
+implementation,setting,time_ms_per_machine_minute,peak_memory_MB,cells_differing_from_numpy,note
+numpy FFT (original spectro.py),,0.9,,reference,avg of 50 runs
+pure SQL DFT in ClickHouse,max_block_size=65409 (default),797,355.3,0,clickhouse-local
+pure SQL DFT in ClickHouse,max_block_size=2048,780,55.8,0,chosen setting
+pure SQL DFT in ClickHouse,max_block_size=512,811,25.7,0,
+"pure SQL DFT, on server",one minute via view,703,,0,clickhouse server
+"executable UDF (numpy, RowBinary, executable_pool)",first call,214,,0,includes Python start + numpy import
+"executable UDF (numpy, RowBinary, executable_pool)",warm call,4,,0,includes transfer to/from Python
+"executable UDF (numpy, RowBinary, executable_pool)","12 machine-minutes, one query",3.75,,0,45 ms total

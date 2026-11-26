@@ -1,0 +1,5 @@
+view_query,ms,rows_read,bytes_read,cpu_ms,note
+anomaly view (one-pass stored baseline),254,389518,8.15 MiB,229,was 1162-2510 ms per run before
+"health view, last 3 h",191,389151,9.68 MiB,158,
+"live health calculation, last 15 min",92,672935,5.78 MiB,77,primary key reads 0.67 M of 11 M rows
+"spectrogram view, last 15 min",100,376,21.21 MiB,70,UDF live minute included

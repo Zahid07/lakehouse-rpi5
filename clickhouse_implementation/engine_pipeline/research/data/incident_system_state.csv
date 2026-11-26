@@ -1,0 +1,11 @@
+metric,value,note
+producers,6,"laptop, one reading per MQTT message, QoS 1"
+target rate,3000 msg/s,6 x 500
+delivered to ClickHouse,531-1368 msg/s,"RabbitMQ deliver rate, two samples 10 s apart"
+queue messages ready,0,no backlog in RabbitMQ: bottleneck upstream of the queue
+queue messages unacked,91-2253,
+ClickHouse CPU,160%,top; 4 cores = 400%
+RabbitMQ CPU,130%,top
+RabbitMQ memory,209 MB of 838 MB limit,no memory or disk alarm
+dashboard 'active producers',0,bug: counted by sample timestamp; readings ~90 s late
+producer local buffer,"20,000 messages","~40 s at 500/s; full -> paho refuses publish, return code ignored"
